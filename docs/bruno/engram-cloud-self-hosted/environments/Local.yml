@@ -1,0 +1,93 @@
+# Local environment for a self-hosted `engram cloud serve` instance.
+#
+# All values are PLACEHOLDERS. Replace `token` with the real value of
+# ENGRAM_CLOUD_TOKEN that the server was started with before sending any
+# /sync/* or /admin/* request. Do NOT commit real tokens.
+#
+# Defaults assume the server was started with:
+#   ENGRAM_PORT=8080
+#   ENGRAM_CLOUD_HOST=127.0.0.1
+#   ENGRAM_CLOUD_ALLOWED_PROJECTS=bruno-demo
+#   ENGRAM_CLOUD_TOKEN=<set in your shell, do not paste here>
+#
+# See internal/cloud/config.go (ConfigFromEnv) and cmd/engram/cloud.go
+# (validateCloudServeAuthConfig) for the authoritative env var list.
+
+variables:
+  - name: baseUrl
+    value: http://127.0.0.1:8080
+
+  # Bearer token sent on every /sync/* and /admin/* request.
+  # MUST match the ENGRAM_CLOUD_TOKEN value the server was started with.
+  # Marked secret: Bruno masks it in the UI.
+  - name: token
+    value: REPLACE_WITH_ENGRAM_CLOUD_TOKEN
+    secret: true
+
+  # Project name used by the demo requests.
+  # MUST appear in ENGRAM_CLOUD_ALLOWED_PROJECTS, otherwise the server
+  # returns 403 with error_code=policy_forbidden.
+  - name: project
+    value: bruno-demo
+
+  # Filled after running Admin/01-list-users and copying an existing
+  # principal_id (UUID). Used by Admin/*/{principalID}/* requests.
+  - name: principalId
+    value: REPLACE_WITH_PRINCIPAL_ID
+
+  # Filled after running Sync/01-pull-manifest and copying an existing
+  # chunk id (8-char SHA-256 prefix). Used by Sync/02-pull-chunk.
+  - name: chunkId
+    value: REPLACE_WITH_CHUNK_ID
+
+  # Filled after running Admin/06-create-user-token. The id (NOT the raw
+  # token) is used by Admin/07-revoke-token. The raw token is only shown
+  # once at creation time.
+  - name: tokenId
+    value: REPLACE_WITH_TOKEN_ID
+
+  # Filled before Admin/10-revoke-user-grant with the exact project name
+  # passed to Admin/09-create-user-grant. Project names are
+  # server-normalized, so the value here MUST match the canonical form.
+  - name: grantProject
+    value: REPLACE_WITH_GRANT_PROJECT
+
+  # Username / email / role used by Admin/02-create-user. The server
+  # returns the new principal_id on success; capture it into `principalId`.
+  - name: newUsername
+    value: bruno-demo-user
+
+  - name: newEmail
+    value: bruno-demo-user@example.com
+
+  - name: newDisplayName
+    value: Bruno Demo User
+
+  - name: newRole
+    value: member
+
+  # Reason string written to the auth audit log on token revocation.
+  # Audit is recorded by every successful admin mutation, so leave a
+  # meaningful reason on every revoke.
+  - name: revokeReason
+    value: revoked via Bruno OpenCollection
+
+  # Bearer token captured from Admin/06-create-user-token. Save it
+  # immediately: the raw token is only returned once. Subsequent
+  # /sync/* calls can use either the legacy token OR this managed token.
+  - name: managedRawToken
+    value: REPLACE_WITH_RAW_TOKEN_FROM_ADMIN_06
+    secret: true
+
+  # Friendly name passed to Admin/06-create-user-token. Stored verbatim
+  # on the PrincipalToken row; surfaced by Admin/05-list-user-tokens.
+  - name: newTokenName
+    value: bruno-demo-token
+
+  # Project name passed to Admin/11-create-project. The server normalizes
+  # it (trim → lowercase → collapse -- and __) and the response's
+  # normalized form is captured back into `project`, so subsequent
+  # Sync/* requests push/pull against the new project. Set this to the
+  # raw name you want; do NOT pre-normalize.
+  - name: newProject
+    value: bruno-demo-api

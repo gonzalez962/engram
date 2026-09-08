@@ -1,0 +1,8 @@
+info:
+  name: Health
+  type: folder
+
+docs: |-
+  Public liveness probe. No Bearer token is sent or required.
+
+  Source: `internal/cloud/cloudserver/cloudserver.go` → `handleHealth`.

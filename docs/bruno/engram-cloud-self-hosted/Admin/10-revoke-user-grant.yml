@@ -1,0 +1,57 @@
+info:
+  name: Revoke User Grant
+  type: http
+  seq: 10
+
+http:
+  method: POST
+  url: "{{baseUrl}}/admin/users/{{principalId}}/grants/{{grantProject}}/revoke"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {}
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.status
+      operator: eq
+      value: ok
+  scripts:
+    - type: tests
+      code: |-
+        test("Revoke confirms the project that was revoked", function() {
+          expect(res.body).to.have.property("project");
+        });
+
+docs: |-
+  Revokes one project grant. After this, the principal cannot read or
+  write that project through the cloud API.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminRevokeGrant`
+  (line 348).
+
+  Path params:
+    - `principalID` — from `01-list-users` or `02-create-user`.
+    - `project` — the **server-normalized** project name as returned by
+      `09-create-user-grant` or `08-list-user-grants`. Pass an empty body;
+      nothing else is required.
+
+  Effects:
+    - `DELETE FROM cloud_project_grants WHERE principal_id=$1 AND project=$2`.
+    - Audit event: `action=grant.revoke` with `{ project }`.
+
+  Status codes:
+    - 200 — `{ "status": "ok", "principal_id": "...", "project": "..." }`.
+    - 400 — `principal_id` or `project` missing or no such grant.
+    - 401 / 403 — see folder docs.

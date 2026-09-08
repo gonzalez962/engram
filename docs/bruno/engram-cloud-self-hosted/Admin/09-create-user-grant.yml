@@ -1,0 +1,69 @@
+info:
+  name: Create User Grant
+  type: http
+  seq: 9
+
+http:
+  method: POST
+  url: "{{baseUrl}}/admin/users/{{principalId}}/grants"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "project": "{{grantProject}}"
+      }
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "201"
+    - expression: res.body.project
+      operator: isString
+    - expression: res.body.principal_id
+      operator: isString
+  scripts:
+    - type: after-response
+      code: |-
+        // Save the canonical (server-normalized) project name so
+        // 10-revoke-user-grant matches exactly.
+        if (res.body && typeof res.body.project === "string") {
+          bru.setEnvVar("grantProject", res.body.project);
+        }
+    - type: tests
+      code: |-
+        test("Grant was created for the requested project", function() {
+          expect(res.body).to.have.property("project");
+          expect(res.body).to.have.property("principal_id");
+        });
+
+docs: |-
+  Grants a managed principal access to one project. Upserts on
+  `(principal_id, project)`, so re-running with the same project is
+  idempotent (it just refreshes `granted_by_principal_id`).
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminCreateGrant`
+  (line 312).
+
+  Request body (`createAdminGrantRequest`):
+    - `project` — required, server-normalized via `NormalizeProjectGrant`.
+
+  Effects:
+    - `INSERT ... ON CONFLICT (principal_id, project) DO UPDATE SET project = EXCLUDED.project`
+      on `cloud_project_grants`.
+    - Audit event: `action=grant.create` with `{ project }`.
+
+  Status codes:
+    - 201 — `{ <ProjectGrant> }`.
+    - 400 — `principal_id` missing, invalid payload, missing `project`,
+      or storage rejection.
+    - 401 / 403 — see folder docs.
+    - 500 — audit failure.

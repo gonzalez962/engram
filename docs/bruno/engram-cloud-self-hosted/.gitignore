@@ -1,0 +1,19 @@
+# Local-only environment overrides. Operators can copy
+# environments/Local.yml to environments/Local.local.yml, fill in the real
+# Bearer token, and Bruno will pick it up while `git status` stays clean.
+environments/*.local.yml
+environments/*.local.bru
+
+# Per-user scratch state (e.g. when "Send and Download" writes a response
+# body next to a request for inspection).
+*.local.yml
+*.local.json
+*.local.txt
+
+# IDE / editor scratch.
+.idea/
+.vscode/
+.DS_Store
+
+# Local Bruno cache / sandbox.
+node_modules/

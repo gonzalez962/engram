@@ -513,6 +513,76 @@ func TestCloudBootstrapAdminAuditFailureStillCreatesAdminAndExitsNonZero(t *test
 // TestCloudBootstrapAdminIssuesTokenExactlyOnce proves --issue-token atomically
 // persists a resolvable token hash with its completion audit before disclosing
 // the raw token exactly once.
+// TestCloudBootstrapAdminIssueTokenAuditMetadataAvoidsSensitiveKeys is the
+// REGRESSION test for the fresh-self-host bootstrap blocker: the completion
+// audit metadata must not contain any key that cloudstore.sensitiveAuthAuditKey
+// would reject. The pre-fix code wrote "issued_token" (which contains the
+// substring "token" → rejected by sensitiveAuthAuditKey), making the
+// completion audit fail at the production store. The fix renamed the key to
+// "minted_credential" (no forbidden substring). This test asserts that every
+// key actually written — across the success and failure paths of
+// `engram cloud bootstrap admin --issue-token` — passes the exact same set of
+// forbidden fragments that cloudstore.sensitiveAuthAuditKey enforces, so a
+// future regression cannot reintroduce a blocked key without this test
+// failing in CI.
+//
+// RED evidence (before the fix): every bootstrap --issue-token invocation
+// failed with cloudstore.ErrSensitiveAuditMetadata: issued_token because the
+// fake store's audit path does not mirror sensitiveAuthAuditKey, but the
+// production store does — meaning every fresh self-host bootstrap was
+// permanently broken.
+func TestCloudBootstrapAdminIssueTokenAuditMetadataAvoidsSensitiveKeys(t *testing.T) {
+	stubExitWithPanic(t)
+	t.Setenv("ENGRAM_CLOUD_TOKEN_PEPPER", "dedicated-cloud-token-pepper-for-tests")
+	store := &fakeCloudBootstrapStore{}
+	stubNewCloudBootstrapStore(t, store)
+
+	withArgs(t, "engram", "cloud", "bootstrap", "admin", "--username", "morgan",
+		"--grant-project", "alpha", "--grant-project", "beta", "--issue-token", "ops-token")
+	stdout, _, recovered := captureOutputAndRecover(t, cmdCloudBootstrap)
+	if recovered != nil {
+		t.Fatalf("expected bootstrap --issue-token to succeed, got %v; stdout=%q", recovered, stdout)
+	}
+	if len(store.auditEvents) == 0 {
+		t.Fatalf("expected at least one audit event from bootstrap --issue-token, got 0")
+	}
+
+	// Replicate the production cloudstore.sensitiveAuthAuditKey allowlist.
+	// The single explicit allow (token_prefix) is preserved here so a
+	// regression that re-introduces a token-bearing key fails this test.
+	allowed := map[string]bool{"token_prefix": true}
+	forbidden := []string{"token", "authorization", "cookie", "secret", "hash", "password", "bearer"}
+	for _, event := range store.auditEvents {
+		for key := range event.Metadata {
+			lower := strings.ToLower(strings.TrimSpace(key))
+			if allowed[lower] {
+				continue
+			}
+			for _, fragment := range forbidden {
+				if strings.Contains(lower, fragment) {
+					t.Fatalf("bootstrap audit metadata key %q (action=%s outcome=%s reason_code=%s) contains forbidden fragment %q — would be rejected by cloudstore.sensitiveAuthAuditKey and break fresh self-host bootstrap --issue-token",
+						key, event.Action, event.Outcome, event.ReasonCode, fragment)
+				}
+			}
+		}
+	}
+
+	// Lock in the renamed flag so a future refactor cannot silently revert
+	// to the rejected "issued_token" key.
+	foundMintKey := false
+	for _, event := range store.auditEvents {
+		if v, ok := event.Metadata["minted_credential"]; ok {
+			foundMintKey = true
+			if v != true {
+				t.Fatalf("expected minted_credential=true on a successful --issue-token bootstrap, got %v", v)
+			}
+		}
+	}
+	if !foundMintKey {
+		t.Fatalf("expected minted_credential flag in bootstrap completion audit metadata, got %+v", store.auditEvents)
+	}
+}
+
 func TestCloudBootstrapAdminIssuesTokenExactlyOnce(t *testing.T) {
 	stubExitWithPanic(t)
 	t.Setenv("ENGRAM_CLOUD_TOKEN_PEPPER", "dedicated-cloud-token-pepper-for-tests")

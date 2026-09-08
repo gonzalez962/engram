@@ -985,6 +985,157 @@ func TestActiveAdminGuardLockQueriesIgnoreUnrelatedAdvisoryLocks(t *testing.T) {
 	assertNoActiveAdminGuardHeld(t, cs.db)
 }
 
+// TestCreateProjectWithGrantAndAuditLifecycle proves the atomic
+// create-project contract against a real Postgres, mirroring
+// TestCreatePrincipalTokenWithAuditRollsBackTokenWhenAuditValidationFails:
+// happy path persists exactly one row in each of cloud_project_controls,
+// cloud_project_grants and cloud_auth_audit_log; a second call with the same
+// normalized project name returns ErrProjectAlreadyExists without adding
+// dangling rows; and an audit event carrying sensitive metadata rolls the
+// whole transaction back so no control, grant, or audit row survives. The
+// project name normalization (`normalizeCloudProjectGrant`) is exercised end
+// to end so a caller passing "Beta Project" gets a row keyed under
+// "beta-project".
+func TestCreateProjectWithGrantAndAuditLifecycle(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+
+	actor, err := cs.CreateHumanUser(ctx, CreateHumanUserParams{Username: "project-create-actor", Email: "project-create-actor@example.test", DisplayName: "Project Create Actor", Role: PrincipalRoleAdmin})
+	if err != nil {
+		t.Fatalf("CreateHumanUser actor: %v", err)
+	}
+
+	t.Run("happy_path_persists_control_grant_and_audit", func(t *testing.T) {
+		if err := cs.CreateProjectWithGrantAndAudit(ctx,
+			CreateProjectGrantParams{PrincipalID: actor.PrincipalID, Project: "Alpha Project", GrantedByPrincipalID: actor.PrincipalID},
+			AuthAuditEvent{ActorPrincipalID: actor.PrincipalID, ActorSource: "managed", Project: "Alpha Project", Action: "project.create", Outcome: "success", Metadata: map[string]any{"name": "alpha-project"}},
+		); err != nil {
+			t.Fatalf("CreateProjectWithGrantAndAudit: %v", err)
+		}
+
+		ctrl, err := cs.GetProjectSyncControl("alpha-project")
+		if err != nil {
+			t.Fatalf("GetProjectSyncControl: %v", err)
+		}
+		if ctrl == nil {
+			t.Fatalf("expected a control row for alpha-project, got nil")
+		}
+		if !ctrl.SyncEnabled {
+			t.Fatalf("expected default SyncEnabled=true for new project, got false")
+		}
+
+		grants, err := cs.ListProjectGrants(ctx, actor.PrincipalID)
+		if err != nil {
+			t.Fatalf("ListProjectGrants: %v", err)
+		}
+		if len(grants) != 1 || grants[0].Project != "alpha-project" || grants[0].GrantedByPrincipalID != actor.PrincipalID || grants[0].PrincipalID != actor.PrincipalID {
+			t.Fatalf("expected one grant for the actor on alpha-project, got %+v", grants)
+		}
+
+		events, err := cs.ListAuthAuditEvents(ctx, AuthAuditQuery{Limit: 10})
+		if err != nil {
+			t.Fatalf("ListAuthAuditEvents: %v", err)
+		}
+		var createEvent *AuthAuditEvent
+		for i := range events {
+			if events[i].Action == "project.create" {
+				createEvent = &events[i]
+				break
+			}
+		}
+		if createEvent == nil {
+			t.Fatalf("expected a project.create audit event, got %+v", events)
+		}
+		if createEvent.ActorPrincipalID != actor.PrincipalID || createEvent.Project != "alpha-project" || createEvent.Outcome != "success" {
+			t.Fatalf("unexpected project.create audit event: %+v", createEvent)
+		}
+		if createEvent.Metadata["name"] != "alpha-project" {
+			t.Fatalf("expected audit metadata to project the normalized name, got %+v", createEvent.Metadata)
+		}
+	})
+
+	t.Run("duplicate_returns_ErrProjectAlreadyExists_without_extra_rows", func(t *testing.T) {
+		err := cs.CreateProjectWithGrantAndAudit(ctx,
+			CreateProjectGrantParams{PrincipalID: actor.PrincipalID, Project: "alpha-project", GrantedByPrincipalID: actor.PrincipalID},
+			AuthAuditEvent{ActorPrincipalID: actor.PrincipalID, ActorSource: "managed", Project: "alpha-project", Action: "project.create", Outcome: "success", Metadata: map[string]any{"name": "alpha-project"}},
+		)
+		if !errors.Is(err, ErrProjectAlreadyExists) {
+			t.Fatalf("expected ErrProjectAlreadyExists on duplicate, got %v", err)
+		}
+
+		var controlCount int
+		if err := cs.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cloud_project_controls WHERE project = $1`, "alpha-project").Scan(&controlCount); err != nil {
+			t.Fatalf("count control rows: %v", err)
+		}
+		if controlCount != 1 {
+			t.Fatalf("expected exactly one control row for alpha-project after duplicate, got %d", controlCount)
+		}
+
+		grants, err := cs.ListProjectGrants(ctx, actor.PrincipalID)
+		if err != nil {
+			t.Fatalf("ListProjectGrants after duplicate: %v", err)
+		}
+		if len(grants) != 1 {
+			t.Fatalf("expected duplicate to leave grant count at 1, got %d: %+v", len(grants), grants)
+		}
+
+		events, err := cs.ListAuthAuditEvents(ctx, AuthAuditQuery{Limit: 100})
+		if err != nil {
+			t.Fatalf("ListAuthAuditEvents after duplicate: %v", err)
+		}
+		createCount := 0
+		for _, ev := range events {
+			if ev.Action == "project.create" {
+				createCount++
+			}
+		}
+		if createCount != 1 {
+			t.Fatalf("expected exactly one project.create audit event after duplicate, got %d in %+v", createCount, events)
+		}
+	})
+
+	t.Run("sensitive_metadata_rolls_back_control_grant_and_audit", func(t *testing.T) {
+		// Use a fresh project name so the ON CONFLICT path is not engaged and
+		// the rollback is observable as absence of any new row.
+		err := cs.CreateProjectWithGrantAndAudit(ctx,
+			CreateProjectGrantParams{PrincipalID: actor.PrincipalID, Project: "beta-project", GrantedByPrincipalID: actor.PrincipalID},
+			AuthAuditEvent{ActorPrincipalID: actor.PrincipalID, ActorSource: "managed", Project: "beta-project", Action: "project.create", Outcome: "success", Metadata: map[string]any{"raw_token": "egc_live_secret"}},
+		)
+		if !errors.Is(err, ErrAuthAuditInsertFailed) {
+			t.Fatalf("expected ErrAuthAuditInsertFailed when audit metadata is sensitive, got %v", err)
+		}
+		if !errors.Is(err, ErrSensitiveAuditMetadata) {
+			t.Fatalf("expected ErrSensitiveAuditMetadata wrapped inside ErrAuthAuditInsertFailed, got %v", err)
+		}
+
+		if ctrl, err := cs.GetProjectSyncControl("beta-project"); err != nil {
+			t.Fatalf("GetProjectSyncControl beta-project: %v", err)
+		} else if ctrl != nil {
+			t.Fatalf("expected no control row for beta-project after rollback, got %+v", ctrl)
+		}
+
+		grants, err := cs.ListProjectGrants(ctx, actor.PrincipalID)
+		if err != nil {
+			t.Fatalf("ListProjectGrants after rollback: %v", err)
+		}
+		for _, grant := range grants {
+			if grant.Project == "beta-project" {
+				t.Fatalf("sensitive audit metadata must roll back the grant, found %+v", grant)
+			}
+		}
+
+		events, err := cs.ListAuthAuditEvents(ctx, AuthAuditQuery{Limit: 100})
+		if err != nil {
+			t.Fatalf("ListAuthAuditEvents after rollback: %v", err)
+		}
+		for _, ev := range events {
+			if ev.Project == "beta-project" {
+				t.Fatalf("sensitive audit metadata must roll back the audit event, found %+v", ev)
+			}
+		}
+	})
+}
+
 // TestFindPrincipalTokenByHashResolvesActiveTokenAndRejectsUnknownOrRevoked
 // is the RED-first proof for the runtime managed-token wiring slice: before
 // FindPrincipalTokenByHash existed, this test failed to compile (undefined

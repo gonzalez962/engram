@@ -32,3 +32,9 @@ Thumbs.db
 engram-dev
 .atl/
 .release-notes-beta.md
+
+# Local env files (production-like local stack secrets).
+# .env.example is versioned; .env is per-developer / per-host.
+.env
+.env.*
+!.env.example

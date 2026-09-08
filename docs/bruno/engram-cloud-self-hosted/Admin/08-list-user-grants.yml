@@ -1,0 +1,55 @@
+info:
+  name: List User Grants
+  type: http
+  seq: 8
+
+http:
+  method: GET
+  url: "{{baseUrl}}/admin/users/{{principalId}}/grants"
+  headers:
+    - name: Accept
+      value: application/json
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body
+      operator: isArray
+  scripts:
+    - type: tests
+      code: |-
+        test("Grants list is an array", function() {
+          expect(res.body).to.be.an("array");
+        });
+        test("Each grant identifies the project", function() {
+          if (res.body.length > 0) {
+            expect(res.body[0]).to.have.property("project");
+            expect(res.body[0]).to.have.property("principal_id");
+          }
+        });
+
+docs: |-
+  Lists the project grants for a managed principal. An empty array means
+  the principal cannot read or write any project through the cloud API.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminListGrants`
+  (line 291).
+
+  Response: JSON array of `cloudstore.ProjectGrant`:
+    {
+      "principal_id":          "<uuid>",
+      "project":               "<normalized project name>",
+      "granted_by_principal_id":"<uuid or empty>",
+      "created_at":            "<RFC3339>"
+    }
+
+  Status codes:
+    - 200 — list returned.
+    - 400 — `principal_id` missing.
+    - 401 / 403 — see folder docs.
+    - 500 — storage error.

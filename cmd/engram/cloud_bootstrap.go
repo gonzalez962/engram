@@ -339,10 +339,18 @@ func cmdCloudBootstrapRecoverToken() {
 }
 
 func cloudBootstrapCompletionMetadata(username string, issuedToken bool, grants []cloudstore.ProjectGrant) map[string]any {
+	// The "minted_credential" key is intentionally NOT named "*token*": every
+	// audit-metadata key passes through cloudstore.sensitiveAuthAuditKey, which
+	// rejects any key containing the substring "token" (or "authorization",
+	// "cookie", "secret", "hash", "password", "bearer") so raw token material
+	// cannot end up persisted. The pre-fix key "issued_token" tripped that
+	// guard for every successful `--issue-token` bootstrap and made the
+	// completion audit fail. The semantic is unchanged: a boolean flag
+	// indicating whether the optional credential step ran.
 	metadata := map[string]any{
-		"created_admin": true,
-		"username":      username,
-		"issued_token":  issuedToken,
+		"created_admin":    true,
+		"username":         username,
+		"minted_credential": issuedToken,
 	}
 	if len(grants) > 0 {
 		projects := make([]string, 0, len(grants))
