@@ -1,0 +1,73 @@
+info:
+  name: Pull Manifest
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{baseUrl}}/sync/pull"
+  params:
+    query:
+      - name: project
+        value: "{{project}}"
+        enabled: true
+  headers:
+    - name: Accept
+      value: application/json
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.headers.content-type
+      operator: contains
+      value: application/json
+  scripts:
+    - type: tests
+      code: |-
+        test("Manifest has version 1", function() {
+          expect(res.body).to.have.property("version", 1);
+        });
+        test("Manifest has chunks array", function() {
+          expect(res.body).to.have.property("chunks");
+          expect(res.body.chunks).to.be.an("array");
+        });
+
+docs: |-
+  Returns the manifest for one project: every chunk the cloud server knows
+  about, with the SHA-256 prefix, author, timestamp, and per-chunk counts.
+
+  Source: `internal/cloud/cloudserver/cloudserver.go` → `handlePullManifest`
+  (line 422).
+
+  Query params:
+    - `project` (required) — must be in `ENGRAM_CLOUD_ALLOWED_PROJECTS`.
+
+  Status codes:
+    - 200 — manifest returned.
+    - 400 — `project` missing or empty (error envelope
+      `{error_class, error_code, error}`).
+    - 401 — missing or invalid Bearer token.
+    - 403 — token does not authorize `project` (policy_forbidden).
+
+  Response shape (`engramsync.Manifest`):
+    {
+      "version": 1,
+      "chunks": [
+        {
+          "id": "<8-char SHA-256 prefix>",
+          "created_by": "<username or machine>",
+          "created_at": "<RFC3339>",
+          "sessions":  <int>,
+          "memories":  <int>,
+          "prompts":   <int>
+        }
+      ]
+    }
+
+  Capture an `id` into the `chunkId` environment variable to exercise
+  `02-pull-chunk` next.

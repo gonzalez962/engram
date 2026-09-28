@@ -1,0 +1,83 @@
+opencollection: 1.0.0
+
+info:
+  name: Engram Cloud Server (Self-Hosted)
+  type: collection
+  version: 1.0.0
+
+config:
+  proxy:
+    inherit: true
+    config:
+      protocol: http
+      hostname: ""
+      port: ""
+      auth:
+        username: ""
+        password: ""
+      bypassProxy: ""
+
+request:
+  variables:
+    - name: projectDefault
+      value: bruno-demo
+      enabled: true
+    - name: chunkIdDefault
+      value: ""
+      enabled: true
+    - name: principalIdDefault
+      value: ""
+      enabled: true
+    - name: tokenIdDefault
+      value: ""
+      enabled: true
+    - name: grantProjectDefault
+      value: ""
+      enabled: true
+  scripts:
+    - type: before-request
+      code: |-
+        // Stamp every request with a per-run correlation id so server logs
+        // can be cross-referenced with the Bruno run timeline. Variable is
+        // request-scoped — it does NOT leak between requests.
+        bru.setVar("engramRequestId", `engram-bru-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
+
+runtime:
+  scripts:
+    - type: tests
+      code: |-
+        // Collection-level guard: every authenticated response must be JSON
+        // and must not be a plain-text 401/403/500 page. Individual requests
+        // add their own assertions on top of this.
+        const ct = res.headers["content-type"] || "";
+        if (res.status !== 200 && res.status !== 201 && res.status !== 204) {
+          test("Response is JSON when error status", function() {
+            expect(ct).to.contain("application/json");
+          });
+        }
+
+ignore:
+  - node_modules
+  - .git
+
+docs:
+  content: |-
+    # Engram Cloud Server (Self-Hosted)
+
+    Executable documentation for the HTTP API exposed by `engram cloud serve`.
+    Every request maps 1:1 to a route registered in
+    `internal/cloud/cloudserver/cloudserver.go`.
+
+    | Group  | Path prefix | Auth |
+    |--------|-------------|------|
+    | Health | `/health`   | none |
+    | Sync   | `/sync/*`   | Bearer (sync or managed-token member) |
+    | Admin  | `/admin/*`  | Bearer (managed-token admin principal only) |
+
+    Select `Local` in the environment picker and replace `token` with the
+    real `ENGRAM_CLOUD_TOKEN` value before sending any `/sync/*` or
+    `/admin/*` request. See `./README.md` for setup and safe execution order.
+  type: text/markdown
+
+bundled: false
+extensions: {}

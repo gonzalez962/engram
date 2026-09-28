@@ -18,13 +18,14 @@ import (
 const (
 	authAuditOutcomeSuccess = "success"
 
-	authAuditActionUserCreate  = "user.create"
-	authAuditActionUserEnable  = "user.enable"
-	authAuditActionUserDisable = "user.disable"
-	authAuditActionTokenCreate = "token.create"
-	authAuditActionTokenRevoke = "token.revoke"
-	authAuditActionGrantCreate = "grant.create"
-	authAuditActionGrantRevoke = "grant.revoke"
+	authAuditActionUserCreate    = "user.create"
+	authAuditActionUserEnable    = "user.enable"
+	authAuditActionUserDisable   = "user.disable"
+	authAuditActionTokenCreate   = "token.create"
+	authAuditActionTokenRevoke   = "token.revoke"
+	authAuditActionGrantCreate   = "grant.create"
+	authAuditActionGrantRevoke   = "grant.revoke"
+	authAuditActionProjectCreate = "project.create"
 )
 
 // AdminIdentityStore is the storage boundary used by cloudserver admin API
@@ -40,6 +41,12 @@ type AdminIdentityStore interface {
 	CreateProjectGrant(ctx context.Context, params cloudstore.CreateProjectGrantParams) (cloudstore.ProjectGrant, error)
 	ListProjectGrants(ctx context.Context, principalID string) ([]cloudstore.ProjectGrant, error)
 	RevokeProjectGrant(ctx context.Context, principalID, project string) error
+	// CreateProjectWithGrantAndAudit persists a brand-new project together with
+	// its initial actor grant and the auth audit event in one transaction.
+	// Returns cloudstore.ErrProjectAlreadyExists (mapped to 409) when the
+	// project control row already exists, or cloudstore.ErrAuthAuditInsertFailed
+	// (mapped to 500) when the audit insert fails.
+	CreateProjectWithGrantAndAudit(ctx context.Context, params cloudstore.CreateProjectGrantParams, audit cloudstore.AuthAuditEvent) error
 	InsertAuthAuditEvent(ctx context.Context, event cloudstore.AuthAuditEvent) error
 }
 
@@ -60,6 +67,18 @@ type revokeAdminTokenRequest struct {
 
 type createAdminGrantRequest struct {
 	Project string `json:"project"`
+}
+
+type createAdminProjectRequest struct {
+	Name string `json:"name"`
+}
+
+// adminProjectMetadata is the stable response envelope for POST /admin/projects.
+// The contract is intentionally narrow: callers only see the normalized project
+// name and the initial sync state, with no echoes of internal ids or secrets.
+type adminProjectMetadata struct {
+	Name        string `json:"name"`
+	SyncEnabled bool   `json:"sync_enabled"`
 }
 
 type adminTokenMetadata struct {
@@ -369,6 +388,74 @@ func (s *CloudServer) handleAdminRevokeGrant(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"status": "ok", "principal_id": principalID, "project": project})
+}
+
+// handleAdminCreateProject implements POST /admin/projects for the managed
+// Engram Cloud self-hosted API. The contract is intentionally minimal:
+//   - Auth: only `requireManagedAdmin` (managed-token admin principal).
+//   - Payload: {"name": "<project>"} — nothing else is accepted by the
+//     decoder (DisallowUnknownFields); we deliberately do not accept display
+//     names, grant lists, or other speculative fields.
+//   - Effect: creates the project control row (sync_enabled=true), grants
+//     the acting admin a project grant, and writes a project.create audit
+//     event — all in one transaction so a failure at any stage leaves no
+//     orphaned state (see cloudstore.CreateProjectWithGrantAndAudit).
+//   - Response: 201 {name, sync_enabled} where `name` is the server-normalized
+//     form (trimmed, lowercased, collapsed --/__).
+//
+// Status codes:
+//   - 201 — created (with normalized name + sync_enabled).
+//   - 400 — invalid payload or empty name.
+//   - 403 — caller is not a managed admin principal.
+//   - 409 — project already exists (storage returns ErrProjectAlreadyExists).
+//   - 500 — storage failure or audit insert failure (rolls back the project
+//     and grant rows).
+func (s *CloudServer) handleAdminCreateProject(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.requireManagedAdmin(w, r)
+	if !ok {
+		return
+	}
+	store, ok := s.adminStore(w)
+	if !ok {
+		return
+	}
+	var req createAdminProjectRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid project payload: %v", err))
+		return
+	}
+	rawName := strings.TrimSpace(req.Name)
+	if rawName == "" {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "project name is required")
+		return
+	}
+	// Normalize via the same pipeline used by grants so the response reflects
+	// the canonical name persisted to disk.
+	normalized := cloudstore.NormalizeProjectGrant(rawName)
+	if normalized == "" {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "project name is invalid")
+		return
+	}
+	auditMetadata := map[string]any{"name": normalized}
+	if err := store.CreateProjectWithGrantAndAudit(r.Context(),
+		cloudstore.CreateProjectGrantParams{
+			PrincipalID:          actor.ID,
+			Project:              normalized,
+			GrantedByPrincipalID: actor.ID,
+		},
+		adminAuditEvent(actor, authAuditActionProjectCreate, "", normalized, auditMetadata),
+	); err != nil {
+		switch {
+		case errors.Is(err, cloudstore.ErrProjectAlreadyExists):
+			writeActionableError(w, http.StatusConflict, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("project %q already exists", normalized))
+		case errors.Is(err, cloudstore.ErrAuthAuditInsertFailed):
+			writeAuditFailure(w, err)
+		default:
+			writeActionableError(w, http.StatusInternalServerError, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeInternal, fmt.Sprintf("create project: %v", err))
+		}
+		return
+	}
+	jsonResponse(w, http.StatusCreated, adminProjectMetadata{Name: normalized, SyncEnabled: true})
 }
 
 func (s *CloudServer) requireManagedAdmin(w http.ResponseWriter, r *http.Request) (cloudauth.Principal, bool) {

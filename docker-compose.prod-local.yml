@@ -1,0 +1,93 @@
+# Engram Cloud — production-like local stack (managed principals)
+#
+# Builds the image from the current working tree (docker/cloud/Dockerfile),
+# NOT the GHCR-published image, so engineers can exercise the managed-admin
+# code paths (POST /admin/projects, cloud_principals, cloud_project_grants,
+# cloud_auth_audit_log) on the exact bytes they intend to deploy.
+#
+# This stack is intentionally separate from:
+#   - docker-compose.cloud.yml  (insecure smoke, smoke-project only)
+#   - docker-compose.beta.yml   (community beta, Phases 2-4 conflict UI)
+#   - docs/engram-cloud/docker-compose.ghcr.yml  (production deploy from GHCR)
+#
+# All four stacks can coexist on one host: disjoint ports, container names,
+# and Postgres volumes (see docs/engram-cloud/prod-local.md).
+#
+# Auth model in this stack:
+#   - ENGRAM_CLOUD_INSECURE_NO_AUTH is NOT set. The server starts in
+#     authenticated mode and refuses to start without explicit secrets.
+#   - ENGRAM_CLOUD_TOKEN, ENGRAM_CLOUD_ADMIN, ENGRAM_JWT_SECRET, and
+#     ENGRAM_CLOUD_TOKEN_PEPPER must all be set to non-default strong
+#     values, and ENGRAM_CLOUD_ALLOWED_PROJECTS must be non-empty to
+#     satisfy validateCloudServeAuthConfig (cmd/engram/cloud.go).
+#   - The acting admin is created by `engram cloud bootstrap admin --issue-token`
+#     after the stack is up. The returned managed token is the only credential
+#     that can call POST /admin/projects.
+#   - Managed principals authorize against cloud_project_grants; the legacy
+#     ENGRAM_CLOUD_ALLOWED_PROJECTS allowlist is not consulted for them.
+#     See the "Role of ENGRAM_CLOUD_ALLOWED_PROJECTS" section of the doc.
+#
+# Secrets are loaded from a sibling .env file (never committed). Copy
+# .env.example at the repo root to .env, replace the placeholders, then
+# run: docker compose -f docker-compose.prod-local.yml --env-file .env up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: engram-prod-local-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - engram-prod-local-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Host loopback only — never published on the LAN.
+    ports:
+      - "35432:5432"
+
+  cloud:
+    build:
+      context: .
+      dockerfile: docker/cloud/Dockerfile
+    container_name: engram-prod-local-cloud
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # DSN points at the postgres service on the compose bridge network.
+      ENGRAM_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      # Required by validateCloudServeAuthConfig when both ENGRAM_CLOUD_TOKEN
+      # and ENGRAM_CLOUD_ALLOWED_PROJECTS are set.
+      ENGRAM_JWT_SECRET: ${ENGRAM_JWT_SECRET}
+      # Legacy env-token credentials. The server still requires these at
+      # startup even though the admin-only work uses managed tokens.
+      ENGRAM_CLOUD_TOKEN: ${ENGRAM_CLOUD_TOKEN}
+      ENGRAM_CLOUD_ADMIN: ${ENGRAM_CLOUD_ADMIN}
+      # Dedicated secret for hashing managed tokens. Must be distinct from
+      # ENGRAM_JWT_SECRET (see internal/cloud/config.go TokenPepper contract).
+      ENGRAM_CLOUD_TOKEN_PEPPER: ${ENGRAM_CLOUD_TOKEN_PEPPER}
+      # Required for startup validation. See the doc "Role of
+      # ENGRAM_CLOUD_ALLOWED_PROJECTS" — managed grants do NOT use this.
+      ENGRAM_CLOUD_ALLOWED_PROJECTS: ${ENGRAM_CLOUD_ALLOWED_PROJECTS}
+      # Listen inside the container on all interfaces so the host port
+      # mapping reaches it. The host-port mapping is 127.0.0.1-only.
+      ENGRAM_CLOUD_HOST: 0.0.0.0
+      ENGRAM_PORT: "18080"
+    # Host loopback only — never published on the LAN.
+    ports:
+      - "38080:18080"
+    command: ["cloud", "serve"]
+
+volumes:
+  engram-prod-local-pg:

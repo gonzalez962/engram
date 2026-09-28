@@ -1,0 +1,41 @@
+info:
+  name: Admin
+  type: folder
+
+http:
+  auth:
+    type: bearer
+    token: "{{token}}"
+
+runtime:
+  scripts:
+    - type: tests
+      code: |-
+        // Admin endpoints demand a managed-token principal with role=admin.
+        // A 403 with error_code=policy_forbidden means the token resolves
+        // but is not an admin — surface this distinctly so operators
+        // don't mistake it for a generic auth failure.
+        if (res.status === 403) {
+          test("Admin endpoint returned expected policy error", function() {
+            if (res.body && res.body.error_code) {
+              expect([
+                "policy_forbidden",
+                "forbidden: managed admin principal is required"
+              ]).to.include(res.body.error_code);
+            }
+          });
+        }
+
+docs: |-
+  Bearer-authenticated admin endpoints. Every successful mutation is
+  recorded in the auth audit log.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go`.
+
+  **Important.** These endpoints require a *managed* token whose principal
+  has `Role=admin`. The legacy `ENGRAM_CLOUD_TOKEN` (sync-only) cannot
+  authenticate here — it resolves to `PrincipalSourceLegacyEnvSync` with
+  `Role=member`. Mint an admin token first via:
+    engram cloud bootstrap admin --issue-token
+  ...and use the printed `egc_live_*` token in the `token` environment
+  variable when exercising this folder.

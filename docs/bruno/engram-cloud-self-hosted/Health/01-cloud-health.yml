@@ -1,0 +1,46 @@
+info:
+  name: Cloud Health
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{baseUrl}}/health"
+  headers:
+    - name: Accept
+      value: application/json
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.status
+      operator: eq
+      value: ok
+    - expression: res.body.service
+      operator: eq
+      value: engram-cloud
+    - expression: res.headers.content-type
+      operator: contains
+      value: application/json
+
+docs: |-
+  Liveness probe for the cloud server.
+
+  Source: `internal/cloud/cloudserver/cloudserver.go` → `handleHealth`
+  (line 411). Returns 200 with a fixed JSON body. No Bearer token is sent
+  (and none is required). If this request fails, none of the
+  authenticated `/sync/*` or `/admin/*` requests will work either.
+
+  Response shape:
+    { "status": "ok", "service": "engram-cloud" }
+
+  Note: there is a *second* health endpoint at `GET /dashboard/health`
+  owned by the dashboard subsystem (`internal/cloud/dashboard/dashboard.go`
+  → `handleHealth`). It returns `{ "status": "ok", "subsystem": "dashboard" }`
+  and is also unauthenticated. Both are valid liveness signals; this
+  collection documents the primary one.

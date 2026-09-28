@@ -1,0 +1,64 @@
+info:
+  name: List User Tokens
+  type: http
+  seq: 5
+
+http:
+  method: GET
+  url: "{{baseUrl}}/admin/users/{{principalId}}/tokens"
+  headers:
+    - name: Accept
+      value: application/json
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body
+      operator: isArray
+  scripts:
+    - type: tests
+      code: |-
+        test("Token list is an array", function() {
+          expect(res.body).to.be.an("array");
+        });
+        test("Token entries carry sanitized metadata only", function() {
+          if (res.body.length > 0) {
+            expect(res.body[0]).to.not.have.property("token_hash");
+            expect(res.body[0]).to.have.property("id");
+            expect(res.body[0]).to.have.property("principal_id");
+            expect(res.body[0]).to.have.property("token_prefix");
+          }
+        });
+
+docs: |-
+  Lists every managed token for one principal. The response carries
+  sanitized metadata (`adminTokenMetadata`): `token_hash` is stripped.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminListTokens`
+  (line 157).
+
+  Response: JSON array of `adminTokenMetadata`:
+    {
+      "id":                     "<uuid>",
+      "principal_id":           "<uuid>",
+      "token_prefix":           "egc_live_<8-hex>",
+      "name":                   "<human label>",
+      "created_by_principal_id": "<uuid>",
+      "created_at":             "<RFC3339>",
+      "last_used_at":           "<RFC3339 or null>",
+      "revoked_at":             "<RFC3339 or null>",
+      "revoked_by_principal_id":"<uuid or empty>",
+      "revocation_reason":      "<string or empty>"
+    }
+
+  Status codes:
+    - 200 — list returned.
+    - 400 — `principal_id` missing.
+    - 401 — Bearer token missing/invalid.
+    - 403 — managed admin principal required.
+    - 500 — storage or admin identity error.

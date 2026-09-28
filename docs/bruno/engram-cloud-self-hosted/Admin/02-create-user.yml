@@ -1,0 +1,77 @@
+info:
+  name: Create User
+  type: http
+  seq: 2
+
+http:
+  method: POST
+  url: "{{baseUrl}}/admin/users"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "username":     "{{newUsername}}",
+        "email":        "{{newEmail}}",
+        "display_name": "{{newDisplayName}}",
+        "role":         "{{newRole}}"
+      }
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "201"
+    - expression: res.body.principal_id
+      operator: isString
+    - expression: res.body.enabled
+      operator: isBoolean
+  scripts:
+    - type: after-response
+      code: |-
+        // The newly created principal id is needed by every subsequent
+        // /admin/users/{principalID}/* request. Save it to the env so the
+        // rest of the admin flow can be run in sequence.
+        if (res.body && typeof res.body.principal_id === "string") {
+          bru.setEnvVar("principalId", res.body.principal_id);
+        }
+    - type: tests
+      code: |-
+        test("Created user has a principal_id", function() {
+          expect(res.body).to.have.property("principal_id");
+          expect(res.body.principal_id).to.be.a("string").that.is.not.empty;
+        });
+
+docs: |-
+  Creates a managed human user. Returns 201 with the new `HumanUser`.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminCreateUser`
+  (line 94).
+
+  Request body (`createAdminUserRequest`):
+    - `username`     — required, server-trimmed.
+    - `email`        — required, server-trimmed.
+    - `display_name` — optional.
+    - `role`         — `"admin"` or `"member"`; defaults to `"member"` when
+      empty. Invalid values are rejected by `cloudstore`.
+
+  Effects:
+    - Inserts a row in `cloud_principals` with `Kind=human`.
+    - Inserts an `auth_audit_events` row with `action=user.create`,
+      `actor_source=managed_token`, and the calling principal in the
+      metadata. The audit insert is **mandatory**: if it fails the user
+      creation rolls back and the response is 500
+      (`record auth audit: ...`).
+
+  Status codes:
+    - 201 — user created. Body: `HumanUser`.
+    - 400 — malformed payload, duplicate username, or storage rejection.
+    - 401 — Bearer token missing/invalid.
+    - 403 — managed admin principal required.
