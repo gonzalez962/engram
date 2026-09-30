@@ -96,6 +96,75 @@ type LocalStore interface {
 	CountDeferredAndDeadForScope(targetKey, project string) (deferred, dead int, err error)
 }
 
+// scopedPendingLister selects pending journal rows for a project scope inside
+// the store query. Scoped managers require it so rows routed to other remotes
+// can never fill a batch and starve this manager.
+type scopedPendingLister interface {
+	ListPendingSyncMutationsScoped(targetKey string, include, exclude []string, limit int) ([]store.SyncMutation, error)
+}
+
+// pullCursorAdvancer moves the pull cursor past mutations a scoped manager
+// skips because their project is outside its scope.
+type pullCursorAdvancer interface {
+	AdvanceSyncPullCursor(targetKey string, seq int64) error
+}
+
+// projectScope is the set of projects a manager owns. A nil include and empty
+// exclude (the legacy configuration) owns every project.
+type projectScope struct {
+	include map[string]struct{} // non-nil: only these projects
+	exclude map[string]struct{}
+	// Sorted lists handed to the store query.
+	includeList []string
+	excludeList []string
+}
+
+func newProjectScope(include, exclude []string) projectScope {
+	var scope projectScope
+	if include != nil {
+		scope.include, scope.includeList = projectSet(include)
+	}
+	if len(exclude) > 0 {
+		scope.exclude, scope.excludeList = projectSet(exclude)
+	}
+	return scope
+}
+
+func projectSet(projects []string) (map[string]struct{}, []string) {
+	set := make(map[string]struct{}, len(projects))
+	list := make([]string, 0, len(projects))
+	for _, project := range projects {
+		project = strings.TrimSpace(project)
+		if project == "" {
+			continue
+		}
+		if _, ok := set[project]; ok {
+			continue
+		}
+		set[project] = struct{}{}
+		list = append(list, project)
+	}
+	sort.Strings(list)
+	return set, list
+}
+
+// scoped reports whether the manager syncs only a subset of projects.
+func (s projectScope) scoped() bool {
+	return s.include != nil || len(s.exclude) > 0
+}
+
+// owns reports whether project belongs to this manager. Empty-project rows
+// belong to the unscoped and exclude-scoped (global) managers only.
+func (s projectScope) owns(project string) bool {
+	project = strings.TrimSpace(project)
+	if s.include != nil {
+		_, ok := s.include[project]
+		return ok && project != ""
+	}
+	_, excluded := s.exclude[project]
+	return !excluded
+}
+
 type enrolledProjectRepairEnsurer interface {
 	EnsureEnrolledProjectSyncMutations(ctx context.Context) error
 }
@@ -147,7 +216,10 @@ func (e *projectTransportFailure) Unwrap() error { return e.err }
 
 // Config holds tuning parameters for the background sync manager.
 type Config struct {
-	TargetKey              string        // sync_state target key (default: "cloud")
+	TargetKey              string        // journal target key for pending list/ack (default: "cloud")
+	StateKey               string        // sync_state key for lease, pull cursor, pulled/deferred rows and status (default: TargetKey)
+	IncludeProjects        []string      // when non-nil, sync only these projects (a per-project remote)
+	ExcludeProjects        []string      // sync every project except these (the global remote with routed projects)
 	LeaseOwner             string        // unique owner identity for lease
 	LeaseInterval          time.Duration // how long to hold the lease each cycle
 	DebounceDuration       time.Duration // debounce window for dirty notifications
@@ -199,6 +271,7 @@ type Manager struct {
 	store     LocalStore
 	transport CloudTransport
 	cfg       Config
+	scope     projectScope
 
 	mu        sync.RWMutex
 	status    Status
@@ -218,6 +291,9 @@ type Manager struct {
 func New(localStore LocalStore, transport CloudTransport, cfg Config) *Manager {
 	if cfg.TargetKey == "" {
 		cfg.TargetKey = store.DefaultSyncTargetKey
+	}
+	if strings.TrimSpace(cfg.StateKey) == "" {
+		cfg.StateKey = cfg.TargetKey
 	}
 	if cfg.PushBatchSize <= 0 {
 		cfg.PushBatchSize = 100
@@ -247,6 +323,7 @@ func New(localStore LocalStore, transport CloudTransport, cfg Config) *Manager {
 		store:     localStore,
 		transport: transport,
 		cfg:       cfg,
+		scope:     newProjectScope(cfg.IncludeProjects, cfg.ExcludeProjects),
 		status:    Status{Phase: PhaseIdle},
 		dirtyCh:   make(chan struct{}, 1),
 	}
@@ -270,7 +347,7 @@ func (m *Manager) Status() Status {
 	m.mu.RUnlock()
 
 	// Phase E: populate deferred/dead counts from store (live query, best-effort).
-	if deferred, dead, err := m.store.CountDeferredAndDeadForScope(m.cfg.TargetKey, ""); err == nil {
+	if deferred, dead, err := m.store.CountDeferredAndDeadForScope(m.cfg.StateKey, ""); err == nil {
 		st.DeferredCount = deferred
 		st.DeadCount = dead
 	}
@@ -483,7 +560,7 @@ func (m *Manager) cycle(ctx context.Context) {
 
 	// Acquire lease.
 	now := time.Now().UTC()
-	acquired, err := m.store.AcquireSyncLease(m.cfg.TargetKey, m.cfg.LeaseOwner, m.cfg.LeaseInterval, now)
+	acquired, err := m.store.AcquireSyncLease(m.cfg.StateKey, m.cfg.LeaseOwner, m.cfg.LeaseInterval, now)
 	if err != nil || !acquired {
 		return
 	}
@@ -498,7 +575,7 @@ func (m *Manager) cycle(ctx context.Context) {
 		var blocked *nonEnrolledPendingError
 		if !errors.As(err, &blocked) {
 			reasonCode := classifyTransportError(err)
-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("push: %v", err), err), reasonCode)
+			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.StateKey, fmt.Sprintf("push: %v", err), err), reasonCode)
 			return
 		}
 
@@ -506,19 +583,19 @@ func (m *Manager) cycle(ctx context.Context) {
 		m.recordBlocked(blockedMessage, constants.ReasonNonEnrolledPendingMutations)
 		if err := m.pullPreservingSyncState(ctx); err != nil {
 			reasonCode := classifyTransportError(err)
-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
+			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.StateKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
 			return
 		}
 		if err := m.recordBlockedAfterSuccess(blockedMessage, constants.ReasonNonEnrolledPendingMutations); err != nil {
 			reasonCode := classifyTransportError(err)
-			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("persist blocked state after successful pull: %v", err), err), reasonCode)
+			m.recordFailureWithReason(autosyncFailureMessage(m.cfg.StateKey, fmt.Sprintf("persist blocked state after successful pull: %v", err), err), reasonCode)
 		}
 		return
 	}
 
 	if err := m.pull(ctx); err != nil {
 		reasonCode := classifyTransportError(err)
-		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.TargetKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
+		m.recordFailureWithReason(autosyncFailureMessage(m.cfg.StateKey, fmt.Sprintf("pull: %v", err), err), reasonCode)
 		return
 	}
 
@@ -618,7 +695,7 @@ func (m *Manager) push(ctx context.Context) error {
 		}
 	}
 
-	pending, err := m.store.ListPendingSyncMutations(m.cfg.TargetKey, m.cfg.PushBatchSize)
+	pending, err := m.listPending()
 	if err != nil {
 		return fmt.Errorf("list pending: %w", err)
 	}
@@ -627,6 +704,7 @@ func (m *Manager) push(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("count pending non-enrolled mutations: %w", err)
 		}
+		counts = m.ownedCounts(counts)
 		if len(counts) > 0 {
 			return &nonEnrolledPendingError{counts: counts}
 		}
@@ -691,6 +769,35 @@ func (m *Manager) push(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
+// listPending returns the next push batch from the journal. A scoped manager
+// selects its projects inside the store query so rows routed to other remotes
+// cannot fill the batch.
+func (m *Manager) listPending() ([]store.SyncMutation, error) {
+	if !m.scope.scoped() {
+		return m.store.ListPendingSyncMutations(m.cfg.TargetKey, m.cfg.PushBatchSize)
+	}
+	lister, ok := m.store.(scopedPendingLister)
+	if !ok {
+		return nil, fmt.Errorf("store does not support project-scoped pending mutations")
+	}
+	return lister.ListPendingSyncMutationsScoped(m.cfg.TargetKey, m.scope.includeList, m.scope.excludeList, m.cfg.PushBatchSize)
+}
+
+// ownedCounts drops non-enrolled backlog counts of projects another remote
+// owns, so one remote never reports another remote's enrollment block.
+func (m *Manager) ownedCounts(counts []store.PendingSyncMutationProjectCount) []store.PendingSyncMutationProjectCount {
+	if !m.scope.scoped() {
+		return counts
+	}
+	owned := counts[:0:0]
+	for _, count := range counts {
+		if m.scope.owns(count.Project) {
+			owned = append(owned, count)
+		}
+	}
+	return owned
+}
+
 // ─── Pull ────────────────────────────────────────────────────────────────────
 
 func (m *Manager) pull(ctx context.Context) error {
@@ -708,12 +815,20 @@ func (m *Manager) pullWithSyncState(ctx context.Context, preserveSyncState bool)
 
 	m.setPhase(PhasePulling)
 
-	state, err := m.store.GetSyncState(m.cfg.TargetKey)
+	state, err := m.store.GetSyncState(m.cfg.StateKey)
 	if err != nil {
 		return fmt.Errorf("get sync state: %w", err)
 	}
 
 	sinceSeq := state.LastPulledSeq
+
+	var advancer pullCursorAdvancer
+	if m.scope.scoped() {
+		var ok bool
+		if advancer, ok = m.store.(pullCursorAdvancer); !ok {
+			return fmt.Errorf("store does not support advancing the pull cursor past out-of-scope mutations")
+		}
+	}
 
 	touchedProjects := make(map[string]struct{})
 	projectOrder := make([]string, 0)
@@ -727,10 +842,22 @@ func (m *Manager) pullWithSyncState(ctx context.Context, preserveSyncState bool)
 			return fmt.Errorf("transport pull: %w", err)
 		}
 
+		var skippedSeq int64
 		for _, rm := range resp.Mutations {
+			// Mutations of projects routed to another remote are never applied
+			// from this one; the cursor still moves past them.
+			if !m.scope.owns(rm.Project) {
+				if rm.Seq > skippedSeq {
+					skippedSeq = rm.Seq
+				}
+				if rm.Seq > sinceSeq {
+					sinceSeq = rm.Seq
+				}
+				continue
+			}
 			localMut := store.SyncMutation{
 				Seq:        rm.Seq,
-				TargetKey:  m.cfg.TargetKey,
+				TargetKey:  m.cfg.StateKey,
 				Project:    rm.Project,
 				Entity:     rm.Entity,
 				EntityKey:  rm.EntityKey,
@@ -744,9 +871,9 @@ func (m *Manager) pullWithSyncState(ctx context.Context, preserveSyncState bool)
 			// to sync_apply_deferred and returning nil — the cursor advances normally.
 			// All other errors (legacy entities, decode errors) propagate and halt the pull.
 			if preserveSyncState {
-				err = m.store.ApplyPulledMutationPreservingSyncState(m.cfg.TargetKey, localMut)
+				err = m.store.ApplyPulledMutationPreservingSyncState(m.cfg.StateKey, localMut)
 			} else {
-				err = m.store.ApplyPulledMutation(m.cfg.TargetKey, localMut)
+				err = m.store.ApplyPulledMutation(m.cfg.StateKey, localMut)
 			}
 			if err != nil {
 				return fmt.Errorf("apply pulled mutation seq=%d: %w", rm.Seq, err)
@@ -763,14 +890,20 @@ func (m *Manager) pullWithSyncState(ctx context.Context, preserveSyncState bool)
 			}
 		}
 
+		if skippedSeq > 0 {
+			if err := advancer.AdvanceSyncPullCursor(m.cfg.StateKey, skippedSeq); err != nil {
+				return fmt.Errorf("advance pull cursor past out-of-scope seq=%d: %w", skippedSeq, err)
+			}
+		}
+
 		if !resp.HasMore {
 			break
 		}
 	}
 
-	pendingProjects, err := m.store.ListDeferredProjectsForTarget(m.cfg.TargetKey)
+	pendingProjects, err := m.store.ListDeferredProjectsForTarget(m.cfg.StateKey)
 	if err != nil {
-		log.Printf("[autosync] list deferred projects target=%q error: %v", m.cfg.TargetKey, err)
+		log.Printf("[autosync] list deferred projects target=%q error: %v", m.cfg.StateKey, err)
 	} else {
 		for _, project := range pendingProjects {
 			project = strings.TrimSpace(project)
@@ -787,7 +920,7 @@ func (m *Manager) pullWithSyncState(ctx context.Context, preserveSyncState bool)
 	sort.Strings(projectOrder)
 
 	for _, project := range projectOrder {
-		if res, err := m.store.ReplayDeferredForScope(m.cfg.TargetKey, project); err != nil {
+		if res, err := m.store.ReplayDeferredForScope(m.cfg.StateKey, project); err != nil {
 			log.Printf("[autosync] replayDeferred project=%q error: %v", project, err)
 		} else if res.Retried > 0 {
 			log.Printf("[autosync] replayDeferred project=%q retried=%d succeeded=%d failed=%d dead=%d",
@@ -829,10 +962,10 @@ func (m *Manager) recordFailureWithReason(msg, reasonCode string) {
 	m.mu.Unlock()
 
 	if reasonAware, ok := m.store.(reasonAwareFailureStore); ok {
-		_ = reasonAware.MarkSyncFailureWithReason(m.cfg.TargetKey, reasonCode, msg, bu)
+		_ = reasonAware.MarkSyncFailureWithReason(m.cfg.StateKey, reasonCode, msg, bu)
 		return
 	}
-	_ = m.store.MarkSyncFailure(m.cfg.TargetKey, msg, bu)
+	_ = m.store.MarkSyncFailure(m.cfg.StateKey, msg, bu)
 }
 
 func (m *Manager) recordBlocked(msg, reasonCode string) {
@@ -844,11 +977,11 @@ func (m *Manager) recordBlocked(msg, reasonCode string) {
 	m.status.BackoffUntil = nil
 	m.mu.Unlock()
 
-	_ = m.store.MarkSyncBlocked(m.cfg.TargetKey, reasonCode, msg)
+	_ = m.store.MarkSyncBlocked(m.cfg.StateKey, reasonCode, msg)
 }
 
 func (m *Manager) recordBlockedAfterSuccess(msg, reasonCode string) error {
-	if err := m.store.MarkSyncBlockedAfterSuccess(m.cfg.TargetKey, reasonCode, msg); err != nil {
+	if err := m.store.MarkSyncBlockedAfterSuccess(m.cfg.StateKey, reasonCode, msg); err != nil {
 		return err
 	}
 
@@ -877,7 +1010,7 @@ func (m *Manager) recordSuccess() {
 	m.status.ReasonMessage = ""
 	m.mu.Unlock()
 
-	_ = m.store.MarkSyncHealthy(m.cfg.TargetKey)
+	_ = m.store.MarkSyncHealthy(m.cfg.StateKey)
 }
 
 func nonEnrolledPendingMessage(counts []store.PendingSyncMutationProjectCount) string {
@@ -929,5 +1062,5 @@ func (m *Manager) releaseLease() {
 	m.mu.Lock()
 	m.leaseHeld = false
 	m.mu.Unlock()
-	_ = m.store.ReleaseSyncLease(m.cfg.TargetKey, m.cfg.LeaseOwner)
+	_ = m.store.ReleaseSyncLease(m.cfg.StateKey, m.cfg.LeaseOwner)
 }

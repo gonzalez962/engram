@@ -1,6 +1,9 @@
 package store
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func countPendingProjectMutations(t *testing.T, s *Store, project string) int {
 	t.Helper()
@@ -162,5 +165,108 @@ func TestRequeueProjectSyncHistoryReplaysAgainAfterPartialDelivery(t *testing.T)
 	}
 	if second != first {
 		t.Fatalf("queued after partial delivery = %d, want full replay %d", second, first)
+	}
+}
+
+func seedPendingSessionRow(t *testing.T, s *Store, project, id string) int64 {
+	t.Helper()
+	res, err := s.db.Exec(`
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+		VALUES (?, 'session', ?, 'upsert', ?, 'local', ?)`,
+		DefaultSyncTargetKey, id, `{"id":"`+id+`","directory":"/tmp/x","project":"`+project+`"}`, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := res.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+func pendingProjects(rows []SyncMutation) []string {
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.Project)
+	}
+	return out
+}
+
+func TestListPendingSyncMutationsScopedSelectsInTheQuery(t *testing.T) {
+	s := newTestStore(t)
+	for _, project := range []string{"alpha", "beta", "gamma"} {
+		if err := s.EnrollProject(project); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Five alpha rows at the head of the journal would fill a LIMIT 2 batch
+	// if scope were applied after the query.
+	for i := 0; i < 5; i++ {
+		seedPendingSessionRow(t, s, "alpha", "alpha-"+string(rune('a'+i)))
+	}
+	betaSeq := seedPendingSessionRow(t, s, "beta", "beta-1")
+	seedPendingSessionRow(t, s, "gamma", "gamma-1")
+	seedPendingSessionRow(t, s, "", "global-1")
+	seedPendingSessionRow(t, s, "unenrolled", "unenrolled-1")
+
+	included, err := s.ListPendingSyncMutationsScoped(DefaultSyncTargetKey, []string{"beta"}, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(included) != 1 || included[0].Seq != betaSeq {
+		t.Fatalf("include beta = %v, want only seq %d", pendingProjects(included), betaSeq)
+	}
+
+	excluded, err := s.ListPendingSyncMutationsScoped(DefaultSyncTargetKey, nil, []string{"alpha"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(pendingProjects(excluded), ","); got != "beta,gamma," {
+		t.Fatalf("exclude alpha = %q, want beta,gamma and the empty-project row", got)
+	}
+
+	none, err := s.ListPendingSyncMutationsScoped(DefaultSyncTargetKey, []string{}, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("empty include set must select nothing, got %v", pendingProjects(none))
+	}
+
+	legacy, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unscoped, err := s.ListPendingSyncMutationsScoped(DefaultSyncTargetKey, nil, nil, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(pendingProjects(unscoped), ",") != strings.Join(pendingProjects(legacy), ",") {
+		t.Fatalf("nil scope = %v, want legacy %v", pendingProjects(unscoped), pendingProjects(legacy))
+	}
+}
+
+func TestAdvanceSyncPullCursorOnlyMovesForward(t *testing.T) {
+	s := newTestStore(t)
+	const key = "cloud@abc123"
+	if err := s.AdvanceSyncPullCursor(key, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AdvanceSyncPullCursor(key, 3); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.GetSyncState(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.LastPulledSeq != 7 {
+		t.Fatalf("cursor = %d, want 7", state.LastPulledSeq)
+	}
+	global, err := s.GetSyncState(DefaultSyncTargetKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if global.LastPulledSeq != 0 {
+		t.Fatalf("global cursor moved to %d", global.LastPulledSeq)
 	}
 }
