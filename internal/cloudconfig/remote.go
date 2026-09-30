@@ -95,38 +95,44 @@ func ProjectRemotes(cfg *Config) []NamedProjectRemote {
 // an override use the global remote with the usual env overrides
 // (ENGRAM_CLOUD_SERVER, then ENGRAM_CLOUD_TOKEN before cloud.json). Overridden
 // projects ignore env vars and never fall back to the global token, so the
-// global credential is not sent to a different server.
-func ResolveForProject(cfg *Config, project string) Remote {
-	if cfg != nil {
-		if override, ok := cfg.Projects[strings.TrimSpace(project)]; ok && strings.TrimSpace(project) != "" {
-			return resolveOverride(override)
+// global credential is not sent to a different server. A persisted override
+// whose server URL is empty or invalid is reported as an error instead of a
+// silently unusable remote. project is looked up as given (trimmed); callers
+// normalize project names before resolving.
+func ResolveForProject(cfg *Config, project string) (Remote, error) {
+	name := strings.TrimSpace(project)
+	if cfg != nil && name != "" {
+		if override, ok := cfg.Projects[name]; ok {
+			return resolveOverride(name, override)
 		}
 	}
-	return resolveGlobal(cfg)
+	return resolveGlobal(cfg), nil
 }
 
-func resolveOverride(override ProjectRemote) Remote {
-	r := Remote{
-		ServerURL: strings.TrimSpace(override.ServerURL),
-		Token:     strings.TrimSpace(override.Token),
+func resolveOverride(project string, override ProjectRemote) (Remote, error) {
+	validated, err := ValidateServerURL(override.ServerURL)
+	if err != nil {
+		return Remote{}, fmt.Errorf("cloud remote override for project %q has an invalid server URL: %w", project, err)
 	}
-	if r.ServerURL != "" {
-		r.ServerSource = SourceFile
+	r := Remote{
+		ServerURL:    validated,
+		Token:        strings.TrimSpace(override.Token),
+		ServerSource: SourceFile,
 	}
 	if r.Token != "" {
 		r.TokenSource = SourceFile
 	}
 	r.ID = RemoteID(r.ServerURL, r.Token)
-	return r
+	return r, nil
 }
 
 func resolveGlobal(cfg *Config) Remote {
 	r := Remote{Global: true}
 	if cfg != nil {
-		r.ServerURL = cfg.ServerURL
+		r.ServerURL = strings.TrimSpace(cfg.ServerURL)
 		r.Token = strings.TrimSpace(cfg.Token)
 	}
-	if strings.TrimSpace(r.ServerURL) != "" {
+	if r.ServerURL != "" {
 		r.ServerSource = SourceFile
 	}
 	if value := strings.TrimSpace(os.Getenv(EnvCloudServer)); value != "" {

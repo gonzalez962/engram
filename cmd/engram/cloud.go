@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -355,7 +356,7 @@ func cmdCloudUpgradeDoctor(cfg store.Config) {
 	defer s.Close()
 
 	cloudConfigured := false
-	if cc, cfgErr := resolveCloudRuntimeConfig(cfg); cfgErr == nil {
+	if cc, cfgErr := resolveCloudRuntimeConfigForProject(cfg, project); cfgErr == nil {
 		if cc != nil {
 			if validated, err := cloudconfig.ValidateServerURL(cc.ServerURL); err == nil && strings.TrimSpace(validated) != "" {
 				cloudConfigured = true
@@ -501,7 +502,7 @@ func cmdCloudUpgradeBootstrap(cfg store.Config) {
 	}
 	defer s.Close()
 
-	cc, err := resolveCloudRuntimeConfig(cfg)
+	cc, err := resolveCloudRuntimeConfigForProject(cfg, project)
 	if err != nil {
 		fatal(err)
 		return
@@ -561,7 +562,7 @@ func cmdCloudUpgradeRemirror(cfg store.Config) {
 		return
 	}
 	defer s.Close()
-	cc, err := resolveCloudRuntimeConfig(cfg)
+	cc, err := resolveCloudRuntimeConfigForProject(cfg, project)
 	if err != nil {
 		fatal(err)
 		return
@@ -690,6 +691,7 @@ func cmdCloudStatus(cfg store.Config) {
 	if cc.ServerURL == "" {
 		fmt.Println("Cloud status: not configured (no effective server URL)")
 		printCloudStatusAuth(token, tokenSource, false, false)
+		printCloudStatusProjectRemotes(cfg)
 		printCloudStatusProjectEnrollment(cfg, project)
 		printCloudStatusSyncDiagnostic(cfg, project)
 		return
@@ -716,6 +718,7 @@ func cmdCloudStatus(cfg store.Config) {
 	if token == "" && !insecureNoAuth {
 		fmt.Println("Hint: if the remote server enforces bearer auth, set ENGRAM_CLOUD_TOKEN")
 	}
+	printCloudStatusProjectRemotes(cfg)
 	printCloudStatusProjectEnrollment(cfg, project)
 	printCloudStatusDaemonProbe()
 	printCloudStatusSyncDiagnostic(cfg, project)
@@ -936,7 +939,13 @@ func cmdCloudUnenroll(cfg store.Config) {
 	fmt.Println("Note: an already in-flight push is not cancelled.")
 }
 
+const cloudConfigUsage = "usage: engram cloud config --server <url> | --clear | --project <name> --server <url> [--token <token>] | --project <name> --clear"
+
 func cmdCloudConfig(cfg store.Config) {
+	if hasCloudUpgradeFlag(os.Args[3:], "--project") {
+		cmdCloudConfigProject(cfg, os.Args[3:])
+		return
+	}
 	if len(os.Args) == 4 && os.Args[3] == "--clear" {
 		if err := cloudconfig.Clear(cfg.DataDir); err != nil {
 			fatal(err)
@@ -952,7 +961,7 @@ func cmdCloudConfig(cfg store.Config) {
 		return
 	}
 	if len(os.Args) < 5 || os.Args[3] != "--server" {
-		fmt.Fprintln(os.Stderr, "usage: engram cloud config --server <url> | --clear")
+		fmt.Fprintln(os.Stderr, cloudConfigUsage)
 		exitFunc(1)
 		return
 	}
@@ -979,6 +988,181 @@ func cmdCloudConfig(cfg store.Config) {
 		return
 	}
 	fmt.Printf("✓ Cloud server set to %s\n", cc.ServerURL)
+}
+
+type cloudConfigProjectArgs struct {
+	project  string
+	server   string
+	token    string
+	hasToken bool
+	clear    bool
+}
+
+func parseCloudConfigProjectArgs(args []string) (cloudConfigProjectArgs, error) {
+	var out cloudConfigProjectArgs
+	hasServer := false
+	value := func(i int, flag string) (string, error) {
+		if i+1 >= len(args) {
+			return "", fmt.Errorf("%s requires a value", flag)
+		}
+		return args[i+1], nil
+	}
+	for i := 0; i < len(args); i++ {
+		switch flag := strings.TrimSpace(args[i]); flag {
+		case "--project":
+			raw, err := value(i, flag)
+			if err != nil {
+				return out, err
+			}
+			name, warning, err := normalizeCloudCLIProjectInput(raw)
+			if err != nil {
+				return out, err
+			}
+			if warning != "" {
+				fmt.Fprintln(os.Stderr, warning)
+			}
+			out.project = strings.TrimSpace(name)
+			i++
+		case "--server":
+			raw, err := value(i, flag)
+			if err != nil {
+				return out, err
+			}
+			out.server, hasServer = raw, true
+			i++
+		case "--token":
+			raw, err := value(i, flag)
+			if err != nil {
+				return out, err
+			}
+			out.token, out.hasToken = raw, true
+			i++
+		case "--clear":
+			out.clear = true
+		default:
+			return out, fmt.Errorf("unknown option %q", args[i])
+		}
+	}
+	switch {
+	case out.project == "":
+		return out, fmt.Errorf("--project is required")
+	case out.clear && (hasServer || out.hasToken):
+		return out, fmt.Errorf("--clear cannot be combined with --server or --token")
+	case !out.clear && !hasServer:
+		return out, fmt.Errorf("--server <url> is required")
+	}
+	return out, nil
+}
+
+// cmdCloudConfigProject sets or clears the cloud remote override of a single
+// project. When the project's effective remote changes, its full history is
+// re-queued so the new destination receives everything; nothing is deleted.
+func cmdCloudConfigProject(cfg store.Config, args []string) {
+	parsed, err := parseCloudConfigProjectArgs(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, cloudConfigUsage)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		exitFunc(1)
+		return
+	}
+	cc, err := cloudconfig.Load(cfg.DataDir)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	before, beforeErr := cloudconfig.ResolveForProject(cc, parsed.project)
+
+	if parsed.clear {
+		if !cloudconfig.ClearProjectRemote(cc, parsed.project) {
+			fmt.Printf("Project %q has no cloud remote override; it already uses the global remote\n", parsed.project)
+			return
+		}
+	} else if err := cloudconfig.SetProjectRemote(cc, parsed.project, parsed.server, parsed.token); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		exitFunc(1)
+		return
+	}
+	after, err := cloudconfig.ResolveForProject(cc, parsed.project)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if err := cloudconfig.Save(cfg.DataDir, cc); err != nil {
+		fatal(err)
+		return
+	}
+
+	if parsed.clear {
+		fmt.Printf("✓ Cloud remote override for project %q cleared; it now uses the global remote\n", parsed.project)
+	} else {
+		fmt.Printf("✓ Project %q routed to %s (token %s, remote id %s)\n", parsed.project, after.ServerURL, maskCloudToken(after.Token), after.ID)
+	}
+
+	if beforeErr == nil && cloudRemoteIdentity(before) == cloudRemoteIdentity(after) {
+		fmt.Println("Effective remote unchanged; nothing re-queued.")
+		return
+	}
+	requeueProjectHistoryForNewRemote(cfg, parsed.project)
+}
+
+// cloudRemoteIdentity identifies the effective destination of a remote, so a
+// project whose override points at the same server and token as before (or as
+// the global remote) is not re-queued.
+func cloudRemoteIdentity(r cloudconfig.Remote) string {
+	return cloudconfig.RemoteID(r.ServerURL, r.Token)
+}
+
+func requeueProjectHistoryForNewRemote(cfg store.Config, project string) {
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+	queued, err := s.RequeueProjectSyncHistory(project)
+	if errors.Is(err, store.ErrProjectNotEnrolled) {
+		fmt.Printf("Project %q is not enrolled for cloud sync; its history will sync to this remote once enrolled.\n", project)
+		return
+	}
+	if err != nil {
+		fatal(fmt.Errorf("cloud remote changed but re-queueing project history failed: %w", err))
+		return
+	}
+	fmt.Printf("Effective remote changed: re-queued %d mutation(s) of project %q for full history delivery.\n", queued, project)
+	fmt.Println("Nothing was deleted locally or on the previous remote.")
+}
+
+// maskCloudToken never reveals more than the last four characters of a token.
+func maskCloudToken(token string) string {
+	token = strings.TrimSpace(token)
+	switch {
+	case token == "":
+		return "not set"
+	case len(token) <= 8:
+		return "set"
+	default:
+		return "set, ****" + token[len(token)-4:]
+	}
+}
+
+func printCloudStatusProjectRemotes(cfg store.Config) {
+	cc, err := cloudconfig.Load(cfg.DataDir)
+	if err != nil {
+		return
+	}
+	remotes := cloudconfig.ProjectRemotes(cc)
+	if len(remotes) == 0 {
+		return
+	}
+	fmt.Println("Project remotes:")
+	for _, named := range remotes {
+		remote, err := cloudconfig.ResolveForProject(cc, named.Project)
+		if err != nil {
+			fmt.Printf("  - %s: invalid override (%v)\n", named.Project, err)
+			continue
+		}
+		fmt.Printf("  - %s: server=%s token %s remote_id=%s\n", named.Project, remote.ServerURL, maskCloudToken(remote.Token), remote.ID)
+	}
 }
 
 func cmdCloudServe() {

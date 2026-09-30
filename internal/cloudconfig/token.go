@@ -38,6 +38,22 @@ func SourceLabel(source Source) string {
 	}
 }
 
+// LabelServerSourceEnv is the server-source label for ENGRAM_CLOUD_SERVER.
+const LabelServerSourceEnv = "set via " + EnvCloudServer
+
+// ServerSourceLabel returns the user-facing label for a server URL source.
+// SourceLabel is token-specific and must not be used for server URLs.
+func ServerSourceLabel(source Source) string {
+	switch source {
+	case SourceFile:
+		return LabelSourceFile
+	case SourceEnv:
+		return LabelServerSourceEnv
+	default:
+		return LabelSourceNone
+	}
+}
+
 // ApplyServerOverride applies ENGRAM_CLOUD_SERVER when it is non-empty.
 func ApplyServerOverride(cfg *Config) *Config {
 	if cfg == nil {

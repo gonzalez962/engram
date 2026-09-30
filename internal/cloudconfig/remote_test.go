@@ -205,7 +205,10 @@ func TestResolveForProjectGlobal(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv(EnvCloudServer, tt.envServer)
 			t.Setenv(EnvCloudToken, tt.envToken)
-			got := ResolveForProject(tt.cfg, tt.project)
+			got, err := ResolveForProject(tt.cfg, tt.project)
+			if err != nil {
+				t.Fatalf("ResolveForProject: %v", err)
+			}
 			if !got.Global || got.ID != "" {
 				t.Fatalf("remote = %+v, want global with empty id", got)
 			}
@@ -233,7 +236,10 @@ func TestResolveForProjectOverrideIgnoresEnvAndGlobalToken(t *testing.T) {
 		t.Fatalf("set tokenless: %v", err)
 	}
 
-	routed := ResolveForProject(cfg, " routed ")
+	routed, err := ResolveForProject(cfg, " routed ")
+	if err != nil {
+		t.Fatalf("resolve routed: %v", err)
+	}
 	if routed.Global {
 		t.Fatalf("routed remote is global: %+v", routed)
 	}
@@ -250,12 +256,83 @@ func TestResolveForProjectOverrideIgnoresEnvAndGlobalToken(t *testing.T) {
 		t.Fatalf("StateKey(routed) = %q", StateKey(routed))
 	}
 
-	tokenless := ResolveForProject(cfg, "tokenless")
+	tokenless, err := ResolveForProject(cfg, "tokenless")
+	if err != nil {
+		t.Fatalf("resolve tokenless: %v", err)
+	}
 	if tokenless.Global || tokenless.Token != "" || tokenless.TokenSource != SourceNone {
 		t.Fatalf("tokenless remote leaked a credential: %+v", tokenless)
 	}
 	if tokenless.ServerURL != "https://tokenless.example.test" {
 		t.Fatalf("tokenless server = %q", tokenless.ServerURL)
+	}
+}
+
+func TestResolveForProjectRejectsMalformedOverride(t *testing.T) {
+	cases := map[string]ProjectRemote{
+		"empty url":   {ServerURL: "", Token: "tok"},
+		"blank url":   {ServerURL: "   ", Token: "tok"},
+		"bad scheme":  {ServerURL: "ftp://cloud.example.test", Token: "tok"},
+		"with query":  {ServerURL: "https://cloud.example.test?x=1"},
+		"no host url": {ServerURL: "https://"},
+	}
+	for name, override := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := &Config{ServerURL: "https://global.example.test", Projects: map[string]ProjectRemote{"broken": override}}
+			got, err := ResolveForProject(cfg, "broken")
+			if err == nil {
+				t.Fatalf("ResolveForProject = %+v, want error for malformed override", got)
+			}
+			if !strings.Contains(err.Error(), "broken") {
+				t.Fatalf("error %q should name the project", err)
+			}
+			if strings.Contains(err.Error(), "tok") {
+				t.Fatalf("error %q must not leak the token", err)
+			}
+		})
+	}
+}
+
+func TestResolveForProjectOverrideURLIsValidatedForm(t *testing.T) {
+	cfg := &Config{Projects: map[string]ProjectRemote{"p": {ServerURL: "  https://cloud.example.test  ", Token: "t"}}}
+	got, err := ResolveForProject(cfg, "p")
+	if err != nil {
+		t.Fatalf("ResolveForProject: %v", err)
+	}
+	if got.ServerURL != "https://cloud.example.test" {
+		t.Fatalf("server = %q, want trimmed validated URL", got.ServerURL)
+	}
+}
+
+func TestResolveGlobalTrimsServerURL(t *testing.T) {
+	t.Setenv(EnvCloudServer, "")
+	t.Setenv(EnvCloudToken, "")
+	got, err := ResolveForProject(&Config{ServerURL: "  https://global.example.test  "}, "any")
+	if err != nil {
+		t.Fatalf("ResolveForProject: %v", err)
+	}
+	if got.ServerURL != "https://global.example.test" || got.ServerSource != SourceFile {
+		t.Fatalf("global remote = %+v, want trimmed URL from file", got)
+	}
+	blank, err := ResolveForProject(&Config{ServerURL: "   "}, "any")
+	if err != nil {
+		t.Fatalf("ResolveForProject blank: %v", err)
+	}
+	if blank.ServerURL != "" || blank.ServerSource != SourceNone {
+		t.Fatalf("blank global remote = %+v, want empty with no source", blank)
+	}
+}
+
+func TestServerSourceLabel(t *testing.T) {
+	cases := map[Source]string{
+		SourceNone: LabelSourceNone,
+		SourceFile: LabelSourceFile,
+		SourceEnv:  "set via ENGRAM_CLOUD_SERVER",
+	}
+	for source, want := range cases {
+		if got := ServerSourceLabel(source); got != want {
+			t.Fatalf("ServerSourceLabel(%v) = %q, want %q", source, got, want)
+		}
 	}
 }
 
