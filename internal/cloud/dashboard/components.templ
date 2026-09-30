@@ -804,7 +804,7 @@ templ AdminPage(health *cloudstore.DashboardSystemHealth, controls []cloudstore.
 
 // AdminProjectsPage renders organization-level project sync controls.
 // ADAPTED: ProjectSyncControl kept (integrated cloudstore now has it).
-templ AdminProjectsPage(controls []cloudstore.ProjectSyncControl) {
+templ AdminProjectsPage(controls []cloudstore.ProjectSyncControl, canManage bool) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -813,6 +813,19 @@ templ AdminProjectsPage(controls []cloudstore.ProjectSyncControl) {
 			</div>
 		</div>
 		@adminNav("projects")
+		if canManage {
+			<div class="data-frame">
+				<p class="section-kicker">CREATE MANAGED PROJECT</p>
+				<form method="post" action="/dashboard/admin/projects" class="managed-user-form">
+					<input type="text" name="name" placeholder="Project name" required autocomplete="off"/>
+					<button type="submit">Create Project</button>
+				</form>
+				<p class="muted">Creates a managed project with sync enabled and automatically grants access to the acting administrator.</p>
+			</div>
+		} else {
+			@ManagedUserAdministrationNotice()
+		}
+		<h3 class="section-block-title">Managed Projects</h3>
 		if len(controls) == 0 {
 			@EmptyState("No Managed Projects", "Projects appear here once cloud receives data or policy entries.")
 		} else {

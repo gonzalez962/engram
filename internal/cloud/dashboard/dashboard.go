@@ -715,7 +715,7 @@ func (h *handlers) handleAdminProjectControls(w http.ResponseWriter, r *http.Req
 		}
 		controls = ctrls
 	}
-	component := AdminProjectsPage(controls)
+	component := AdminProjectsPage(controls, p.CanManageManagedUsers())
 	if isHTMXRequest(r) {
 		renderComponent(w, r, component)
 		return

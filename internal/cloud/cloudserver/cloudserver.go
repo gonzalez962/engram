@@ -312,6 +312,7 @@ func (s *CloudServer) routes() {
 	s.mux.HandleFunc("POST /dashboard/admin/tokens/{tokenID}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedToken))
 	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants", s.requireDashboardSession(s.handleDashboardCreateManagedGrant))
 	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants/{project}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedGrant))
+	s.mux.HandleFunc("POST /dashboard/admin/projects", s.requireDashboardSession(s.handleDashboardCreateManagedProject))
 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
 	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
 	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
