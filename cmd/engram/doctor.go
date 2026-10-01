@@ -375,7 +375,14 @@ func cmdDoctorRepair(cfg store.Config) {
 		return
 	}
 	if check == diagnostic.CheckSyncTargetClosedSpace {
-		cleanup, err := s.CleanupForeignSyncTargets(mode == diagnostic.RepairModeApply)
+		// Per-remote cloud@<id> state is kept for every configured remote and
+		// pruned only when its remote is gone. An unreadable cloud.json leaves
+		// every cloud@ row in place (fail safe) and is reported.
+		liveRemoteKeys, cfgErr := diagnostic.LiveCloudRemoteStateKeys(cfg.DataDir)
+		if cfgErr != nil {
+			plan.Skipped = append(plan.Skipped, diagnostic.RepairSkip{ReasonCode: diagnostic.ReasonCloudConfigUnreadable, Message: fmt.Sprintf("cloud.json could not be read (%v); no cloud@ remote state was pruned", cfgErr)})
+		}
+		cleanup, err := s.CleanupForeignSyncTargetsWithLiveRemotes(mode == diagnostic.RepairModeApply, liveRemoteKeys)
 		if err != nil {
 			failDoctorRepair(err.Error())
 			return
@@ -385,7 +392,7 @@ func cmdDoctorRepair(cfg store.Config) {
 			plan.Status = "applied"
 		}
 		for _, action := range cleanup.Actions {
-			plan.TargetActions = append(plan.TargetActions, diagnostic.SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations, RetainedMutations: action.RetainedMutations, StateRemoved: action.StateRemoved})
+			plan.TargetActions = append(plan.TargetActions, diagnostic.SyncTargetCleanupActionFromStore(action))
 			if action.RetainedMutations > 0 && mode == diagnostic.RepairModeApply {
 				plan.Status = "blocked"
 				if cleanup.Applied {

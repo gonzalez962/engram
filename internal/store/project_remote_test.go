@@ -270,3 +270,112 @@ func TestAdvanceSyncPullCursorOnlyMovesForward(t *testing.T) {
 		t.Fatalf("global cursor moved to %d", global.LastPulledSeq)
 	}
 }
+
+
+func seedSyncStateRow(t *testing.T, s *Store, targetKey string) {
+	t.Helper()
+	if _, err := s.DB().Exec(`INSERT INTO sync_state (target_key, lifecycle, last_pulled_seq, updated_at) VALUES (?, 'idle', 42, datetime('now'))`, targetKey); err != nil {
+		t.Fatalf("seed sync_state %q: %v", targetKey, err)
+	}
+}
+
+func syncStateExists(t *testing.T, s *Store, targetKey string) bool {
+	t.Helper()
+	return scalarInt(t, s, `SELECT COUNT(*) FROM sync_state WHERE target_key = ?`, targetKey) == 1
+}
+
+func cleanupActionFor(report ForeignSyncTargetCleanupReport, targetKey string) (ForeignSyncTargetCleanupAction, bool) {
+	for _, action := range report.Actions {
+		if action.TargetKey == targetKey {
+			return action, true
+		}
+	}
+	return ForeignSyncTargetCleanupAction{}, false
+}
+
+func TestCleanupForeignSyncTargetsKeepsLiveRemoteStateAndPrunesOrphans(t *testing.T) {
+	s := newTestStore(t)
+	const live, orphan, foreign = "cloud@aaaaaaaaaaaa", "cloud@bbbbbbbbbbbb", "satellite:inert"
+	for _, key := range []string{live, orphan, foreign} {
+		seedSyncStateRow(t, s, key)
+	}
+
+	planned, err := s.CleanupForeignSyncTargetsWithLiveRemotes(false, map[string]bool{live: true})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if _, listed := cleanupActionFor(planned, live); listed {
+		t.Fatalf("live remote state must never be a cleanup action: %+v", planned)
+	}
+	orphanAction, listed := cleanupActionFor(planned, orphan)
+	if !listed || !orphanAction.StateRemoved || orphanAction.Reason != ForeignSyncTargetReasonOrphanedRemoteState {
+		t.Fatalf("orphan action = %+v (listed=%v), want a pruned orphaned remote state", orphanAction, listed)
+	}
+	if foreignAction, ok := cleanupActionFor(planned, foreign); !ok || foreignAction.Reason != "" || !foreignAction.StateRemoved {
+		t.Fatalf("legacy foreign action changed: %+v", planned)
+	}
+	if !syncStateExists(t, s, orphan) {
+		t.Fatal("planning must not delete state")
+	}
+
+	applied, err := s.CleanupForeignSyncTargetsWithLiveRemotes(true, map[string]bool{live: true})
+	if err != nil || !applied.Applied {
+		t.Fatalf("apply: %+v, %v", applied, err)
+	}
+	if !syncStateExists(t, s, live) {
+		t.Fatal("live cloud@ state was deleted")
+	}
+	if syncStateExists(t, s, orphan) || syncStateExists(t, s, foreign) {
+		t.Fatal("orphaned cloud@ state and legacy foreign state must be pruned")
+	}
+}
+
+func TestCleanupForeignSyncTargetsUnknownRemotesPrunesNoRemoteState(t *testing.T) {
+	s := newTestStore(t)
+	const remoteKey, foreign = "cloud@cccccccccccc", "satellite:inert"
+	seedSyncStateRow(t, s, remoteKey)
+	seedSyncStateRow(t, s, foreign)
+
+	// nil means the configured remotes are unknown (cloud.json unreadable, or
+	// the legacy entry point): every cloud@ row is kept.
+	report, err := s.CleanupForeignSyncTargetsWithLiveRemotes(true, nil)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if _, listed := cleanupActionFor(report, remoteKey); listed || !syncStateExists(t, s, remoteKey) {
+		t.Fatalf("unknown remotes must prune nothing under cloud@: %+v", report)
+	}
+	if syncStateExists(t, s, foreign) {
+		t.Fatal("legacy foreign cleanup must still run")
+	}
+
+	seedSyncStateRow(t, s, "satellite:again")
+	legacy, err := s.CleanupForeignSyncTargets(true)
+	if err != nil {
+		t.Fatalf("legacy cleanup: %v", err)
+	}
+	if _, listed := cleanupActionFor(legacy, remoteKey); listed || !syncStateExists(t, s, remoteKey) {
+		t.Fatalf("legacy entry point must never touch cloud@ state: %+v", legacy)
+	}
+}
+
+func TestCleanupForeignSyncTargetsRetainsOrphanWithDeferredRows(t *testing.T) {
+	s := newTestStore(t)
+	const orphan = "cloud@dddddddddddd"
+	seedSyncStateRow(t, s, orphan)
+	if _, err := s.DB().Exec(`INSERT INTO sync_apply_deferred (sync_id, entity, payload, target_key) VALUES ('deferred-1', 'observation', '{}', ?)`, orphan); err != nil {
+		t.Fatalf("seed deferred row: %v", err)
+	}
+
+	report, err := s.CleanupForeignSyncTargetsWithLiveRemotes(true, map[string]bool{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	action, listed := cleanupActionFor(report, orphan)
+	if !listed || action.StateRemoved || action.RetainedMutations != 1 {
+		t.Fatalf("orphan with deferred rows = %+v (listed=%v), want retained", action, listed)
+	}
+	if !syncStateExists(t, s, orphan) {
+		t.Fatal("orphan state with deferred rows must be kept")
+	}
+}

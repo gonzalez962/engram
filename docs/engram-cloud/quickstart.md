@@ -47,6 +47,21 @@ Open:
 
 In compose smoke mode, `/dashboard/login` redirects to `/dashboard/` (no bearer login needed).
 
+### Optional: route one project to a different cloud
+
+The global server and token stay the default. To send one project to another Engram Cloud:
+
+```bash
+engram cloud config --project team-app --server https://team-cloud.example.com --token <token>
+engram cloud status   # lists project remotes with masked tokens
+engram cloud config --project team-app --clear   # back to the global remote
+```
+
+- The override is stored in `cloud.json` under `projects`. `ENGRAM_CLOUD_SERVER` / `ENGRAM_CLOUD_TOKEN` only affect the global remote, and the global token is never sent to a project's server.
+- Changing a project's remote re-queues its current state for the new remote and pulls what other devices already wrote there. If that pull fails, the new routing is kept; retry with `engram sync --cloud --import --project team-app`.
+- An override without `--token` is saved, but autosync skips the project and explicit sync fails until a token is set.
+- Restart running `engram serve` / `engram mcp` processes so autosync picks up the change.
+
 ---
 
 ## Existing Project Upgrade Path (recommended)

@@ -75,6 +75,25 @@ engram cloud upgrade remirror --project <project>
 
 The project must already be enrolled and the configured cloud credentials must be authorized for it. Remirror creates new project-scoped upsert and locally represented tombstone mutations, then sends them through the normal cloud export path. It preserves existing acknowledgement and attempt history; it does not reopen acknowledged rows, delete mutation history, or reset `last_acked_seq`. Re-running the command is safe because remote entities use stable identities and upsert semantics.
 
+## Project not syncing to its own remote
+
+A project routed with `engram cloud config --project <project> --server <url> --token <token>` syncs only to that remote. If it does not:
+
+1. Run `engram cloud status` and check the project appears under `Project remotes:` with `token set`. An override showing `token not set` is skipped by autosync and fails explicit sync; re-run the command with `--token`.
+2. Restart `engram serve` / `engram mcp`. Autosync reads the routing at startup, so a running process keeps the old destination.
+3. Remember `ENGRAM_CLOUD_SERVER` / `ENGRAM_CLOUD_TOKEN` only change the global remote; they never redirect a routed project.
+4. Run `engram sync --cloud --project <project>` to push through the same routing and see the error directly.
+
+## Catch-up pull failed after changing a project's remote
+
+`engram cloud config --project ...` (or `--clear`) re-queues the project's current state and then pulls from the new remote. If the pull fails (for example the server is unreachable) the command prints a warning and still exits successfully: the new routing and the re-queued history are kept. Once the remote is reachable, import what other devices wrote there with:
+
+```bash
+engram sync --cloud --import --project <project>
+```
+
+Nothing needs rolling back; re-running the pull is safe because already-imported chunks are skipped.
+
 ---
 
 ## Error: `chunk_id does not match payload content hash`
