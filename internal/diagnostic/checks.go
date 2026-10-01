@@ -35,6 +35,13 @@ const ReasonQuarantinedPulledSessionIdentity = "quarantined_pulled_session_ident
 // targets.
 const ReasonForeignSyncTarget = "foreign_sync_target"
 
+// orphanedPendingRelationSampleLimit bounds how many candidate relations the
+// store's bounded diagnostic read returns to the aggregate doctor finding, so
+// a large legacy backlog cannot flood diagnostic output. The full candidate
+// set is re-derived by the repair plan and apply path from the same store
+// evidence.
+const orphanedPendingRelationSampleLimit = 10
+
 // ReasonOrphanedRemoteSyncState marks a CheckSyncTargetClosedSpace finding for
 // a per-project cloud@<id> state row whose remote is no longer configured.
 // doctor repair removes it, so it is a warning rather than an error.

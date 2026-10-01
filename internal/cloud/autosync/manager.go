@@ -100,7 +100,7 @@ type LocalStore interface {
 // the store query. Scoped managers require it so rows routed to other remotes
 // can never fill a batch and starve this manager.
 type scopedPendingLister interface {
-	ListPendingSyncMutationsScoped(targetKey string, include, exclude []string, limit int) ([]store.SyncMutation, error)
+	ListPendingSyncMutationsAfterSeqScoped(targetKey string, afterSeq int64, include, exclude []string, limit int) ([]store.SyncMutation, error)
 }
 
 // pullCursorAdvancer moves the pull cursor past mutations a scoped manager
@@ -748,7 +748,12 @@ func (m *Manager) push(ctx context.Context) error {
 		}
 	}
 
-	pending, err := m.listPending()
+	pager, ok := m.store.(pendingMutationPager)
+	if !ok {
+		return fmt.Errorf("bounded pending mutation pagination unavailable")
+	}
+	// Snapshot the eligible journal after repair: new enqueues belong to a later cycle.
+	highWater, err := pager.MaxPendingSyncMutationSeq(m.cfg.TargetKey)
 	if err != nil {
 		return fmt.Errorf("read push high-water: %w", err)
 	}
@@ -759,7 +764,7 @@ func (m *Manager) push(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(failures, err)...)
 		}
-		pending, err := pager.ListPendingSyncMutationsAfterSeq(m.cfg.TargetKey, afterSeq, m.cfg.PushBatchSize)
+		pending, err := m.listPendingAfter(pager, afterSeq)
 		if err != nil {
 			return errors.Join(append(failures, fmt.Errorf("list pending: %w", err))...)
 		}
@@ -914,18 +919,18 @@ func (m *Manager) preflightPrompt(mut store.SyncMutation, syncID, session, inbox
 	return nil
 }
 
-// listPending returns the next push batch from the journal. A scoped manager
+// listPendingAfter returns the next push page after afterSeq. A scoped manager
 // selects its projects inside the store query so rows routed to other remotes
-// cannot fill the batch.
-func (m *Manager) listPending() ([]store.SyncMutation, error) {
+// cannot fill the page.
+func (m *Manager) listPendingAfter(pager pendingMutationPager, afterSeq int64) ([]store.SyncMutation, error) {
 	if !m.scope.scoped() {
-		return m.store.ListPendingSyncMutations(m.cfg.TargetKey, m.cfg.PushBatchSize)
+		return pager.ListPendingSyncMutationsAfterSeq(m.cfg.TargetKey, afterSeq, m.cfg.PushBatchSize)
 	}
 	lister, ok := m.store.(scopedPendingLister)
 	if !ok {
 		return nil, fmt.Errorf("store does not support project-scoped pending mutations")
 	}
-	return lister.ListPendingSyncMutationsScoped(m.cfg.TargetKey, m.scope.includeList, m.scope.excludeList, m.cfg.PushBatchSize)
+	return lister.ListPendingSyncMutationsAfterSeqScoped(m.cfg.TargetKey, afterSeq, m.scope.includeList, m.scope.excludeList, m.cfg.PushBatchSize)
 }
 
 // ownedCounts drops non-enrolled backlog counts of projects another remote
