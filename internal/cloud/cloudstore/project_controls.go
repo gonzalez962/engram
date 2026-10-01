@@ -256,5 +256,8 @@ func (cs *CloudStore) CreateProjectWithGrantAndAudit(ctx context.Context, params
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("cloudstore: commit project create tx: %w", err)
 	}
+	// A registered project extends the dashboard deployment scope; drop the
+	// cached read model so the new project is visible immediately.
+	cs.invalidateDashboardReadModel()
 	return nil
 }
