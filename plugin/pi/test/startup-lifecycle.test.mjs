@@ -45,8 +45,16 @@ if (process.argv.includes("sync") || process.argv.includes("--import")) { append
 const isServe = process.argv[2] === "serve" || isSyntheticServe;
 if (isServe) {
   appendFileSync(${JSON.stringify(spawnLog)}, "serve\\n");
+  appendFileSync(${JSON.stringify(spawnLog)}, "autosync=" + (process.env.ENGRAM_CLOUD_AUTOSYNC ?? "<unset>") + "\\n");
   ${exitCode === undefined
-      ? `const server = createServer((req, res) => {
+      ? `const server = createServer(async (req, res) => {
+  if (req.url === "/sessions") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    res.writeHead(201, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: JSON.parse(body).id, status: "created" }));
+    return;
+  }
   if (req.url.startsWith("/project/current")) {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ project: "fake-project" }));
@@ -123,8 +131,15 @@ async function withFixture(options, run) {
     const spawnLog = join(dir, "spawns.log");
     await writeFile(spawnLog, "", "utf8");
     const port = await freePort();
-    readyServer = options.readyServer && createHTTPServer((request, response) => {
+    readyServer = options.readyServer && createHTTPServer(async (request, response) => {
       options.requests?.push({ method: request.method, url: request.url });
+      if (request.url === "/sessions") {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        response.writeHead(201, { "content-type": "application/json" });
+        response.end(JSON.stringify({ id: JSON.parse(body).id, status: "created" }));
+        return;
+      }
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(request.url.startsWith("/project/current") ? { project: "fake-project" } : (options.healthBody ?? { instance_id: "00000000000000000000000000000000" })));
     });
@@ -246,6 +261,24 @@ test("a slow health probe never authorizes a duplicate spawn", async () => {
   });
 });
 
+test("a plugin-launched server starts with cloud autosync enabled", async () => {
+  const previous = process.env.ENGRAM_CLOUD_AUTOSYNC;
+  delete process.env.ENGRAM_CLOUD_AUTOSYNC;
+  try {
+    await withFixture({ readyAfterMs: 0 }, async ({ hooks, ctx, spawnLog }) => {
+      await hooks.get("session_start")({}, ctx);
+
+      assert.equal(await countSpawns(spawnLog), 1, "the plugin spawns the server");
+      const log = await readFile(spawnLog, "utf8");
+      assert.ok(log.split("\n").includes("autosync=1"),
+        "the daemon must opt into cloud autosync, like the Claude Code and Codex launchers");
+    });
+  } finally {
+    if (previous === undefined) delete process.env.ENGRAM_CLOUD_AUTOSYNC;
+    else process.env.ENGRAM_CLOUD_AUTOSYNC = previous;
+  }
+});
+
 test("a child that exits before readiness surfaces a normalized tool error", async () => {
   await withFixture({ exitCode: 1 }, async ({ tools, ctx }) => {
     const memSearch = tools.get("mem_search");
@@ -266,6 +299,11 @@ test("a child that exits before readiness never escapes the session hooks", asyn
 
     const result = await hooks.get("before_agent_start")({ systemPrompt: "base", prompt: "hello there" }, ctx);
     assert.match(result.systemPrompt, /^base\n\n/, "memory instructions still reach the agent");
+
+    const options = { appendSystemPrompt: "existing" };
+    const structured = await hooks.get("before_agent_start")({ systemPrompt: "base", systemPromptOptions: options, prompt: "hello there" }, ctx);
+    assert.equal(structured, undefined, "structured options never receive a forced replacement");
+    assert.match(options.appendSystemPrompt, /^existing\n\n## Engram Persistent Memory — Protocol/);
   });
 });
 

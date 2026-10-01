@@ -56,13 +56,15 @@ marketplace plugin, it warns without changing the selected mode; session-only
 
 ## Pi
 
-Install Engram's Pi-native package and retain the MCP adapter for other servers:
+Install Engram's Pi-native package:
 
 ```bash
 engram setup pi
 ```
 
-`engram setup pi` runs `pi install npm:gentle-engram@0.1.16` and `pi install npm:pi-mcp-adapter`, then ensures Pi settings contain both packages. Pi agent writes use native `mem_*` tools, not Engram MCP registration. `engram setup pi` does not create or change `mcpServers.engram`. This applies to the Go setup command only: until the Pi package update, `pi-engram init` still creates an Engram MCP entry and must not be used as a native-only setup path. If the Pi agent directory's `mcp.json` already contains `mcpServers.engram`, Go setup warns with its exact path and key; manually remove only that key and restart/reload Pi for the native-only guarantee. Until then native-only agent writes are **not guaranteed**. Other MCP servers are preserved.
+`engram setup pi` runs `pi install npm:gentle-engram@0.1.16`, then ensures Pi settings contain that package. Pi agent writes use native `mem_*` tools, not Engram MCP registration. `engram setup pi` does not create or change `mcpServers.engram`. Go setup remains pinned to published `0.1.16`. That version's `pi-engram init` still registers Engram MCP and must not be used for native-only setup. If `gentle-engram@0.1.17` is available on npm, install it explicitly and run `pi-engram init` for native-only setup; version `0.1.17` init does not create or change `mcp.json` and warns about an existing `mcpServers.engram` entry. If the Pi agent directory's `mcp.json` already contains `mcpServers.engram`, Go setup warns with its exact path and key; manually remove only that key and restart/reload Pi for the native-only guarantee. Until then native-only agent writes are **not guaranteed**. Other MCP servers are preserved.
+
+Pi 0.99.0 and later ship built-in MCP (`mcp.json`, `/mcp`, `pi mcp add`); an installed `pi-mcp-adapter` replaces that built-in support, so neither `engram setup pi` nor `pi-engram init` adds it. An existing adapter entry in `settings.json` is left untouched.
 
 For versioned mise installations, setup selects the shim directory from an absolute `MISE_SHIMS_DIR`, the effective absolute `shims_dir` reported by `mise settings get shims_dir` (including global config), or the mise data directory's default `shims` folder, in that order. Invalid settings output or an unavailable mise CLI leaves the default directory as the fallback. If the shim is missing from the selected directory, the caller uses its existing executable/PATH fallback policy; setup never writes mise warnings as the Engram MCP command.
 
@@ -72,7 +74,6 @@ Manual equivalent:
 
 ```bash
 pi install npm:gentle-engram@0.1.16
-pi install npm:pi-mcp-adapter
 ```
 
 Restart Pi after installation.
@@ -80,7 +81,7 @@ Restart Pi after installation.
 The package has two paths:
 
 - **HTTP event capture**: the Pi extension sends prompts, summaries, passive task learnings, and compact Pi-native `mem_*` tool calls to `engram serve`.
-- **Optional MCP gateway**: `pi-mcp-adapter` remains for other Pi MCP servers such as Notion. Deliberate standalone/direct MCP clients can still launch `engram mcp` separately; do not register it in Pi for native-only agent writes. Until the Pi package update, `pi-engram init` still registers Engram MCP.
+- **Other MCP servers**: use Pi's built-in MCP (`mcp.json`) for servers such as Notion. Deliberate standalone/direct MCP clients can still launch `engram mcp` separately; do not register it in Pi for native-only agent writes. Published `0.1.16` init still registers Engram MCP; `0.1.17` init does not create or change `mcp.json`.
 
 Use an existing Engram HTTP server:
 
@@ -227,6 +228,12 @@ If validation returns `project_name_collision`, do not guess. Ask the user to di
 Alternatives: `cd` into the target repo before starting the MCP server, or add repo `.engram/config.json`.
 
 **Read tools** (`mem_search`, `mem_context`, `mem_stats`, `mem_timeline`, `mem_doctor`, `mem_get_observation`) accept an optional `project` override validated against known projects. Omit it to use the process override or cwd detection. For `mem_get_observation`, `project` selects response-envelope context only; the observation is still retrieved by ID without ownership filtering.
+
+`mem_get_observation` retains its read-only stored-owner fallback: only when cwd detection is ambiguous and the observation has a nonblank stored project does it use that project (`project_source: "stored_project"`, `project_path: ""`). This identifies the record's owner, not a verified repository path, and does not bypass malformed or unknown explicit/process overrides.
+
+`mem_update` and `mem_delete` require caller-supplied `expected_project`, including for personal/global scopes. Never fetch the target to fill a missing assertion. The normalized stored owner is checked atomically with the mutation. Native `mem_update` also retains known-current/process ownership checks and rejects ambiguous cwd rather than using a stored-owner write fallback. The assertion is not a recovery token or permission to bypass context rules; existing recovery and session ownership protections remain unchanged.
+
+This is an intentional compatibility break for clients omitting `expected_project`. The in-repository Pi schema and forwarding require it; external gentle-engram relays need separate adaptation.
 
 ---
 
@@ -437,14 +444,14 @@ Recommended: one command to set up MCP + compaction recovery instructions:
 engram setup codex
 ```
 
-`engram setup codex` now does four things:
+`engram setup codex` does four things:
 
 - Registers `[mcp_servers.engram]` in the active Codex config (`$CODEX_HOME/config.toml` when `CODEX_HOME` is absolute, otherwise `~/.codex/config.toml`; on Windows the default is `%USERPROFILE%\.codex\config.toml`) and pins the current absolute executable path
-- Writes `engram-instructions.md` beside the active config with the Engram Memory Protocol
-- Writes `engram-compact-prompt.md` beside the active config and points `experimental_compact_prompt_file` to it, so compaction output includes a required memory-save instruction
-- Best-effort installs the Codex plugin with `codex plugin marketplace add Gentleman-Programming/engram --ref main` and `codex plugin add engram@engram`
+- Writes `engram-instructions.md` and `engram-compact-prompt.md` beside the active config as informational copies of the Memory Protocol
+- Installs the Codex plugin with `codex plugin marketplace add Gentleman-Programming/engram --ref main` and `codex plugin add engram@engram`. The plugin hooks inject the Memory Protocol additively, so this is how Codex actually receives it. If the CLI is missing or either command fails, setup returns an error, not complete success. The MCP config and informational instruction files remain written, but plugin activation is incomplete. Ensure `codex` is in `PATH`, resolve the reported command error, and run both commands above manually (or rerun `engram setup codex`), then restart Codex. Do not wire the informational files into prompt override keys as a workaround.
+- Removes legacy `model_instructions_file` / `experimental_compact_prompt_file` keys if a previous Engram version wrote them
 
-> `engram setup codex` writes the Memory Protocol and compaction recovery prompt beside the active Codex config. No additional configuration needed.
+> **Do not set `model_instructions_file` in Codex.** Unlike most instruction mechanisms, that key *replaces* Codex's built-in system instructions instead of adding to them. Pointing it at `engram-instructions.md` wipes Codex's own base prompt (`You are Codex, ...`) and degrades the agent. Earlier Engram versions did this automatically; current versions strip the keys instead. If you set them manually, you are deliberately opting into overriding Codex's base prompt.
 
 On Windows, setup also writes an executable marker at the first line of `config.toml`; the native `UserPromptSubmit` hook reads it from the same active config. If `engram.exe` moves, rerun `engram setup codex` before restarting Codex to refresh both pins.
 
@@ -457,9 +464,6 @@ Manual alternative: add to your active Codex `config.toml` (Windows default: `%U
 If `CODEX_HOME` is set, adjust the instruction-file paths below to that directory.
 
 ```toml
-model_instructions_file = "~/.codex/engram-instructions.md"
-experimental_compact_prompt_file = "~/.codex/engram-compact-prompt.md"
-
 [mcp_servers.engram]
 command = "engram"
 args = ["mcp"]
