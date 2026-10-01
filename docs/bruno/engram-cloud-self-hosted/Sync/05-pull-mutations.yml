@@ -1,0 +1,78 @@
+info:
+  name: Pull Mutations
+  type: http
+  seq: 5
+
+http:
+  method: GET
+  url: "{{baseUrl}}/sync/mutations/pull"
+  params:
+    query:
+      - name: since_seq
+        value: "0"
+        enabled: true
+      - name: limit
+        value: "100"
+        enabled: true
+  headers:
+    - name: Accept
+      value: application/json
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.mutations
+      operator: isArray
+    - expression: res.body.has_more
+      operator: isBoolean
+    - expression: res.body.latest_seq
+      operator: isNumber
+  scripts:
+    - type: tests
+      code: |-
+        test("Pull envelope has required fields", function() {
+          expect(res.body).to.have.property("mutations");
+          expect(res.body).to.have.property("has_more");
+          expect(res.body).to.have.property("latest_seq");
+        });
+
+docs: |-
+  Pulls mutations the caller is allowed to see, ordered by sequence
+  number.
+
+  Source: `internal/cloud/cloudserver/mutations.go` → `handleMutationPull`
+  (line 219).
+
+  Query params:
+    - `since_seq` (int, default 0) — return mutations with
+      `seq > since_seq`.
+    - `limit` (int, default 100, max 100 — `defaultPullLimit`).
+
+  Authorization model:
+    - For managed-token / human / service-account principals the server
+      resolves enrollment from `cloud_project_grants` and returns only
+      mutations whose `project` is in that allow-list.
+    - For the legacy sync token (and other resolvers that do not
+      implement `EnrolledProjectsProvider`) the server fails closed with
+      an empty result, logging a warning. This is intentional — it
+      prevents cross-tenant leaks.
+
+  Status codes:
+    - 200 — body:
+      {
+        "mutations":      [ <StoredMutation>... ],
+        "has_more":       <bool>,
+        "latest_seq":     <int>,
+        "project":        "<primary project>",
+        "project_source": "request_body",
+        "project_path":   ""
+      }
+    - 400 — `project` missing (only if the resolved principal has no
+      enrollments at all and `project_source` cannot be filled).
+    - 401 — Bearer token missing/invalid.
+    - 403 — managed principal cannot resolve enrollment.

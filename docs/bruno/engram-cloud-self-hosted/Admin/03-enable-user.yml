@@ -1,0 +1,55 @@
+info:
+  name: Enable User
+  type: http
+  seq: 3
+
+http:
+  method: POST
+  url: "{{baseUrl}}/admin/users/{{principalId}}/enable"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {}
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.status
+      operator: eq
+      value: ok
+    - expression: res.body.enabled
+      operator: isBoolean
+  scripts:
+    - type: tests
+      code: |-
+        test("Enable confirms enabled=true", function() {
+          expect(res.body).to.have.property("enabled", true);
+        });
+
+docs: |-
+  Re-enables a previously disabled managed user. Idempotent — calling it
+  on an already-enabled user still returns 200.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminEnableUser`
+  (line 124) → `handleAdminSetUserEnabled`.
+
+  Effects:
+    - `UPDATE cloud_principals SET enabled=true ...`
+    - Audit event: `action=user.enable`.
+
+  Status codes:
+    - 200 — `{ "status": "ok", "principal_id": "...", "enabled": true }`.
+    - 400 — `principal_id` missing or storage rejection.
+    - 401 — Bearer token missing/invalid.
+    - 403 — managed admin principal required.
+    - 500 — audit insert failed (rollback).

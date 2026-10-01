@@ -354,6 +354,113 @@ func TestDashboardCreateAndRevokeManagedGrantRedirectsAndAudits(t *testing.T) {
 	}
 }
 
+// TestDashboardCreateManagedProjectSucceedsRedirectsAndAudits proves that an
+// authenticated managed admin can create a project via the dashboard form,
+// is redirected to /dashboard/admin/projects, and the mutation is audited.
+func TestDashboardCreateManagedProjectSucceedsRedirectsAndAudits(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/projects", "name=zeta-project", cookie, false)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect after project create, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if dashboardRedirect(rec) != "/dashboard/admin/projects" {
+		t.Fatalf("expected redirect to /dashboard/admin/projects, got %q", dashboardRedirect(rec))
+	}
+	if store.createProjectCalls != 1 {
+		t.Fatalf("expected exactly one CreateProjectWithGrantAndAudit call, got %d", store.createProjectCalls)
+	}
+	if len(store.projectControls) != 1 || store.projectControls[0].Project != "zeta-project" || !store.projectControls[0].SyncEnabled {
+		t.Fatalf("expected project control row for zeta-project with sync_enabled=true, got %+v", store.projectControls)
+	}
+	if len(store.grants) != 1 || store.grants[0].Project != "zeta-project" || store.grants[0].PrincipalID != "p-admin" {
+		t.Fatalf("expected grant on zeta-project for actor p-admin, got %+v", store.grants)
+	}
+	event := lastAuditEvent(t, store)
+	if event.Action != authAuditActionProjectCreate || event.Outcome != authAuditOutcomeSuccess {
+		t.Fatalf("unexpected audit event for dashboard project create: %+v", event)
+	}
+	if event.ActorPrincipalID != "p-admin" || event.Project != "zeta-project" {
+		t.Fatalf("expected dashboard-created-project audit actor p-admin and project zeta-project, got %+v", event)
+	}
+	assertNoSensitiveAuditMetadata(t, event)
+
+	// HTMX variant returns HX-Redirect instead of a 303 Location header.
+	htmxRec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/projects", "name=htmx-project", cookie, true)
+	if htmxRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with HX-Redirect for HTMX project create, got %d body=%q", htmxRec.Code, htmxRec.Body.String())
+	}
+	if htmxRec.Header().Get("HX-Redirect") != "/dashboard/admin/projects" {
+		t.Fatalf("expected HX-Redirect header for HTMX project create, got %q", htmxRec.Header().Get("HX-Redirect"))
+	}
+}
+
+// TestDashboardCreateManagedProjectRequiresManagedAdmin proves non-admin users
+// cannot create projects through the dashboard route.
+func TestDashboardCreateManagedProjectRequiresManagedAdmin(t *testing.T) {
+	store := newLoginAuditTestStore()
+	store.principals["p-member"] = dashboardStoredPrincipal("p-member", cloudstore.PrincipalRoleMember, true)
+	member := dashboardManagedPrincipal("p-member", cloudstore.PrincipalRoleMember, true)
+	authn := resolvingAuth{principals: map[string]cloudauth.Principal{"member-token": member}}
+	srv := New(store, authn, 0, WithAdminIdentityStore(store))
+	cookie := managedDashboardLogin(t, srv, "member-token", false)
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/projects", "name=forbidden-project", cookie, false)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden for managed member dashboard project create, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if store.createProjectCalls != 0 {
+		t.Fatalf("forbidden dashboard request must not create a project, got %d calls", store.createProjectCalls)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionProjectCreate {
+			t.Fatalf("forbidden dashboard request must not record a project.create audit event, got %+v", event)
+		}
+	}
+}
+
+// TestDashboardCreateManagedProjectValidation covers empty and malformed project names.
+func TestDashboardCreateManagedProjectValidation(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+
+	cases := []struct {
+		name string
+		form string
+	}{
+		{name: "empty name", form: "name="},
+		{name: "whitespace name", form: "name=   "},
+		{name: "missing name", form: ""},
+		{name: "normalizes to empty", form: "name=!!!"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/projects", tc.form, cookie, false)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %q, got %d body=%q", tc.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if store.createProjectCalls != 0 {
+		t.Fatalf("invalid project form must not reach store, got %d calls", store.createProjectCalls)
+	}
+}
+
+// TestDashboardCreateManagedProjectDuplicateReturns409 proves conflict response.
+func TestDashboardCreateManagedProjectDuplicateReturns409(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	updatedBy := "p-admin"
+	store.projectControls = append(store.projectControls, cloudstore.ProjectSyncControl{Project: "existing-proj", SyncEnabled: true, UpdatedBy: &updatedBy})
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/projects", "name=existing-proj", cookie, false)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for duplicate project, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if len(store.projectControls) != 1 {
+		t.Fatalf("duplicate project create must not add second control row, got %+v", store.projectControls)
+	}
+}
+
+
 // TestDashboardManagedUserMutationsRequireSession proves an unauthenticated
 // request to a dashboard-owned managed-user mutation route is redirected to
 // login rather than performing the mutation, for both plain and HTMX requests.
@@ -705,6 +812,27 @@ func TestDashboardRevokeManagedGrantSurfacesStoreErrorWithoutAudit(t *testing.T)
 	}
 }
 
+// TestDashboardCreateManagedProjectSurfacesStoreErrorWithoutAudit proves store failures
+// during dashboard project creation surface an error and record no success audit.
+func TestDashboardCreateManagedProjectSurfacesStoreErrorWithoutAudit(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	store.createProjectErr = errors.New("project store unavailable")
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/projects", "name=zeta", cookie, false)
+	if rec.Code == http.StatusSeeOther || rec.Code == http.StatusOK {
+		t.Fatalf("expected project create to fail when the store errors, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if len(store.projectControls) != 0 || len(store.grants) != 0 {
+		t.Fatalf("expected no project control or grant to be persisted on store failure, controls=%+v grants=%+v", store.projectControls, store.grants)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionProjectCreate {
+			t.Fatalf("expected no project.create audit event on store failure, got %+v", event)
+		}
+	}
+}
+
+
 // TestDashboardCreateManagedUserRejectsOversizedBody is the RED test for
 // FIX D: dashboard mutation POST forms must cap the request body the same
 // way handleDashboardBootstrapSubmit and dashboard.go's handleLoginSubmit
@@ -818,6 +946,7 @@ func TestDashboardLegacyAdminCanViewButNotMutateManagedUsers(t *testing.T) {
 		{path: "/dashboard/admin/tokens/tok-target/revoke", form: "reason=lost"},
 		{path: "/dashboard/admin/users/p-target/grants", form: "project=beta"},
 		{path: "/dashboard/admin/users/p-target/grants/alpha/revoke"},
+		{path: "/dashboard/admin/projects", form: "name=beta"},
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			rec := performDashboardForm(srv, http.MethodPost, tc.path, tc.form, cookie, false)
@@ -826,8 +955,8 @@ func TestDashboardLegacyAdminCanViewButNotMutateManagedUsers(t *testing.T) {
 			}
 		})
 	}
-	if store.createUserCalls != 0 || store.setEnabledCalls != 0 || store.createTokenCalls != 0 || store.revokeTokenCalls != 0 || store.createGrantCalls != 0 || store.revokeGrantCalls != 0 {
-		t.Fatalf("forbidden legacy dashboard requests must not mutate state: user=%d enabled=%d token=%d revokeToken=%d grant=%d revokeGrant=%d", store.createUserCalls, store.setEnabledCalls, store.createTokenCalls, store.revokeTokenCalls, store.createGrantCalls, store.revokeGrantCalls)
+	if store.createUserCalls != 0 || store.setEnabledCalls != 0 || store.createTokenCalls != 0 || store.revokeTokenCalls != 0 || store.createGrantCalls != 0 || store.revokeGrantCalls != 0 || store.createProjectCalls != 0 {
+		t.Fatalf("forbidden legacy dashboard requests must not mutate state: user=%d enabled=%d token=%d revokeToken=%d grant=%d revokeGrant=%d createProject=%d", store.createUserCalls, store.setEnabledCalls, store.createTokenCalls, store.revokeTokenCalls, store.createGrantCalls, store.revokeGrantCalls, store.createProjectCalls)
 	}
 }
 

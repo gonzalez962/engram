@@ -451,3 +451,48 @@ func (s *CloudServer) handleDashboardRevokeManagedGrant(w http.ResponseWriter, r
 	}
 	redirectDashboardAdmin(w, r, "/dashboard/admin/users/"+principalID)
 }
+
+// handleDashboardCreateManagedProject handles POST /dashboard/admin/projects.
+func (s *CloudServer) handleDashboardCreateManagedProject(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.requireManagedAdmin(w, r)
+	if !ok {
+		return
+	}
+	store, ok := s.adminStore(w)
+	if !ok {
+		return
+	}
+	if !parseDashboardMutationForm(w, r) {
+		return
+	}
+	rawName := strings.TrimSpace(r.FormValue("name"))
+	if rawName == "" {
+		http.Error(w, "project name is required", http.StatusBadRequest)
+		return
+	}
+	normalized := cloudstore.NormalizeProjectGrant(rawName)
+	if normalized == "" {
+		http.Error(w, "project name is invalid", http.StatusBadRequest)
+		return
+	}
+	auditMetadata := map[string]any{"name": normalized}
+	if err := store.CreateProjectWithGrantAndAudit(r.Context(),
+		cloudstore.CreateProjectGrantParams{
+			PrincipalID:          actor.ID,
+			Project:              normalized,
+			GrantedByPrincipalID: actor.ID,
+		},
+		adminAuditEvent(actor, authAuditActionProjectCreate, "", normalized, auditMetadata),
+	); err != nil {
+		switch {
+		case errors.Is(err, cloudstore.ErrProjectAlreadyExists):
+			http.Error(w, fmt.Sprintf("project %q already exists", normalized), http.StatusConflict)
+		case errors.Is(err, cloudstore.ErrAuthAuditInsertFailed):
+			http.Error(w, fmt.Sprintf("audit error: %v", err), http.StatusInternalServerError)
+		default:
+			http.Error(w, fmt.Sprintf("create project: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+	redirectDashboardAdmin(w, r, "/dashboard/admin/projects")
+}

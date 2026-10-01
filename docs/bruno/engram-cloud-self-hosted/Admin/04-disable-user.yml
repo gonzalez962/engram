@@ -1,0 +1,56 @@
+info:
+  name: Disable User
+  type: http
+  seq: 4
+
+http:
+  method: POST
+  url: "{{baseUrl}}/admin/users/{{principalId}}/disable"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {}
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.status
+      operator: eq
+      value: ok
+    - expression: res.body.enabled
+      operator: isBoolean
+  scripts:
+    - type: tests
+      code: |-
+        test("Disable confirms enabled=false", function() {
+          expect(res.body).to.have.property("enabled", false);
+        });
+
+docs: |-
+  Disables a managed user. After disabling, all existing managed tokens
+  for the user become unable to authenticate (the resolver checks
+  `principal.enabled`).
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminDisableUser`
+  (line 128).
+
+  Side effects:
+    - `UPDATE cloud_principals SET enabled=false ...`
+    - Audit event: `action=user.disable`.
+    - `06-create-user-token` on the same `principalID` will subsequently
+      return 409 with `error_code=policy_forbidden` ("managed user is
+      disabled; enable the user before creating a managed token").
+
+  Status codes:
+    - 200 — `{ "status": "ok", "principal_id": "...", "enabled": false }`.
+    - 400 / 401 / 403 / 500 — same as `03-enable-user`.

@@ -1,0 +1,65 @@
+info:
+  name: Revoke Token
+  type: http
+  seq: 7
+
+http:
+  method: POST
+  url: "{{baseUrl}}/admin/tokens/{{tokenId}}/revoke"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "reason": "{{revokeReason}}"
+      }
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.status
+      operator: eq
+      value: ok
+    - expression: res.body.token_id
+      operator: isString
+  scripts:
+    - type: tests
+      code: |-
+        test("Revoke confirms the token_id that was revoked", function() {
+          expect(res.body).to.have.property("token_id");
+        });
+
+docs: |-
+  Revokes a managed token. Idempotent — re-revoking a token with
+  `revoked_at` already set keeps the original timestamp and updates
+  `revoked_by_principal_id` / `revocation_reason`.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminRevokeToken`
+  (line 261).
+
+  Path params:
+    - `tokenID` — the id returned by `05-list-user-tokens` /
+      `06-create-user-token`.
+
+  Request body (`revokeAdminTokenRequest`):
+    - `reason` — optional. Persisted on `cloud_principal_tokens.revocation_reason`
+      and in the auth audit metadata.
+
+  Effects:
+    - `UPDATE cloud_principal_tokens SET revoked_at=NOW(), revoked_by_principal_id=$actor, revocation_reason=$reason WHERE id=$tokenID`.
+    - Audit event: `action=token.revoke` with `{ id, reason }`.
+
+  Status codes:
+    - 200 — `{ "status": "ok", "token_id": "..." }`.
+    - 400 — `token_id` missing, malformed payload, or token not found
+      (storage's `requireAffected` returns "principal token not found").
+    - 401 / 403 — see folder docs.

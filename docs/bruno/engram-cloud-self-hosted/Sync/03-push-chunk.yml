@@ -1,0 +1,99 @@
+info:
+  name: Push Chunk
+  type: http
+  seq: 3
+
+http:
+  method: POST
+  url: "{{baseUrl}}/sync/push"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "created_by": "bruno-demo",
+        "client_created_at": "{{$isoTimestamp}}",
+        "project": "{{project}}",
+        "data": {
+          "sessions": [
+            {
+              "id": "bruno-demo-session-1",
+              "project": "{{project}}",
+              "directory": "/tmp/bruno-demo",
+              "started_at": "{{$isoTimestamp}}"
+            }
+          ],
+          "observations": [
+            {
+              "sync_id": "bruno-demo-obs-1",
+              "session_id": "bruno-demo-session-1",
+              "type": "discovery",
+              "title": "Pushed via Bruno OpenCollection",
+              "content": "Synthetic observation body used to verify /sync/push end-to-end.",
+              "scope": "project",
+              "created_at": "{{$isoTimestamp}}"
+            }
+          ],
+          "prompts": []
+        }
+      }
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.status
+      operator: eq
+      value: ok
+    - expression: res.body.chunk_id
+      operator: isString
+  scripts:
+    - type: after-response
+      code: |-
+        // The server canonicalizes the chunk id from the payload hash and
+        // may accept or reject the client-provided one. Capture the
+        // canonical id so the next run of 02-pull-chunk can retrieve it.
+        if (res.body && typeof res.body.chunk_id === "string") {
+          bru.setEnvVar("chunkId", res.body.chunk_id);
+        }
+    - type: tests
+      code: |-
+        test("Push payload was accepted", function() {
+          expect(res.body).to.have.property("status", "ok");
+          expect(res.body).to.have.property("chunk_id");
+        });
+
+docs: |-
+  Uploads one chunk to the cloud server. The chunk id is recomputed by the
+  server as a SHA-256 prefix of the canonicalized `data` payload; any
+  `chunk_id` you send is logged but discarded.
+
+  Source: `internal/cloud/cloudserver/cloudserver.go` → `handlePushChunk`
+  (line 464).
+
+  Body fields (request struct):
+    - `chunk_id` (optional) — server recomputes and ignores mismatches.
+    - `created_by` (required) — stored on `cloud_chunks.created_by`.
+    - `client_created_at` (optional) — RFC3339; stored on
+      `cloud_chunks.client_created_at`.
+    - `project` (optional in body — but `?project=` is required as
+      fallback when absent).
+    - `data` (required) — full `engramsync.ChunkData` JSON: one or more of
+      `sessions`, `observations`, `prompts`, `mutations`.
+
+  Status codes:
+    - 200 — chunk stored. Body: `{ "status": "ok", "chunk_id": "<8-char>" }`.
+    - 400 — missing `data` or unparseable payload.
+    - 401 — Bearer token missing/invalid.
+    - 403 — project not authorized.
+    - 409 — chunk conflict (existing chunk with the same id has a
+      *different* payload; this is `cloudstore.ErrChunkConflict`).
+    - 413 — payload exceeds `ENGRAM_CLOUD_MAX_PUSH_BYTES` (default 8 MiB).

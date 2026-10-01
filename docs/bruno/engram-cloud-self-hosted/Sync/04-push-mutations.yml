@@ -1,0 +1,111 @@
+info:
+  name: Push Mutations
+  type: http
+  seq: 4
+
+http:
+  method: POST
+  url: "{{baseUrl}}/sync/mutations/push"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "created_by": "bruno-demo",
+        "entries": [
+          {
+            "project": "{{project}}",
+            "entity": "relation",
+            "entity_key": "bruno-demo-rel-1",
+            "op": "upsert",
+            "payload": {
+              "sync_id": "bruno-demo-rel-1",
+              "source_id": "bruno-demo-obs-1",
+              "target_id": "bruno-demo-session-1",
+              "relation": "observed_in",
+              "judgment_status": "auto",
+              "marked_by_actor": "bruno-demo",
+              "marked_by_kind": "agent",
+              "marked_by_model": "bruno-fixture",
+              "project": "{{project}}",
+              "created_at": "{{$isoTimestamp}}"
+            }
+          }
+        ]
+      }
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body.accepted_seqs
+      operator: isArray
+  scripts:
+    - type: after-response
+      code: |-
+        // Capture the first accepted sequence number for use in
+        // 05-pull-mutations (`since_seq=<first_seq - 1>` returns it again
+        // and proves the server persisted the mutation).
+        const seqs = res.body && res.body.accepted_seqs;
+        if (Array.isArray(seqs) && seqs.length > 0) {
+          bru.setEnvVar("latestMutationSeq", seqs[seqs.length - 1]);
+        }
+    - type: tests
+      code: |-
+        test("Mutation batch was accepted", function() {
+          expect(res.body).to.have.property("accepted_seqs");
+          expect(res.body.accepted_seqs).to.be.an("array").that.is.not.empty;
+        });
+
+docs: |-
+  Pushes a batch of mutations to the cloud server. Each entry describes one
+  row in `cloud_mutations`.
+
+  Source: `internal/cloud/cloudserver/mutations.go` → `handleMutationPush`
+  (line 64).
+
+  Envelope (`mutationPushEnvelope`):
+    {
+      "created_by": "<optional, audit attribution>",
+      "entries": [
+        {
+          "project":     "<required>",
+          "entity":      "session|observation|prompt|relation",
+          "entity_key":  "<required>",
+          "op":          "<required>",
+          "payload":     { ... entity-specific JSON ... }
+        }
+      ]
+    }
+
+  Constraints (enforced server-side):
+    - `entries` MUST be non-empty (`empty_batch`).
+    - At most 100 entries per request (`maxMutationBatchSize`).
+    - Every entry's `project` MUST be non-empty (`empty_project`).
+    - Per-project authorization is enforced for every distinct project in
+      the batch. The batch is rejected all-or-nothing (BC2).
+    - For `entity="relation"`, the payload MUST contain all of:
+      `sync_id`, `source_id`, `target_id`, `relation`,
+      `judgment_status`, `marked_by_actor`, `marked_by_kind`
+      (`validation_error`, returned per-index in the `invalid` array).
+    - The server checks `IsProjectSyncEnabled` per project. If sync is
+      paused for any project in the batch, the entire batch is rejected
+      with 409 (`sync-paused`, plus a project envelope).
+
+  Status codes:
+    - 200 — accepted. Body:
+      `{ "accepted_seqs": [<int>...], "project": "<primary>", "project_source": "request_body", "project_path": "" }`.
+    - 400 — empty batch, empty project, invalid relation payload,
+      oversize batch, malformed JSON.
+    - 401 — Bearer token missing/invalid.
+    - 403 — token does not authorize any project in the batch.
+    - 409 — sync is paused for at least one project in the batch.
+    - 413 — payload exceeds `ENGRAM_CLOUD_MAX_PUSH_BYTES`.

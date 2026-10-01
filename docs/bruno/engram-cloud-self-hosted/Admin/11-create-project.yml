@@ -1,0 +1,99 @@
+info:
+  name: Create Project
+  type: http
+  seq: 11
+
+http:
+  method: POST
+  url: "{{baseUrl}}/admin/projects"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "name": "{{newProject}}"
+      }
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "201"
+    - expression: res.body.name
+      operator: isString
+    - expression: res.body.sync_enabled
+      operator: eq
+      value: "true"
+  scripts:
+    - type: after-response
+      code: |-
+        // Capture the SERVER-NORMALIZED project name into `project` so the
+        // downstream Sync/* requests can push/pull against this project
+        // without the operator having to copy the value by hand.
+        // Normalization rules: trimmed, lowercased, collapsed "--" and "__".
+        // If the operator passed "My_Project", `project` becomes "my_project".
+        if (res.body && typeof res.body.name === "string") {
+          bru.setEnvVar("project", res.body.name);
+        }
+    - type: tests
+      code: |-
+        test("Project was created with the normalized name", function() {
+          expect(res.body).to.have.property("name");
+          expect(res.body.name).to.be.a("string");
+        });
+        test("New project starts with sync_enabled=true", function() {
+          expect(res.body).to.have.property("sync_enabled");
+          expect(res.body.sync_enabled).to.equal(true);
+        });
+
+docs: |-
+  Creates a brand-new cloud project via the managed-admin API. Use this when
+  you want a project that does NOT already exist in `ENGRAM_CLOUD_ALLOWED_PROJECTS`
+  (the legacy sync-token allowlist) — the API-created project is reachable
+  through the admin's managed token and grant, not the legacy env allowlist.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminCreateProject`.
+  Route registered in `internal/cloud/cloudserver/cloudserver.go` → `routes()`
+  (`POST /admin/projects`).
+
+  Request body (`createAdminProjectRequest`):
+    - `name` — required, server-normalized via `NormalizeProjectGrant`
+      (trim → lowercase → collapse `--` and `__`).
+
+  Effects (atomic via `cloudstore.CreateProjectWithGrantAndAudit`):
+    - INSERT into `cloud_project_controls` (`sync_enabled=TRUE`).
+    - INSERT into `cloud_project_grants` for the acting admin
+      (`granted_by_principal_id = actor.id`).
+    - INSERT into `cloud_auth_audit_log` (`action="project.create"`).
+    - All three succeed together or roll back together. The acting admin
+      automatically gets a grant on the new project.
+
+  Response body:
+    {
+      "name":         "<normalized project>",
+      "sync_enabled": true
+    }
+
+  Status codes:
+    - 201 — created.
+    - 400 — invalid payload, empty name, unknown fields, or a name that
+      normalizes to empty.
+    - 401 / 403 — see folder docs (managed admin only).
+    - 409 — project already exists (no second grant, no second audit event).
+    - 500 — storage failure or audit insert failure (transaction rollback).
+
+  Safety notes:
+    - The legacy `ENGRAM_CLOUD_ALLOWED_PROJECTS` allowlist is **unchanged**
+      by this call. Projects created via API are reachable through the
+      admin's managed token + project grant, not through the legacy sync
+      token. To grant a non-admin managed token access to the project, run
+      `Admin/09-create-user-grant` after this request.
+    - The normalized `name` is captured into the `project` env variable so
+      subsequent `Sync/*` requests push/pull against the new project.

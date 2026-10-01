@@ -3,10 +3,16 @@ package cloudstore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// ErrProjectAlreadyExists is returned by CreateProjectWithGrantAndAudit when
+// a row already exists in cloud_project_controls for the requested (normalized)
+// project. Callers must map this to a 409 Conflict at the API boundary.
+var ErrProjectAlreadyExists = errors.New("cloudstore: project already exists")
 
 // ProjectSyncControl holds the per-project sync enable/pause record.
 // The backing table is cloud_project_controls (Postgres, added in migrate()).
@@ -158,4 +164,97 @@ func (cs *CloudStore) ListProjectSyncControls() ([]ProjectSyncControl, error) {
 		return nil, fmt.Errorf("cloudstore: ListProjectSyncControls iterate: %w", err)
 	}
 	return result, nil
+}
+
+// CreateProjectWithGrantAndAudit persists a brand-new project together with
+// its initial actor grant and the auth-audit event in a single Postgres
+// transaction, mirroring the CreatePrincipalTokenWithAudit atomicity contract
+// so callers never see a project row without its grant or its audit event.
+//
+// Failure modes:
+//   - ErrProjectAlreadyExists when cloud_project_controls already has a row for
+//     the normalized project (detected via ON CONFLICT DO NOTHING + zero rows
+//     affected; the transaction is rolled back so no grant/audit rows are left
+//     dangling).
+//   - ErrAuthAuditInsertFailed when the audit insert fails (the project row and
+//     the grant row are rolled back together with the audit insert).
+//
+// The project name is normalized via the same NormalizeProjectGrant pipeline
+// used by CreateProjectGrant, so a caller passing "My_Project" receives a row
+// keyed under "my_project" and the grant is stored under the same canonical
+// form. Initial sync_enabled defaults to TRUE — pausing a freshly created
+// project is a deliberate, separate admin action.
+func (cs *CloudStore) CreateProjectWithGrantAndAudit(ctx context.Context, params CreateProjectGrantParams, audit AuthAuditEvent) error {
+	if cs == nil || cs.db == nil {
+		return fmt.Errorf("cloudstore: not initialized")
+	}
+	principalID := strings.TrimSpace(params.PrincipalID)
+	if principalID == "" {
+		return fmt.Errorf("cloudstore: principal id is required")
+	}
+	grantedBy := strings.TrimSpace(params.GrantedByPrincipalID)
+	if grantedBy == "" {
+		return fmt.Errorf("cloudstore: granted by principal id is required")
+	}
+	project := normalizeCloudProjectGrant(params.Project)
+	if project == "" {
+		return fmt.Errorf("cloudstore: project is required")
+	}
+
+	tx, err := cs.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("cloudstore: begin project create tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Insert the project control row. ON CONFLICT DO NOTHING lets us detect
+	// duplicates via RowsAffected() == 0 without exposing the underlying
+	// pq/23505 unique-violation text to callers.
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO cloud_project_controls (project, sync_enabled, paused_reason, updated_by, updated_at)
+		VALUES ($1, TRUE, NULL, $2, $3)
+		ON CONFLICT (project) DO NOTHING`,
+		project, grantedBy, time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("cloudstore: insert project control: %w", err)
+	}
+	affected, raErr := res.RowsAffected()
+	if raErr != nil {
+		return fmt.Errorf("cloudstore: project control rows affected: %w", raErr)
+	}
+	if affected == 0 {
+		// Roll back explicitly so any earlier tx activity (currently none,
+		// but future-proof) is reverted before we surface the conflict.
+		_ = tx.Rollback()
+		return ErrProjectAlreadyExists
+	}
+
+	// Initial grant for the actor. ON CONFLICT keeps the call idempotent on
+	// the grant side (re-running with the same principal+project pair is a
+	// no-op), but the surrounding tx is gated on the project-create above so
+	// this branch is only reachable on a successful first insert.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cloud_project_grants (principal_id, project, granted_by_principal_id)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (principal_id, project) DO UPDATE SET granted_by_principal_id = EXCLUDED.granted_by_principal_id`,
+		principalID, project, grantedBy,
+	); err != nil {
+		return fmt.Errorf("cloudstore: insert project grant: %w", err)
+	}
+
+	// Auth audit event. We project the normalized project name into the row
+	// so the audit log is self-describing (the request payload's name may
+	// differ from the canonical form when the caller passed an unnormalized
+	// one).
+	auditEvent := audit
+	auditEvent.Project = project
+	if err := insertAuthAuditEvent(ctx, tx, auditEvent); err != nil {
+		return fmt.Errorf("%w: %w", ErrAuthAuditInsertFailed, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("cloudstore: commit project create tx: %w", err)
+	}
+	return nil
 }

@@ -1,0 +1,93 @@
+info:
+  name: Create User Token
+  type: http
+  seq: 6
+
+http:
+  method: POST
+  url: "{{baseUrl}}/admin/users/{{principalId}}/tokens"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: Accept
+      value: application/json
+  body:
+    type: json
+    data: |-
+      {
+        "name": "{{newTokenName}}"
+      }
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "201"
+    - expression: res.body.raw_token
+      operator: isString
+    - expression: res.body.token.id
+      operator: isString
+  scripts:
+    - type: after-response
+      code: |-
+        // The raw token is shown ONLY ONCE. Capture it immediately into a
+        // secret environment variable so the next run can use it as a
+        // Bearer credential. Subsequent requests can be made with either
+        // the legacy ENGRAM_CLOUD_TOKEN OR this managed token.
+        if (res.body && typeof res.body.raw_token === "string") {
+          bru.setEnvVar("managedRawToken", res.body.raw_token);
+        }
+        if (res.body && res.body.token && typeof res.body.token.id === "string") {
+          bru.setEnvVar("tokenId", res.body.token.id);
+        }
+    - type: tests
+      code: |-
+        test("Response carries the raw token exactly once", function() {
+          expect(res.body).to.have.property("raw_token");
+          expect(res.body.raw_token).to.match(/^egc_live_[0-9a-f_]+/);
+        });
+        test("Sanitized token metadata is included", function() {
+          expect(res.body).to.have.property("token");
+          expect(res.body.token).to.have.property("id");
+          expect(res.body.token).to.have.property("token_prefix");
+          expect(res.body.token).to.not.have.property("token_hash");
+        });
+
+docs: |-
+  Mints a new managed token for a user. The raw token (`egc_live_...`) is
+  shown **exactly once** in the response — store it now.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminCreateToken`
+  (line 178).
+
+  Request body (`createAdminTokenRequest`):
+    - `name` — optional human label stored on the row.
+
+  Effects:
+    - Calls `cloudauth.GenerateManagedToken("live")` to produce
+      `Raw` + `Prefix`.
+    - Hashes `Raw` with the configured `ENGRAM_CLOUD_TOKEN_PEPPER`
+      via `ManagedTokenHasher`.
+    - Atomic insert into `cloud_principal_tokens` plus an
+      `auth_audit_events` row with `action=token.create`. Both must
+      succeed; audit failure rolls back the token.
+    - Disabled users are rejected with 409.
+
+  Response body:
+    {
+      "raw_token": "egc_live_<8-hex>_<base64url>",
+      "token":     { <adminTokenMetadata — same shape as 05-list-user-tokens> }
+    }
+
+  Status codes:
+    - 201 — token minted.
+    - 400 — invalid payload or storage rejection.
+    - 401 / 403 — see folder docs.
+    - 404 — managed user not found.
+    - 409 — managed user is disabled
+      (`error_code=policy_forbidden`, message: "managed user ... is
+      disabled; enable the user before creating a managed token").
+    - 500 — managed token hasher not configured or audit failure.

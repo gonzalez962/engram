@@ -312,6 +312,7 @@ func (s *CloudServer) routes() {
 	s.mux.HandleFunc("POST /dashboard/admin/tokens/{tokenID}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedToken))
 	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants", s.requireDashboardSession(s.handleDashboardCreateManagedGrant))
 	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants/{project}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedGrant))
+	s.mux.HandleFunc("POST /dashboard/admin/projects", s.requireDashboardSession(s.handleDashboardCreateManagedProject))
 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
 	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
 	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
@@ -331,6 +332,11 @@ func (s *CloudServer) routes() {
 	s.mux.HandleFunc("GET /admin/users/{principalID}/grants", s.withAuth(s.handleAdminListGrants))
 	s.mux.HandleFunc("POST /admin/users/{principalID}/grants", s.withAuth(s.handleAdminCreateGrant))
 	s.mux.HandleFunc("POST /admin/users/{principalID}/grants/{project}/revoke", s.withAuth(s.handleAdminRevokeGrant))
+	// POST /admin/projects — managed-admin-only project creation. Creates a
+	// project control row (sync_enabled=true), grants the acting admin a
+	// grant, and writes a project.create audit event atomically. See
+	// handleAdminCreateProject in admin_handlers.go.
+	s.mux.HandleFunc("POST /admin/projects", s.withAuth(s.handleAdminCreateProject))
 }
 
 // dashboardStoreForRequest creates a fresh immutable view for managed

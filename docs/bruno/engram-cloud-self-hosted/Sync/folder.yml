@@ -1,0 +1,35 @@
+info:
+  name: Sync
+  type: folder
+
+http:
+  auth:
+    type: bearer
+    token: "{{token}}"
+
+runtime:
+  scripts:
+    - type: tests
+      code: |-
+        // Every sync request must come back with a JSON body. Any non-JSON
+        // 4xx/5xx page means the server is misconfigured or the token is
+        // wrong — fail loudly so the operator notices before reading the
+        // response shape.
+        const ct = res.headers["content-type"] || "";
+        if (res.status >= 400) {
+          test("Sync response is JSON on error", function() {
+            expect(ct).to.contain("application/json");
+          });
+        }
+
+docs: |-
+  Bearer-authenticated sync endpoints used by `engram sync --cloud`.
+
+  Source: `internal/cloud/cloudserver/cloudserver.go` (sync routes) and
+  `internal/cloud/cloudserver/mutations.go`.
+
+  Every request in this folder must include `?project=<name>` where the
+  project appears in the server's `ENGRAM_CLOUD_ALLOWED_PROJECTS`.
+  Pull/push also gate on `authorizeProjectScope`, so the bearer principal
+  must have a `cloud_project_grants` row for that project (when managed
+  tokens are in use).

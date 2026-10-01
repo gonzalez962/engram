@@ -382,7 +382,42 @@ func TestAdminProjectsPageRendersToggles(t *testing.T) {
 	if !strings.Contains(body, `hx-post="/dashboard/admin/projects/`) && !strings.Contains(body, `action="/dashboard/admin/projects/`) {
 		t.Errorf("expected admin toggle forms in /dashboard/admin/projects body, got body=%q", body)
 	}
+	if !strings.Contains(body, `action="/dashboard/admin/projects"`) || !strings.Contains(body, "Create Project") {
+		t.Errorf("expected create project form in /dashboard/admin/projects body, got body=%q", body)
+	}
 }
+
+// TestAdminProjectsPageHidesCreateProjectFormForLegacyAdmin asserts that when
+// CanManageManagedUsers is false, the create project form is hidden and the
+// managed administration notice is rendered instead.
+func TestAdminProjectsPageHidesCreateProjectFormForLegacyAdmin(t *testing.T) {
+	mux := http.NewServeMux()
+	Mount(mux, MountConfig{
+		RequireSession: func(r *http.Request) error {
+			if r.URL.Query().Get("auth") == "ok" {
+				return nil
+			}
+			return errUnauthorized
+		},
+		IsAdmin:               func(_ *http.Request) bool { return true },
+		CanManageManagedUsers: func(_ *http.Request) bool { return false },
+		GetDisplayName:        func(_ *http.Request) string { return "LEGACY_OPERATOR" },
+		Store:                 parityStoreStub{},
+	})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard/admin/projects?auth=ok", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `action="/dashboard/admin/projects"`) || strings.Contains(body, "Create Project") {
+		t.Errorf("expected create project form to be hidden for legacy admin, got body=%q", body)
+	}
+	if !strings.Contains(body, "Managed-user administration requires a managed admin token") {
+		t.Errorf("expected managed admin notice in body, got body=%q", body)
+	}
+}
+
 
 // TestProjectDetailShowsPauseAudit asserts GET /dashboard/projects/{name}
 // renders PROJECT DETAIL with pause audit info from the sync control. Satisfies (j).

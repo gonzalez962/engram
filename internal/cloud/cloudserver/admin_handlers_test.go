@@ -23,6 +23,7 @@ type adminTestStore struct {
 	users             []cloudstore.HumanUser
 	tokens            []cloudstore.PrincipalToken
 	grants            []cloudstore.ProjectGrant
+	projectControls   []cloudstore.ProjectSyncControl
 	auditEvents       []cloudstore.AuthAuditEvent
 	auditErr          error
 	createUserErr     error
@@ -38,18 +39,20 @@ type adminTestStore struct {
 	// PR4 review remediation (FIX C): per-method error injection so tests can
 	// prove mutation handlers surface store failures as errors instead of
 	// partial success, without adding a partial-success audit event.
-	setEnabledErr  error
-	createTokenErr error
-	revokeTokenErr error
-	createGrantErr error
-	revokeGrantErr error
+	setEnabledErr    error
+	createTokenErr   error
+	revokeTokenErr   error
+	createGrantErr   error
+	revokeGrantErr   error
+	createProjectErr error
 
-	createUserCalls  int
-	setEnabledCalls  int
-	createTokenCalls int
-	revokeTokenCalls int
-	createGrantCalls int
-	revokeGrantCalls int
+	createUserCalls    int
+	setEnabledCalls    int
+	createTokenCalls   int
+	revokeTokenCalls   int
+	createGrantCalls   int
+	revokeGrantCalls   int
+	createProjectCalls int
 }
 
 func newAdminTestStore() *adminTestStore {
@@ -207,6 +210,56 @@ func (s *adminTestStore) RevokeProjectGrant(_ context.Context, principalID, proj
 	return nil
 }
 
+// CreateProjectWithGrantAndAudit mirrors the real cloudstore's atomic
+// transaction: a project control row, a project grant for the actor, and the
+// audit event all succeed together or fail together. Duplicate projects
+// (matched by normalized name) return cloudstore.ErrProjectAlreadyExists
+// without touching the grant or audit slices, mirroring the production
+// ON CONFLICT DO NOTHING contract.
+func (s *adminTestStore) CreateProjectWithGrantAndAudit(_ context.Context, params cloudstore.CreateProjectGrantParams, audit cloudstore.AuthAuditEvent) error {
+	s.createProjectCalls++
+	if s.createProjectErr != nil {
+		return s.createProjectErr
+	}
+	project := strings.TrimSpace(params.Project)
+	if project == "" {
+		return errors.New("cloudstore: project is required")
+	}
+	principalID := strings.TrimSpace(params.PrincipalID)
+	if principalID == "" {
+		return errors.New("cloudstore: principal id is required")
+	}
+	for _, ctrl := range s.projectControls {
+		if ctrl.Project == project {
+			return cloudstore.ErrProjectAlreadyExists
+		}
+	}
+	if strings.TrimSpace(audit.ActorSource) == "" {
+		return errors.New("actor source is required")
+	}
+	if s.auditErr != nil {
+		return fmt.Errorf("%w: %w", cloudstore.ErrAuthAuditInsertFailed, s.auditErr)
+	}
+	now := time.Date(2026, 7, 3, 12, 4, 0, 0, time.UTC)
+	updatedBy := strings.TrimSpace(params.GrantedByPrincipalID)
+	s.projectControls = append(s.projectControls, cloudstore.ProjectSyncControl{
+		Project:     project,
+		SyncEnabled: true,
+		UpdatedAt:   now.UTC().Format(time.RFC3339),
+		UpdatedBy:   &updatedBy,
+	})
+	s.grants = append(s.grants, cloudstore.ProjectGrant{
+		PrincipalID:          principalID,
+		Project:              project,
+		GrantedByPrincipalID: strings.TrimSpace(params.GrantedByPrincipalID),
+		CreatedAt:            now,
+	})
+	s.auditMu.Lock()
+	s.auditEvents = append(s.auditEvents, audit)
+	s.auditMu.Unlock()
+	return nil
+}
+
 // InsertAuthAuditEvent replicates the real cloudstore.InsertAuthAuditEvent
 // validation (actor source is required) so tests catch call sites that would
 // silently fail to persist an audit event against the production store.
@@ -300,6 +353,7 @@ func TestAdminHandlersRequireManagedAdminAndLeaveNoStateForMembers(t *testing.T)
 		{name: "revoke token", method: http.MethodPost, path: "/admin/tokens/tok-target/revoke", body: `{"reason":"lost"}`},
 		{name: "create grant", method: http.MethodPost, path: "/admin/users/p-target/grants", body: `{"project":"beta"}`},
 		{name: "revoke grant", method: http.MethodPost, path: "/admin/users/p-target/grants/alpha/revoke"},
+		{name: "create project", method: http.MethodPost, path: "/admin/projects", body: `{"name":"beta"}`},
 	}
 
 	for _, forbidden := range forbiddenPrincipals {
@@ -319,14 +373,14 @@ func TestAdminHandlersRequireManagedAdminAndLeaveNoStateForMembers(t *testing.T)
 				})
 			}
 
-			if store.createUserCalls != 0 || store.setEnabledCalls != 0 || store.createTokenCalls != 0 || store.revokeTokenCalls != 0 || store.createGrantCalls != 0 || store.revokeGrantCalls != 0 {
-				t.Fatalf("forbidden request mutated state: user=%d enabled=%d token=%d revokeToken=%d grant=%d revokeGrant=%d", store.createUserCalls, store.setEnabledCalls, store.createTokenCalls, store.revokeTokenCalls, store.createGrantCalls, store.revokeGrantCalls)
+			if store.createUserCalls != 0 || store.setEnabledCalls != 0 || store.createTokenCalls != 0 || store.revokeTokenCalls != 0 || store.createGrantCalls != 0 || store.revokeGrantCalls != 0 || store.createProjectCalls != 0 {
+				t.Fatalf("forbidden request mutated state: user=%d enabled=%d token=%d revokeToken=%d grant=%d revokeGrant=%d createProject=%d", store.createUserCalls, store.setEnabledCalls, store.createTokenCalls, store.revokeTokenCalls, store.createGrantCalls, store.revokeGrantCalls, store.createProjectCalls)
 			}
 			if len(store.auditEvents) != 0 {
 				t.Fatalf("forbidden requests must not create success audit events, got %+v", store.auditEvents)
 			}
-			if len(store.users) != 1 || len(store.tokens) != 1 || len(store.grants) != 1 {
-				t.Fatalf("forbidden request changed collections: users=%d tokens=%d grants=%d", len(store.users), len(store.tokens), len(store.grants))
+			if len(store.users) != 1 || len(store.tokens) != 1 || len(store.grants) != 1 || len(store.projectControls) != 0 {
+				t.Fatalf("forbidden request changed collections: users=%d tokens=%d grants=%d projectControls=%d", len(store.users), len(store.tokens), len(store.grants), len(store.projectControls))
 			}
 		})
 	}
@@ -645,6 +699,7 @@ func TestAdminMutationsAreSynchronouslyAuditedAndFailClosedOnAuditErrors(t *test
 		{name: "token revoke", method: http.MethodPost, path: "/admin/tokens/tok-target/revoke", body: `{"reason":"rotation"}`, action: "token.revoke"},
 		{name: "grant create", method: http.MethodPost, path: "/admin/users/p-target/grants", body: `{"project":"alpha"}`, action: "grant.create"},
 		{name: "grant revoke", method: http.MethodPost, path: "/admin/users/p-target/grants/alpha/revoke", action: "grant.revoke"},
+		{name: "project create", method: http.MethodPost, path: "/admin/projects", body: `{"name":"zeta"}`, action: "project.create"},
 	}
 
 	for _, mutation := range mutations {
@@ -692,5 +747,212 @@ func TestAdminMutationsAreSynchronouslyAuditedAndFailClosedOnAuditErrors(t *test
 	}
 	if blockedStore.createUserCalls != 1 || len(blockedStore.users) != 1 {
 		t.Fatalf("post-mutation audit failure should occur after authoritative mutation, calls=%d users=%+v", blockedStore.createUserCalls, blockedStore.users)
+	}
+}
+
+// TestAdminCreateProjectHappyPath proves POST /admin/projects returns 201
+// with the normalized project name, sync_enabled=true, the actor's grant,
+// and a project.create audit event recorded with no sensitive-key leakage.
+func TestAdminCreateProjectHappyPath(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/projects", `{"name":"alpha"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected create project 201, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	var resp adminProjectMetadata
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode create project response: %v body=%q", err, rec.Body.String())
+	}
+	if resp.Name != "alpha" || !resp.SyncEnabled {
+		t.Fatalf("unexpected create project response: %+v", resp)
+	}
+	if store.createProjectCalls != 1 {
+		t.Fatalf("expected exactly one CreateProjectWithGrantAndAudit call, got %d", store.createProjectCalls)
+	}
+	if len(store.projectControls) != 1 || store.projectControls[0].Project != "alpha" || !store.projectControls[0].SyncEnabled {
+		t.Fatalf("expected one project control row with sync_enabled=true, got %+v", store.projectControls)
+	}
+	if len(store.grants) != 1 || store.grants[0].Project != "alpha" || store.grants[0].PrincipalID != "p-admin" || store.grants[0].GrantedByPrincipalID != "p-admin" {
+		t.Fatalf("expected one grant for the actor on the new project, got %+v", store.grants)
+	}
+	var createEvent *cloudstore.AuthAuditEvent
+	for i, ev := range store.auditEvents {
+		if ev.Action == authAuditActionProjectCreate {
+			createEvent = &store.auditEvents[i]
+			break
+		}
+	}
+	if createEvent == nil {
+		t.Fatalf("expected a project.create audit event, got events=%+v", store.auditEvents)
+	}
+	if createEvent.ActorPrincipalID != "p-admin" || createEvent.Project != "alpha" || createEvent.Outcome != "success" {
+		t.Fatalf("unexpected project.create audit event: %+v", createEvent)
+	}
+	encodedMetadata, err := json.Marshal(createEvent.Metadata)
+	if err != nil {
+		t.Fatalf("marshal audit metadata: %v", err)
+	}
+	metadata := strings.ToLower(string(encodedMetadata))
+	for _, fragment := range []string{"token", "secret", "password", "hash", "bearer", "authorization", "cookie"} {
+		if strings.Contains(metadata, fragment) {
+			t.Fatalf("project.create audit metadata leaked %q: %s", fragment, metadata)
+		}
+	}
+}
+
+// TestAdminCreateProjectNormalizesName proves the server applies the same
+// NormalizeProjectGrant pipeline used by grants so the response reflects the
+// canonical stored form (trimmed, lowercased, collapsed -- and __).
+func TestAdminCreateProjectNormalizesName(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	srv := adminHandlerTestServer(t, admin, store)
+
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{input: "  My_Project  ", expected: "my_project"},
+		{input: "alpha--beta", expected: "alpha-beta"},
+		{input: "gamma__delta", expected: "gamma_delta"},
+		{input: "UPPER", expected: "upper"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			rec := performAdminRequest(srv, http.MethodPost, "/admin/projects", fmt.Sprintf(`{"name":%q}`, tc.input))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("expected 201 for %q, got %d body=%q", tc.input, rec.Code, rec.Body.String())
+			}
+			var resp adminProjectMetadata
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v body=%q", err, rec.Body.String())
+			}
+			if resp.Name != tc.expected {
+				t.Fatalf("normalized name mismatch for %q: want %q got %q", tc.input, tc.expected, resp.Name)
+			}
+		})
+	}
+}
+
+// TestAdminCreateProjectRejectsInvalidPayload covers the 400 paths: empty
+// name, missing name, malformed JSON, and unknown fields (the decoder is
+// configured with DisallowUnknownFields — we deliberately do not accept
+// display_name, grants, or other speculative fields).
+func TestAdminCreateProjectRejectsInvalidPayload(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	srv := adminHandlerTestServer(t, admin, store)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "empty name", body: `{"name":""}`},
+		{name: "whitespace name", body: `{"name":"   "}`},
+		{name: "missing name", body: `{}`},
+		{name: "malformed json", body: `{`},
+		{name: "unknown fields", body: `{"name":"alpha","display_name":"x","grants":["x"]}`},
+		// "!!!" passes TrimSpace but normalizeCloudProjectGrant returns "" so the
+		// handler must reject it before reaching the store.
+		{name: "name normalizes to empty", body: `{"name":"!!!"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := performAdminRequest(srv, http.MethodPost, "/admin/projects", tc.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %q, got %d body=%q", tc.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if store.createProjectCalls != 0 {
+		t.Fatalf("invalid payloads must not reach the store, got %d calls", store.createProjectCalls)
+	}
+	if len(store.projectControls) != 0 || len(store.grants) != 0 || len(store.auditEvents) != 0 {
+		t.Fatalf("invalid payloads must not mutate state, got controls=%d grants=%d events=%d", len(store.projectControls), len(store.grants), len(store.auditEvents))
+	}
+}
+
+// TestAdminCreateProjectDuplicateReturns409 proves the conflict path: when a
+// project with the normalized name already exists, the handler returns 409
+// without persisting a second control row, grant, or success audit event.
+func TestAdminCreateProjectDuplicateReturns409(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	updatedBy := "p-admin"
+	store.projectControls = append(store.projectControls, cloudstore.ProjectSyncControl{Project: "alpha", SyncEnabled: true, UpdatedBy: &updatedBy})
+	store.grants = append(store.grants, cloudstore.ProjectGrant{PrincipalID: "p-admin", Project: "alpha", GrantedByPrincipalID: "p-admin"})
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/projects", `{"name":"alpha"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for duplicate project, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if store.createProjectCalls != 1 {
+		t.Fatalf("expected the store boundary to be reached once for the duplicate, got %d calls", store.createProjectCalls)
+	}
+	if len(store.projectControls) != 1 {
+		t.Fatalf("duplicate rejection must not add a control row, got %+v", store.projectControls)
+	}
+	if len(store.grants) != 1 {
+		t.Fatalf("duplicate rejection must not add a second grant, got %+v", store.grants)
+	}
+	for _, ev := range store.auditEvents {
+		if ev.Action == authAuditActionProjectCreate {
+			t.Fatalf("duplicate rejection must not record project.create success audit, got %+v", ev)
+		}
+	}
+}
+
+// TestAdminCreateProjectStoreFailureFailsClosed proves that when the storage
+// boundary returns an unexpected error, the handler surfaces 500 without
+// partial state (no project control row, no grant, no audit event).
+func TestAdminCreateProjectStoreFailureFailsClosed(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	store.createProjectErr = errors.New("project store unavailable")
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/projects", `{"name":"alpha"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for store failure, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if store.createProjectCalls != 1 {
+		t.Fatalf("expected store boundary reached once, got %d calls", store.createProjectCalls)
+	}
+	if len(store.projectControls) != 0 || len(store.grants) != 0 || len(store.auditEvents) != 0 {
+		t.Fatalf("store failure must not persist any state, got controls=%d grants=%d events=%d", len(store.projectControls), len(store.grants), len(store.auditEvents))
+	}
+}
+
+// TestAdminCreateProjectAuditFailureRollsBackAllState proves the atomicity
+// contract: when the audit insert fails, NO project control row and NO grant
+// are persisted (mirrors the real Postgres transaction rollback in
+// CreateProjectWithGrantAndAudit).
+func TestAdminCreateProjectAuditFailureRollsBackAllState(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	store.auditErr = errors.New("audit store unavailable")
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/projects", `{"name":"alpha"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for audit failure, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if store.createProjectCalls != 1 {
+		t.Fatalf("expected the atomic tx to be attempted once, got %d calls", store.createProjectCalls)
+	}
+	if len(store.projectControls) != 0 {
+		t.Fatalf("audit failure must roll back the project control row, got %+v", store.projectControls)
+	}
+	if len(store.grants) != 0 {
+		t.Fatalf("audit failure must roll back the actor grant, got %+v", store.grants)
+	}
+	for _, ev := range store.auditEvents {
+		if ev.Action == authAuditActionProjectCreate {
+			t.Fatalf("audit failure must not record project.create success audit, got %+v", ev)
+		}
 	}
 }

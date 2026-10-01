@@ -1,0 +1,62 @@
+info:
+  name: List Users
+  type: http
+  seq: 1
+
+http:
+  method: GET
+  url: "{{baseUrl}}/admin/users"
+  headers:
+    - name: Accept
+      value: application/json
+
+settings:
+  encodeUrl: true
+
+runtime:
+  assertions:
+    - expression: res.status
+      operator: eq
+      value: "200"
+    - expression: res.body
+      operator: isArray
+  scripts:
+    - type: tests
+      code: |-
+        test("List returns an array", function() {
+          expect(res.body).to.be.an("array");
+        });
+        test("Each user has a principal_id and enabled flag", function() {
+          if (res.body.length > 0) {
+            expect(res.body[0]).to.have.property("principal_id");
+            expect(res.body[0]).to.have.property("enabled");
+          }
+        });
+
+docs: |-
+  Lists every managed human user.
+
+  Source: `internal/cloud/cloudserver/admin_handlers.go` → `handleAdminListUsers`
+  (line 78).
+
+  Auth:
+    - Bearer token must resolve to a managed-token principal with
+      `Role=admin` (see `requireManagedAdmin`). The legacy sync token
+      cannot authorize this endpoint.
+
+  Response: JSON array of `cloudstore.HumanUser` objects:
+    {
+      "principal_id": "<uuid>",
+      "username":     "<string>",
+      "email":        "<string>",
+      "display_name": "<string>",
+      "role":         "admin|member",
+      "enabled":      <bool>,
+      "created_at":   "<RFC3339>"
+    }
+
+  Status codes:
+    - 200 — list returned (possibly empty).
+    - 401 — Bearer token missing/invalid.
+    - 403 — token does not carry a managed admin principal.
+    - 500 — admin identity store not configured, or storage error.
