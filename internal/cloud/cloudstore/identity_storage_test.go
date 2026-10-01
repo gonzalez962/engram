@@ -1455,3 +1455,108 @@ func assertProjects(t *testing.T, got []ProjectGrant, want []string) {
 		t.Fatalf("projects mismatch: got=%v want=%v", projects, want)
 	}
 }
+
+func TestTouchPrincipalTokenLastUsedRecordsSuccessfulUseWithThrottle(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+
+	principal, err := cs.CreatePrincipal(ctx, CreatePrincipalParams{Kind: PrincipalKindServiceAccount, DisplayName: "touch-bot", Role: PrincipalRoleMember})
+	if err != nil {
+		t.Fatalf("CreatePrincipal: %v", err)
+	}
+	token, err := cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: principal.ID, TokenPrefix: "egc_live_touch", TokenHash: "hmac-sha256:v1:touch", Name: "touch"})
+	if err != nil {
+		t.Fatalf("CreatePrincipalToken: %v", err)
+	}
+	if got := principalTokenLastUsedAt(t, cs, token.ID); got != nil {
+		t.Fatalf("new token must start unused, got %v", got)
+	}
+
+	if err := cs.TouchPrincipalTokenLastUsed(ctx, token.ID); err != nil {
+		t.Fatalf("TouchPrincipalTokenLastUsed: %v", err)
+	}
+	first := principalTokenLastUsedAt(t, cs, token.ID)
+	if first == nil {
+		t.Fatal("successful use must set last_used_at")
+	}
+
+	if err := cs.TouchPrincipalTokenLastUsed(ctx, token.ID); err != nil {
+		t.Fatalf("second TouchPrincipalTokenLastUsed: %v", err)
+	}
+	if second := principalTokenLastUsedAt(t, cs, token.ID); second == nil || !second.Equal(*first) {
+		t.Fatalf("touch within a minute must not write again: first=%v second=%v", first, second)
+	}
+
+	if _, err := cs.db.ExecContext(ctx, `UPDATE cloud_principal_tokens SET last_used_at = NOW() - INTERVAL '2 minutes' WHERE id = $1`, token.ID); err != nil {
+		t.Fatalf("age last_used_at: %v", err)
+	}
+	aged := principalTokenLastUsedAt(t, cs, token.ID)
+	if err := cs.TouchPrincipalTokenLastUsed(ctx, token.ID); err != nil {
+		t.Fatalf("aged TouchPrincipalTokenLastUsed: %v", err)
+	}
+	if refreshed := principalTokenLastUsedAt(t, cs, token.ID); refreshed == nil || !refreshed.After(*aged) {
+		t.Fatalf("touch after the throttle window must refresh last_used_at: aged=%v refreshed=%v", aged, refreshed)
+	}
+
+	_, found, err := cs.FindPrincipalTokenByHash(ctx, "hmac-sha256:v1:touch")
+	if err != nil || found.ID != principal.ID {
+		t.Fatalf("FindPrincipalTokenByHash: principal=%+v err=%v", found, err)
+	}
+}
+
+func TestTouchPrincipalTokenLastUsedSkipsRevokedTokensAndDisabledPrincipals(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+
+	enabled, err := cs.CreatePrincipal(ctx, CreatePrincipalParams{Kind: PrincipalKindServiceAccount, DisplayName: "revoked-bot", Role: PrincipalRoleMember})
+	if err != nil {
+		t.Fatalf("CreatePrincipal enabled: %v", err)
+	}
+	revoked, err := cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: enabled.ID, TokenPrefix: "egc_live_revoked", TokenHash: "hmac-sha256:v1:revoked", Name: "revoked"})
+	if err != nil {
+		t.Fatalf("CreatePrincipalToken revoked: %v", err)
+	}
+	if err := cs.RevokePrincipalToken(ctx, revoked.ID, "", "test"); err != nil {
+		t.Fatalf("RevokePrincipalToken: %v", err)
+	}
+
+	disabled, err := cs.CreatePrincipal(ctx, CreatePrincipalParams{Kind: PrincipalKindServiceAccount, DisplayName: "disabled-bot", Role: PrincipalRoleMember})
+	if err != nil {
+		t.Fatalf("CreatePrincipal disabled: %v", err)
+	}
+	disabledToken, err := cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: disabled.ID, TokenPrefix: "egc_live_disabled", TokenHash: "hmac-sha256:v1:disabled", Name: "disabled"})
+	if err != nil {
+		t.Fatalf("CreatePrincipalToken disabled: %v", err)
+	}
+	if err := cs.UpdatePrincipal(ctx, disabled.ID, UpdatePrincipalParams{Role: PrincipalRoleMember, Enabled: false}); err != nil {
+		t.Fatalf("disable principal: %v", err)
+	}
+
+	for _, tokenID := range []string{revoked.ID, disabledToken.ID} {
+		if err := cs.TouchPrincipalTokenLastUsed(ctx, tokenID); err != nil {
+			t.Fatalf("TouchPrincipalTokenLastUsed(%s): %v", tokenID, err)
+		}
+		if got := principalTokenLastUsedAt(t, cs, tokenID); got != nil {
+			t.Fatalf("token %s must not be touched, got last_used_at=%v", tokenID, got)
+		}
+	}
+	if err := cs.TouchPrincipalTokenLastUsed(ctx, "999999"); err != nil {
+		t.Fatalf("unknown token touch must be a no-op, got %v", err)
+	}
+	if err := cs.TouchPrincipalTokenLastUsed(ctx, "  "); err == nil {
+		t.Fatal("blank token id must be rejected")
+	}
+}
+
+func principalTokenLastUsedAt(t *testing.T, cs *CloudStore, tokenID string) *time.Time {
+	t.Helper()
+	var lastUsed sql.NullTime
+	if err := cs.db.QueryRowContext(context.Background(), `SELECT last_used_at FROM cloud_principal_tokens WHERE id = $1`, tokenID).Scan(&lastUsed); err != nil {
+		t.Fatalf("read last_used_at: %v", err)
+	}
+	if !lastUsed.Valid {
+		return nil
+	}
+	value := lastUsed.Time
+	return &value
+}

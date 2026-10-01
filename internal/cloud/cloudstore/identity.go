@@ -783,6 +783,39 @@ func (cs *CloudStore) FindPrincipalTokenByHash(ctx context.Context, tokenHash st
 	return token, principal, nil
 }
 
+// principalTokenLastUsedThrottle bounds last_used_at writes to at most one per
+// token per interval, so authenticated request bursts do not rewrite the row.
+const principalTokenLastUsedThrottle = `1 minute`
+
+// TouchPrincipalTokenLastUsed records that a managed token was just used. It
+// is a throttled, conditional write: last_used_at is set to NOW() only for a
+// non-revoked token of an enabled principal whose last_used_at is unset or
+// older than principalTokenLastUsedThrottle. A token that does not qualify
+// (unknown, revoked, disabled principal, or recently touched) is a no-op, not
+// an error, because callers record usage best-effort after authentication.
+func (cs *CloudStore) TouchPrincipalTokenLastUsed(ctx context.Context, tokenID string) error {
+	if cs == nil || cs.db == nil {
+		return fmt.Errorf("cloudstore: not initialized")
+	}
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return fmt.Errorf("cloudstore: token id is required")
+	}
+	_, err := cs.db.ExecContext(ctx, `
+		UPDATE cloud_principal_tokens t
+		SET last_used_at = NOW()
+		FROM cloud_principals p
+		WHERE t.id = $1
+		  AND p.id = t.principal_id
+		  AND p.enabled
+		  AND t.revoked_at IS NULL
+		  AND (t.last_used_at IS NULL OR t.last_used_at < NOW() - INTERVAL '`+principalTokenLastUsedThrottle+`')`, tokenID)
+	if err != nil {
+		return fmt.Errorf("cloudstore: touch principal token last used: %w", err)
+	}
+	return nil
+}
+
 func (cs *CloudStore) RevokePrincipalToken(ctx context.Context, tokenID, revokedByPrincipalID, reason string) error {
 	if cs == nil || cs.db == nil {
 		return fmt.Errorf("cloudstore: not initialized")

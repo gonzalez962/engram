@@ -300,3 +300,65 @@ type failingReader struct{}
 func (failingReader) Read(_ []byte) (int, error) {
 	return 0, fmt.Errorf("entropy unavailable")
 }
+
+func TestResolverRecordsManagedTokenUseOnlyAfterSuccessfulAuthentication(t *testing.T) {
+	hasher := mustTokenHasher(t)
+	activeHash := mustHash(t, hasher, "active-token")
+	revokedHash := mustHash(t, hasher, "revoked-token")
+	disabledHash := mustHash(t, hasher, "disabled-token")
+	mismatchHash := mustHash(t, hasher, "mismatch-token")
+	revokedAt := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+	recorder := &recordingManagedTokenLookup{fakeManagedTokenLookup: fakeManagedTokenLookup{records: map[string]managedLookupResult{
+		activeHash:   {ManagedTokenRecord{ID: "tok-active", PrincipalID: "p-active", Hash: activeHash}, Principal{ID: "p-active", Kind: PrincipalKindHuman, Role: RoleAdmin, Source: PrincipalSourceManagedToken, Enabled: true}},
+		revokedHash:  {ManagedTokenRecord{ID: "tok-revoked", PrincipalID: "p-active", Hash: revokedHash, RevokedAt: &revokedAt}, Principal{ID: "p-active", Kind: PrincipalKindHuman, Role: RoleMember, Source: PrincipalSourceManagedToken, Enabled: true}},
+		disabledHash: {ManagedTokenRecord{ID: "tok-disabled", PrincipalID: "p-disabled", Hash: disabledHash}, Principal{ID: "p-disabled", Kind: PrincipalKindHuman, Role: RoleMember, Source: PrincipalSourceManagedToken, Enabled: false}},
+		mismatchHash: {ManagedTokenRecord{ID: "tok-mismatch", PrincipalID: "p-token", Hash: mismatchHash}, Principal{ID: "p-other", Kind: PrincipalKindHuman, Role: RoleMember, Source: PrincipalSourceManagedToken, Enabled: true}},
+	}}}
+	resolver := NewPrincipalResolver(ResolverConfig{Hasher: hasher, ManagedTokens: recorder, Legacy: LegacyCredentials{SyncToken: "legacy-sync"}})
+
+	for _, rejected := range []string{"revoked-token", "disabled-token", "mismatch-token", "unknown-token", "legacy-sync"} {
+		_, _ = resolver.ResolveBearerToken(context.Background(), rejected)
+	}
+	if len(recorder.used) != 0 {
+		t.Fatalf("rejected, unknown, and legacy tokens must not record managed token use, got %v", recorder.used)
+	}
+
+	principal, err := resolver.ResolveBearerToken(context.Background(), "active-token")
+	if err != nil || principal.TokenID != "tok-active" {
+		t.Fatalf("active token must resolve: principal=%+v err=%v", principal, err)
+	}
+	if len(recorder.used) != 1 || recorder.used[0] != "tok-active" {
+		t.Fatalf("successful authentication must record use of the resolved token ID, got %v", recorder.used)
+	}
+}
+
+func TestResolverDoesNotFailAuthenticationWhenRecordingUseFails(t *testing.T) {
+	hasher := mustTokenHasher(t)
+	activeHash := mustHash(t, hasher, "active-token")
+	recorder := &recordingManagedTokenLookup{
+		fakeManagedTokenLookup: fakeManagedTokenLookup{records: map[string]managedLookupResult{
+			activeHash: {ManagedTokenRecord{ID: "tok-active", PrincipalID: "p-active", Hash: activeHash}, Principal{ID: "p-active", Kind: PrincipalKindHuman, Role: RoleMember, Source: PrincipalSourceManagedToken, Enabled: true}},
+		}},
+		err: errors.New("usage store unavailable"),
+	}
+	resolver := NewPrincipalResolver(ResolverConfig{Hasher: hasher, ManagedTokens: recorder})
+
+	principal, err := resolver.ResolveBearerToken(context.Background(), "active-token")
+	if err != nil || principal.ID != "p-active" || principal.TokenID != "tok-active" {
+		t.Fatalf("usage recording failure must not fail authentication: principal=%+v err=%v", principal, err)
+	}
+	if len(recorder.used) != 1 {
+		t.Fatalf("expected one usage recording attempt, got %v", recorder.used)
+	}
+}
+
+type recordingManagedTokenLookup struct {
+	fakeManagedTokenLookup
+	used []string
+	err  error
+}
+
+func (r *recordingManagedTokenLookup) RecordManagedTokenUse(_ context.Context, tokenID string) error {
+	r.used = append(r.used, tokenID)
+	return r.err
+}
