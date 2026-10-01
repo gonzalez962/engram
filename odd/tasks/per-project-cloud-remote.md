@@ -40,13 +40,18 @@ autosync manager per process. Users need to separate projects by environment/clo
   trim the global URL in `resolveGlobal`; normalize project names before lookup.) CLI: `engram cloud config --project X --server URL --token T` / `--project X --clear`;
   `engram sync --cloud --project X` + upgrade paths use per-project resolution; reassignment
   re-enqueues full project history; `cloud status` shows per-project remotes; tests.
-- [ ] T3 — (carries T2 review follow-up: `cloud config --project` saves cloud.json before
+- [x] T3 — (carries T2 review follow-up: `cloud config --project` saves cloud.json before
   requeue; if requeue fails the new remote stays saved and re-running reports "unchanged", so
   history never reaches the new remote — restore the previous config on requeue failure, with a
   test. Also: `cloudSyncEnabled` status provider must resolve per project.) Autosync: one manager per remote with separate state key (`cloud@<id>`) for cursor/lease,
   project-filtered push/pull, global manager excludes routed projects, status adapter routes by
   project; tests.
-- [ ] T4 — Doctor/cleanup recognizes `cloud@*` keys and prunes orphaned `cloud@*` rows whose id
+- [ ] T4 — (carries T3 review follow-ups: (a) pull catch-up when a project's route changes —
+  scoped managers advance their cursor past out-of-scope rows, so routing a project back to a
+  remote misses rows other devices wrote meanwhile; (b) `autosyncGroup` StopForUpgrade/Resume must
+  be a no-op, not an error, for unowned projects when only overrides are configured; (c) test the
+  env-only global setup (no cloud.json); (d) restore `storeNew` via t.Cleanup in the routing test;
+  (e) align tokenless-override handling between autosync (skips) and explicit sync.) Doctor/cleanup recognizes `cloud@*` keys and prunes orphaned `cloud@*` rows whose id
   no longer matches any configured remote (token rotation changes `RemoteID`; accepted — a fresh
   pull from seq 0 is safe); docs for the new config; tests.
 
@@ -78,3 +83,8 @@ T2 notes: "full history" = current-state replay via the enroll/remirror backfill
 `reassign:<nanos>` source (not every historical revision). The cloud server appends duplicate
 `cloud_mutations` rows on re-push (cloudstore.go:941), while chunks dedupe by content hash
 (cloudstore.go:962-964). Token rotation on the same server counts as a remote change and requeues.
+| T3 | delegated (writer trigger: manager.go, store.go, main.go, autosync_status.go, cloud.go + tests) | de172a5 | RED: build fails (StateKey/Scoped/autosyncGroup undefined); GREEN (writer): autosync/store/cloudconfig ok, cmd/engram ok (139s), vet ok, build ok, all with `ENGRAM_CLOUD_AUTOSYNC` unset; parent spot check: autosync + cmd routing tests ok | medium, granted; reliability lens approved + acknowledged; 2 WARNING + 2 SUGGESTION moved to T4. Reviewed boundary → de172a5 |
+
+T3 notes: 1336 changed lines (~770 tests) — over the advisory budget; not split because store query,
+manager scoping and wiring are one coherent behavior. Windows `UnixNano` resolution made two managers
+share a LeaseOwner; remote managers now get an id suffix.

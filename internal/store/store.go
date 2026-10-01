@@ -6654,6 +6654,75 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 	return mutations, rows.Err()
 }
 
+// ListPendingSyncMutationsScoped is ListPendingSyncMutations restricted to a
+// project scope inside the query, so rows that belong to other remotes can never
+// fill the LIMIT and starve this scope. A non-nil include selects only those
+// projects (an empty non-nil include selects nothing, and empty-project rows are
+// never included). exclude drops the listed projects and keeps empty-project
+// rows. With both nil it is identical to ListPendingSyncMutations.
+func (s *Store) ListPendingSyncMutationsScoped(targetKey string, include, exclude []string, limit int) ([]SyncMutation, error) {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	if limit <= 0 {
+		limit = 100
+	}
+	if include != nil && len(include) == 0 {
+		return nil, nil
+	}
+	query := `
+		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at, sm.disposition, ifnull(sm.disposition_reason, ''), ifnull(sm.disposition_evidence, ''), sm.disposition_at
+		FROM sync_mutations sm
+		LEFT JOIN sync_enrolled_projects sep ON sm.project = sep.project
+		WHERE sm.target_key = ? AND sm.acked_at IS NULL AND sm.disposition = 'pending'
+		  AND (sm.project = '' OR sep.project IS NOT NULL)`
+	args := []any{targetKey}
+	if include != nil {
+		query += ` AND sm.project IN (` + sqlPlaceholders(len(include)) + `)`
+		for _, project := range include {
+			args = append(args, project)
+		}
+	}
+	if len(exclude) > 0 {
+		query += ` AND sm.project NOT IN (` + sqlPlaceholders(len(exclude)) + `)`
+		for _, project := range exclude {
+			args = append(args, project)
+		}
+	}
+	query += ` ORDER BY sm.seq ASC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.queryItHook(s.db, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mutations []SyncMutation
+	for rows.Next() {
+		var mutation SyncMutation
+		if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt, &mutation.Disposition, &mutation.DispositionReason, &mutation.DispositionEvidence, &mutation.DispositionAt); err != nil {
+			return nil, err
+		}
+		mutations = append(mutations, mutation)
+	}
+	return mutations, rows.Err()
+}
+
+// AdvanceSyncPullCursor moves targetKey's pull cursor forward to seq without
+// applying anything and without touching lifecycle or failure state. Autosync
+// uses it to step over pulled mutations outside its project scope. The cursor
+// never moves backwards.
+func (s *Store) AdvanceSyncPullCursor(targetKey string, seq int64) error {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	if err := s.ensureSyncState(targetKey); err != nil {
+		return err
+	}
+	_, err := s.execHook(s.db,
+		`UPDATE sync_state SET last_pulled_seq = ?, updated_at = datetime('now') WHERE target_key = ? AND last_pulled_seq < ?`,
+		seq, targetKey, seq,
+	)
+	return err
+}
+
 // cloudProjectTargetKeyPattern matches the project-scoped cloud targets in
 // sync_state. The reserved cloud inbox target also matches the pattern and must
 // be excluded explicitly wherever the pattern aggregates project state.

@@ -465,8 +465,11 @@ func (p storeSyncStatusProvider) upgradeStatus(project string) (string, string, 
 	return state.Stage, strings.TrimSpace(state.LastErrorCode), strings.TrimSpace(state.LastErrorMessage)
 }
 
+// cloudSyncEnabled reports whether project can sync: a project routed to its
+// own remote is configured by that remote alone, every other project by the
+// global remote.
 func (p storeSyncStatusProvider) cloudSyncEnabled(project string) (bool, string, string) {
-	cc, err := resolveCloudRuntimeConfig(p.cfg)
+	cc, err := resolveCloudRuntimeConfigForProject(p.cfg, project)
 	if err != nil {
 		return false, "cloud_config_error", fmt.Sprintf("cloud config error: %v", err)
 	}
@@ -933,7 +936,7 @@ func cmdServe(cfg store.Config) {
 	fallback := storeSyncStatusProvider{store: s, defaultProject: resolveServeSyncStatusProject(), cfg: cfg}
 	mgr, mgrStop := tryStartAutosync(ctx, s, cfg)
 	if mgr != nil {
-		srv.SetSyncStatus(&autosyncStatusAdapter{mgr: mgr, fallback: fallback})
+		srv.SetSyncStatus(&autosyncStatusAdapter{mgr: mgr, fallback: fallback, defaultProject: fallback.defaultProject})
 	} else {
 		srv.SetSyncStatus(fallback)
 	}
@@ -1020,23 +1023,36 @@ func resolveServeSyncStatusProject() string {
 	return strings.TrimSpace(projectName)
 }
 
-// tryStartAutosync starts the autosync Manager if ENGRAM_CLOUD_AUTOSYNC=1 and
-// both ENGRAM_CLOUD_TOKEN and ENGRAM_CLOUD_SERVER are present.
+// tryStartAutosync starts autosync if ENGRAM_CLOUD_AUTOSYNC=1. It runs one
+// manager per distinct cloud remote: the global remote (cloud.json server and
+// token, or ENGRAM_CLOUD_SERVER / ENGRAM_CLOUD_TOKEN) syncs every project
+// except those routed elsewhere, and each per-project remote in cloud.json
+// syncs only its projects under its own sync_state key. Projects sharing one
+// remote share one manager. A malformed override is logged and skipped; its
+// project is never routed to the global remote.
 // REQ-210: only exact "1" is accepted. REQ-211: missing token/server → log+skip.
-// Never fatal — autosync is optional.
+// Never fatal — autosync is optional. Routing is read once at process start.
 // BW7: Returns (status provider, stop func) so the caller can invoke stop
-// before os.Exit to ensure the Manager releases its sync lease.
+// before os.Exit to ensure every manager releases its sync lease.
 func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (autosyncStatusProvider, func()) {
 	// REQ-210: opt-in requires exact "1".
 	if strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_AUTOSYNC")) != "1" {
 		return nil, nil
 	}
 
+	persisted, err := cloudconfig.Load(cfg.DataDir)
+	if err != nil {
+		log.Printf("[autosync] ERROR: cannot read cloud config: %v", err)
+		return nil, nil
+	}
 	cc, err := resolveCloudRuntimeConfig(cfg)
 	if err != nil {
 		log.Printf("[autosync] ERROR: cannot read cloud config: %v", err)
 		return nil, nil
 	}
+
+	group := newAutosyncGroup()
+	remotes, order := autosyncProjectRemotes(persisted, group)
 
 	token := strings.TrimSpace(cc.Token)
 	serverURL := strings.TrimSpace(cc.ServerURL)
@@ -1045,39 +1061,92 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 	// overridden by ENGRAM_CLOUD_TOKEN when set, so both sources are tried.
 	// On Windows (Task Scheduler), the env var is often absent — the file path
 	// is the expected source (issue #421).
-	if token == "" {
-		log.Printf("[autosync] ERROR: cloud token is not configured (set ENGRAM_CLOUD_TOKEN or store token in cloud.json via `engram cloud config`); autosync disabled")
-		return nil, nil
-	}
-	// REQ-211: server URL required. Resolved from cloud.json or ENGRAM_CLOUD_SERVER.
-	if serverURL == "" {
-		log.Printf("[autosync] ERROR: cloud server URL is not configured (set ENGRAM_CLOUD_SERVER or run `engram cloud config --server <url>`); autosync disabled")
-		return nil, nil
+	switch {
+	case token == "":
+		log.Printf("[autosync] ERROR: cloud token is not configured (set ENGRAM_CLOUD_TOKEN or store token in cloud.json via `engram cloud config`); global autosync disabled")
+	case serverURL == "":
+		// REQ-211: server URL required. Resolved from cloud.json or ENGRAM_CLOUD_SERVER.
+		log.Printf("[autosync] ERROR: cloud server URL is not configured (set ENGRAM_CLOUD_SERVER or run `engram cloud config --server <url>`); global autosync disabled")
+	default:
+		remoteMT, err := remote.NewMutationTransport(serverURL, token)
+		if err != nil {
+			log.Printf("[autosync] ERROR: invalid server URL %q: %v; global autosync disabled", serverURL, err)
+			break
+		}
+		mgrCfg := autosync.DefaultConfig()
+		mgrCfg.StateKey = store.DefaultSyncTargetKey
+		if routed := group.routedProjects(); len(routed) > 0 {
+			mgrCfg.ExcludeProjects = routed
+		}
+		// BR2-3: Call newAutosyncManager (injectable) instead of autosync.New directly,
+		// so tests can stub the factory and avoid real goroutine/network side effects.
+		group.addGlobal(newAutosyncManager(s, &mutationTransportAdapter{remote: remoteMT}, mgrCfg))
+		log.Printf("[autosync] started (server=%s)", serverURL)
 	}
 
-	remoteMT, err := remote.NewMutationTransport(serverURL, token)
-	if err != nil {
-		log.Printf("[autosync] ERROR: invalid server URL %q: %v; autosync disabled", serverURL, err)
+	for _, id := range order {
+		r := remotes[id]
+		remoteMT, err := remote.NewMutationTransport(r.remote.ServerURL, r.remote.Token)
+		if err != nil {
+			log.Printf("[autosync] WARNING: cloud remote %s for project(s) %s is invalid: %v; autosync disabled for them", r.remote.ServerURL, strings.Join(r.projects, ", "), err)
+			continue
+		}
+		mgrCfg := autosync.DefaultConfig()
+		mgrCfg.StateKey = cloudconfig.StateKey(r.remote)
+		mgrCfg.LeaseOwner += "-" + r.remote.ID
+		mgrCfg.IncludeProjects = r.projects
+		group.addRemote(newAutosyncManager(s, &mutationTransportAdapter{remote: remoteMT}, mgrCfg), r.projects)
+		log.Printf("[autosync] started (server=%s, projects=%s)", r.remote.ServerURL, strings.Join(r.projects, ", "))
+	}
+
+	if group.empty() {
 		return nil, nil
 	}
-	transport := &mutationTransportAdapter{remote: remoteMT}
-	mgrCfg := autosync.DefaultConfig()
-	// BR2-3: Call newAutosyncManager (injectable) instead of autosync.New directly,
-	// so tests can stub the factory and avoid real goroutine/network side effects.
-	mgr := newAutosyncManager(s, transport, mgrCfg)
+	group.start(ctx)
+	return group, group.Stop
+}
 
-	// Startup handshake (CodeRabbit PR #1189): when the manager supports the
-	// Start handshake, launch through it so Stop always waits until the run
-	// loop registered with its wait group — an immediate-EOF shutdown can
-	// otherwise return before the goroutine is even scheduled. Deterministic
-	// test fakes without Start keep the plain goroutine launch.
-	if starter, ok := mgr.(autosyncStartHandshake); ok {
-		starter.Start(ctx)
-	} else {
-		go mgr.Run(ctx)
+type autosyncRemote struct {
+	remote   cloudconfig.Remote
+	projects []string
+}
+
+// autosyncProjectRemotes groups the per-project overrides of cc by remote id
+// and marks every overridden project as routed in group, including projects
+// whose override is malformed or lacks a token: those are skipped with a
+// warning and must never fall back to the global remote.
+func autosyncProjectRemotes(cc *cloudconfig.Config, group *autosyncGroup) (map[string]*autosyncRemote, []string) {
+	remotes := map[string]*autosyncRemote{}
+	order := []string{}
+	for _, override := range cloudconfig.ProjectRemotes(cc) {
+		project, _ := store.NormalizeProject(override.Project)
+		project = strings.TrimSpace(project)
+		if project == "" {
+			continue
+		}
+		group.markRouted(project)
+		r, err := cloudconfig.ResolveForProject(cc, override.Project)
+		if err != nil {
+			log.Printf("[autosync] WARNING: %v; autosync disabled for project %q (it is not synced to the global remote)", err, project)
+			continue
+		}
+		if r.Token == "" {
+			log.Printf("[autosync] WARNING: cloud remote override for project %q has no token (run `engram cloud config --project %s --server <url> --token <token>`); autosync disabled for it", project, project)
+			continue
+		}
+		entry, ok := remotes[r.ID]
+		if !ok {
+			entry = &autosyncRemote{remote: r}
+			remotes[r.ID] = entry
+			order = append(order, r.ID)
+		}
+		entry.projects = append(entry.projects, project)
 	}
-	log.Printf("[autosync] started (server=%s)", serverURL)
-	return mgr, mgr.Stop
+	for _, entry := range remotes {
+		sort.Strings(entry.projects)
+	}
+	sort.Strings(order)
+	return remotes, order
 }
 
 func cmdMCP(cfg store.Config) {
