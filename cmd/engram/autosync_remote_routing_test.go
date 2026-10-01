@@ -184,6 +184,52 @@ func TestTryStartAutosyncOnlyMalformedOverrideAndNoGlobalStartsNothing(t *testin
 	}
 }
 
+func TestAutosyncGroupUpgradePauseIsNoOpForUnownedProjectWithOverridesOnly(t *testing.T) {
+	cc := &cloudconfig.Config{Projects: map[string]cloudconfig.ProjectRemote{
+		"alpha": {ServerURL: "https://team.example.test", Token: "team-token"},
+	}}
+	_, mgr, _, built := startRoutedAutosync(t, cc)
+	group, ok := mgr.(*autosyncGroup)
+	if !ok || len(built) != 1 {
+		t.Fatalf("provider = %T with %d managers, want one override manager", mgr, len(built))
+	}
+	if err := group.StopForUpgrade("unrouted"); err != nil {
+		t.Fatalf("stop unrouted: %v", err)
+	}
+	if err := group.ResumeAfterUpgrade("unrouted"); err != nil {
+		t.Fatalf("resume unrouted: %v", err)
+	}
+	if len(built[0].paused) != 0 || len(built[0].resumed) != 0 {
+		t.Fatalf("unrouted project reached the override manager: paused=%v resumed=%v", built[0].paused, built[0].resumed)
+	}
+}
+
+func TestTryStartAutosyncEnvOnlyGlobalStartsOneLegacyManager(t *testing.T) {
+	cfg := testConfig(t)
+	t.Setenv("ENGRAM_CLOUD_AUTOSYNC", "1")
+	t.Setenv(cloudconfig.EnvCloudServer, "https://env-global.example.test")
+	t.Setenv(cloudconfig.EnvCloudToken, "env-global-token")
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	built := captureAutosyncManagers(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	mgr, stop := tryStartAutosync(ctx, s, cfg)
+	if stop != nil {
+		t.Cleanup(stop)
+	}
+	if mgr == nil || stop == nil || len(*built) != 1 {
+		t.Fatalf("managers = %d (provider nil=%v), want exactly one global manager", len(*built), mgr == nil)
+	}
+	got := (*built)[0].cfg
+	if got.StateKey != store.DefaultSyncTargetKey || got.TargetKey != store.DefaultSyncTargetKey || got.IncludeProjects != nil || got.ExcludeProjects != nil {
+		t.Fatalf("env-only manager cfg = %+v, want the unscoped legacy manager", got)
+	}
+}
+
 func routedGroup(t *testing.T) (*autosyncGroup, *routingFakeManager, *routingFakeManager) {
 	t.Helper()
 	cc := &cloudconfig.Config{
@@ -227,8 +273,16 @@ func TestAutosyncGroupStopForUpgradeStopsOnlyOwner(t *testing.T) {
 	if err := group.ResumeAfterUpgrade("alpha"); err != nil || len(team.resumed) != 1 || len(global.resumed) != 0 {
 		t.Fatalf("resume routed to wrong manager: err=%v team=%v global=%v", err, team.resumed, global.resumed)
 	}
-	if err := group.StopForUpgrade("broken"); err == nil {
-		t.Fatal("a project whose remote failed to start has no manager to pause")
+	// A project whose remote failed to start has no manager to pause; like the
+	// legacy "no manager" path this is a no-op, not an error.
+	if err := group.StopForUpgrade("broken"); err != nil {
+		t.Fatalf("stop broken: %v", err)
+	}
+	if err := group.ResumeAfterUpgrade("broken"); err != nil {
+		t.Fatalf("resume broken: %v", err)
+	}
+	if len(global.paused) != 1 || len(team.paused) != 1 {
+		t.Fatalf("unowned project must pause nothing: team=%v global=%v", team.paused, global.paused)
 	}
 	group.NotifyDirty()
 	if global.dirty != 1 || team.dirty != 1 {
@@ -305,7 +359,9 @@ func TestCmdCloudConfigProjectRestoresConfigWhenRequeueFails(t *testing.T) {
 	}
 	seedDeliveredProject(t, cfg, "moved")
 
+	stubCatchUpImport(t, nil)
 	oldStoreNew := storeNew
+	t.Cleanup(func() { storeNew = oldStoreNew })
 	storeNew = func(store.Config) (*store.Store, error) { return nil, errors.New("database is locked") }
 	_, stderr, recovered := runCloudConfigCLI(t, cfg, "--project", "moved", "--server", "https://team.example.test", "--token", "tt")
 	storeNew = oldStoreNew

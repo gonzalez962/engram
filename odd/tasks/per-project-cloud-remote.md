@@ -46,7 +46,7 @@ autosync manager per process. Users need to separate projects by environment/clo
   test. Also: `cloudSyncEnabled` status provider must resolve per project.) Autosync: one manager per remote with separate state key (`cloud@<id>`) for cursor/lease,
   project-filtered push/pull, global manager excludes routed projects, status adapter routes by
   project; tests.
-- [ ] T4 — (carries T3 review follow-ups: (a) pull catch-up when a project's route changes —
+- [x] T4 — (carries T3 review follow-ups: (a) pull catch-up when a project's route changes —
   scoped managers advance their cursor past out-of-scope rows, so routing a project back to a
   remote misses rows other devices wrote meanwhile; (b) `autosyncGroup` StopForUpgrade/Resume must
   be a no-op, not an error, for unowned projects when only overrides are configured; (c) test the
@@ -54,6 +54,15 @@ autosync manager per process. Users need to separate projects by environment/clo
   (e) align tokenless-override handling between autosync (skips) and explicit sync.) Doctor/cleanup recognizes `cloud@*` keys and prunes orphaned `cloud@*` rows whose id
   no longer matches any configured remote (token rotation changes `RemoteID`; accepted — a fresh
   pull from seq 0 is safe); docs for the new config; tests.
+- [ ] T5 — T4 follow-ups: (a) `engram doctor` check `SyncTargetClosedSpaceCheck`
+  (internal/diagnostic/checks.go ~553-597) still flags live `cloud@<id>` rows as foreign — feed it
+  the live remote keys (Scope needs DataDir); (b) orphaned `cloud@<id>` rows with leftover
+  `sync_apply_deferred` rows keep doctor repair `blocked` forever — discard/report those deferred
+  rows for orphaned remotes instead of retaining, and stop counting them as retained mutations;
+  (c) test tokenless-override preflight with mutateState=true (which key is marked blocked);
+  (d) upgrade paths and status provider should reject tokenless overrides like explicit preflight.
+  Dropped: `cloud status` ServerSourceLabel (current output already says ENGRAM_CLOUD_SERVER; change
+  only breaks cmd/engram/cloud_enrollment_test.go:110).
 
 ## Acceptance criteria
 - A project with an override pushes/pulls only against its remote; others only against global.
@@ -88,3 +97,8 @@ T2 notes: "full history" = current-state replay via the enroll/remirror backfill
 T3 notes: 1336 changed lines (~770 tests) — over the advisory budget; not split because store query,
 manager scoping and wiring are one coherent behavior. Windows `UnixNano` resolution made two managers
 share a LeaseOwner; remote managers now get an id suffix.
+| T4 | delegated (writer trigger: cloud.go, main.go, doctor.go, repair.go, store.go, autosync_status.go + tests + docs) | 3102cd1 | writer status partial (items 7 and doctor check out of surface); RED per item, item 3 proof-only; GREEN: store ok (383s), diagnostic/cloudconfig/autosync ok, cmd/engram ok (107s), vet ok, build ok, all with `ENGRAM_CLOUD_AUTOSYNC` unset; parent spot check: diagnostic + focused cmd tests ok | medium, granted; reliability lens approved + acknowledged; 1 WARNING + 1 SUGGESTION → T5. Reviewed boundary → 3102cd1 |
+
+T4 notes: verified (i) explicit chunk import ignores autosync `last_pulled_seq` (internal/sync/sync.go:833-878)
+and (ii) server materializes cloud_chunks in the same tx as cloud_mutations (cloudstore.go:913, 955-970).
+Manual pull retry is `engram sync --cloud --import --project <p>` (without --import it pushes).

@@ -777,6 +777,7 @@ Inspect or replay the `sync_apply_deferred` queue.
 - `engram cloud status` — show current cloud config state plus auth/sync readiness without mutating local state. When cloud is configured, also probes the local `engram serve` daemon at `127.0.0.1:7437` (respects `ENGRAM_PORT`) and prints a `Local daemon:` line (`running` / `not running` / `unreachable`) so you can detect a silently dead autosync. The probe currently uses the TCP daemon endpoint, so `ENGRAM_SOCKET` socket-only mode can report the daemon as not running. Exit code is unaffected; the line is informational
 - `engram cloud enroll <project>` — enroll one project for cloud replication
 - `engram cloud config --server <url>` — persist cloud server URL to `~/.engram/cloud.json`
+- `engram cloud config --project <project> --server <url> --token <token>` / `engram cloud config --project <project> --clear` — route one project to its own cloud remote, or back to the global remote (see [Per-project cloud remotes](#per-project-cloud-remotes))
 - `engram cloud serve` — run cloud backend API + dashboard (`/dashboard`) using Postgres config from env
 - `engram cloud upgrade doctor --project <project>` — deterministic read-only readiness diagnosis (`ready|blocked`, class/reason)
 - `engram cloud upgrade repair --project <project> [--dry-run|--apply]` — deterministic local-safe repair planner/apply (no remote mutation)
@@ -790,6 +791,34 @@ Inspect or replay the `sync_apply_deferred` queue.
 `engram sync --cloud --import --project <project>` runs in the foreground and prints plain-text import progress that is safe for non-interactive logs. It emits an initial snapshot, bounded event-count-throttled updates, and a final `100%` / `0 pending` snapshot before the normal import summary. Each snapshot includes local, remote, and pending chunk counts; percentage is based on the pending work captured at import start, so retries do not inflate completion.
 
 Cloud auth token is provided at runtime via `ENGRAM_CLOUD_TOKEN` (not by a dedicated CLI subcommand).
+
+#### Per-project cloud remotes
+
+The global server URL and token stay the default. Any single project can sync to a different Engram Cloud instead:
+
+```bash
+engram cloud config --project team-app --server https://team-cloud.example.com --token <token>
+engram cloud config --project team-app --clear   # back to the global remote
+```
+
+`cloud.json` then holds an optional `projects` map next to the global settings:
+
+```json
+{
+  "server_url": "https://cloud.example.com",
+  "token": "global-token",
+  "projects": {
+    "team-app": { "server_url": "https://team-cloud.example.com", "token": "team-token" }
+  }
+}
+```
+
+- `ENGRAM_CLOUD_SERVER` and `ENGRAM_CLOUD_TOKEN` apply only to the global remote. A routed project uses only its own `server_url` and `token`; the global token is never sent to another server.
+- When a project's effective remote changes (set, token rotation, or `--clear`), its current local state is re-queued for the new remote and a catch-up pull imports what other devices already wrote there. Nothing is deleted locally or on the previous remote. If the catch-up pull fails, the routing change is kept and the command still succeeds; retry with `engram sync --cloud --import --project <project>`. Unenrolled projects skip both steps.
+- A project override without a token is saved, but autosync skips that project and explicit cloud sync fails until you re-run the command with `--token`.
+- Running `engram serve` / `engram mcp` processes read `cloud.json` at startup: restart them after changing the routing.
+- `engram cloud status` lists every project remote with its server, masked token, and remote id.
+
 Cloud server startup fails closed when the token is missing unless `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` is explicitly set for local insecure development.
 `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` cannot be combined with `ENGRAM_CLOUD_TOKEN`.
 Cloud server always requires `ENGRAM_CLOUD_ALLOWED_PROJECTS` (comma-separated), including insecure mode, so project scope remains server-enforced.
@@ -1800,6 +1829,8 @@ engram mcp
 ```
 
 Missing `ENGRAM_CLOUD_TOKEN` or `ENGRAM_CLOUD_SERVER` logs an `ERROR` and disables autosync gracefully — `engram serve` or `engram mcp` still starts.
+
+With [per-project cloud remotes](#per-project-cloud-remotes), autosync runs one worker per distinct remote: the global worker skips routed projects, and each routed remote syncs only its own projects with its own pull cursor and lease. Overrides without a token are skipped with a warning. Restart `engram serve` / `engram mcp` after changing the routing.
 
 ### Autosync Phase Table
 

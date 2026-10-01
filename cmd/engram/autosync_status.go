@@ -256,28 +256,34 @@ func (g *autosyncGroup) NotifyDirty() {
 	}
 }
 
-// StopForUpgrade pauses only the manager owning project.
+// StopForUpgrade pauses only the manager owning project. A project no running
+// manager syncs (routed to a remote that did not start, or unrouted while only
+// overrides are configured) has nothing to pause, so this is a no-op like the
+// legacy "no autosync manager" path.
 func (g *autosyncGroup) StopForUpgrade(project string) error {
 	pauser, err := g.upgradePauser(project)
-	if err != nil {
+	if err != nil || pauser == nil {
 		return err
 	}
 	return pauser.StopForUpgrade(project)
 }
 
-// ResumeAfterUpgrade resumes only the manager owning project.
+// ResumeAfterUpgrade resumes only the manager owning project; a no-op when no
+// running manager syncs it.
 func (g *autosyncGroup) ResumeAfterUpgrade(project string) error {
 	pauser, err := g.upgradePauser(project)
-	if err != nil {
+	if err != nil || pauser == nil {
 		return err
 	}
 	return pauser.ResumeAfterUpgrade(project)
 }
 
+// upgradePauser returns the pauser owning project, or nil and no error when no
+// running manager syncs it.
 func (g *autosyncGroup) upgradePauser(project string) (autosyncUpgradePauser, error) {
 	mgr := g.owner(project)
 	if mgr == nil {
-		return nil, fmt.Errorf("no autosync manager is running for project %q", project)
+		return nil, nil
 	}
 	pauser, ok := mgr.(autosyncUpgradePauser)
 	if !ok {

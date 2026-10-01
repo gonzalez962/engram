@@ -53,6 +53,15 @@ Guardrails:
 
 Business rule: **if sync is blocked, fail loudly and visibly**. No silent drops.
 
+### Per-project remotes: journal key vs state key
+
+`cloud.json` may route single projects to their own remote (`internal/cloudconfig/remote.go`). The client keeps two keys apart:
+
+- **Journal key** (`Config.TargetKey`): always `cloud`. Every project has exactly one destination, so pending/acked `sync_mutations` rows stay on one journal.
+- **State key** (`Config.StateKey`): `cloud` for the global remote, `cloud@<remote-id>` for a per-project remote (`cloudconfig.StateKey`). It holds the pull cursor (in that server's seq space), the lease, and deferred pulls.
+
+`tryStartAutosync` (`cmd/engram/main.go`) starts one manager per distinct remote behind `autosyncGroup`: remote managers use `IncludeProjects`, the global manager `ExcludeProjects` for every routed project. A scoped manager advances its cursor past out-of-scope rows, so a route change runs a manifest-based catch-up import (`cloudCatchUpPull`) that does not depend on any cursor. Doctor's `sync_target_closed_space` repair keeps `cloud@` rows of configured remotes, prunes orphaned ones (store receives the live key set from `diagnostic.LiveCloudRemoteStateKeys`), and prunes none when `cloud.json` is unreadable.
+
 ### Blank session identities
 
 A session identity is blank when `strings.TrimSpace` reduces it to the empty

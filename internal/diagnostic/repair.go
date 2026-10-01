@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Gentleman-Programming/engram/v2/internal/cloudconfig"
 	"github.com/Gentleman-Programming/engram/v2/internal/store"
 )
 
@@ -85,7 +86,12 @@ type SyncTargetCleanupAction struct {
 	RetargetedMutations int64  `json:"retargeted_mutations"`
 	RetainedMutations   int64  `json:"retained_mutations"`
 	StateRemoved        bool   `json:"state_removed"`
+	Reason              string `json:"reason,omitempty"`
 }
+
+// ReasonCloudConfigUnreadable marks a sync-target cleanup that kept every
+// per-remote cloud@<id> state row because cloud.json could not be read.
+const ReasonCloudConfigUnreadable = "cloud_config_unreadable"
 
 type RepairPlan struct {
 	Project             string                             `json:"project"`
@@ -176,9 +182,36 @@ func planForeignSyncTargetCleanup(plan *RepairPlan, scope Scope) error {
 		return err
 	}
 	for _, action := range cleanup.Actions {
-		plan.TargetActions = append(plan.TargetActions, SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations, RetainedMutations: action.RetainedMutations, StateRemoved: action.StateRemoved})
+		plan.TargetActions = append(plan.TargetActions, SyncTargetCleanupActionFromStore(action))
 	}
 	return nil
+}
+
+// SyncTargetCleanupActionFromStore converts one store cleanup classification.
+func SyncTargetCleanupActionFromStore(action store.ForeignSyncTargetCleanupAction) SyncTargetCleanupAction {
+	return SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations, RetainedMutations: action.RetainedMutations, StateRemoved: action.StateRemoved, Reason: action.Reason}
+}
+
+// LiveCloudRemoteStateKeys returns the sync_state key (cloud@<remote-id>) of
+// every per-project remote configured in dataDir's cloud.json. The set is
+// empty, not nil, when no override is configured. When cloud.json cannot be
+// read it returns nil and the error, so callers prune no cloud@ state.
+// Overrides whose server URL is invalid resolve to no remote and contribute no
+// key; autosync never runs a manager for them either.
+func LiveCloudRemoteStateKeys(dataDir string) (map[string]bool, error) {
+	cc, err := cloudconfig.Load(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	keys := map[string]bool{}
+	for _, override := range cloudconfig.ProjectRemotes(cc) {
+		remote, err := cloudconfig.ResolveForProject(cc, override.Project)
+		if err != nil || remote.Global {
+			continue
+		}
+		keys[cloudconfig.StateKey(remote)] = true
+	}
+	return keys, nil
 }
 
 // planOrphanedObservationSessionRepair turns orphaned-session findings into

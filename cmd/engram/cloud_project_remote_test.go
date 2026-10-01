@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -16,6 +17,28 @@ func runCloudConfigCLI(t *testing.T, cfg store.Config, args ...string) (string, 
 	t.Helper()
 	withArgs(t, append([]string{"engram", "cloud", "config"}, args...)...)
 	return captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+}
+
+// catchUpCall records one project catch-up pull from a new remote.
+type catchUpCall struct {
+	serverURL, token, project string
+}
+
+// stubCatchUpImport replaces the catch-up pull network step so tests never
+// reach a remote; every call is recorded and returns err.
+func stubCatchUpImport(t *testing.T, err error) *[]catchUpCall {
+	t.Helper()
+	calls := &[]catchUpCall{}
+	old := cloudCatchUpPull
+	cloudCatchUpPull = func(_ *store.Store, serverURL, token, project string) (*engramsync.ImportResult, error) {
+		*calls = append(*calls, catchUpCall{serverURL: serverURL, token: token, project: project})
+		if err != nil {
+			return nil, err
+		}
+		return &engramsync.ImportResult{ChunksImported: 2}, nil
+	}
+	t.Cleanup(func() { cloudCatchUpPull = old })
+	return calls
 }
 
 func pendingMutationCount(t *testing.T, cfg store.Config, project string) int {
@@ -179,6 +202,7 @@ func TestCmdCloudConfigProjectReassignmentRequeuesHistory(t *testing.T) {
 	}
 	seedDeliveredProject(t, cfg, "moved")
 	seedDeliveredProject(t, cfg, "stays")
+	calls := stubCatchUpImport(t, nil)
 	if pendingMutationCount(t, cfg, "moved") != 0 {
 		t.Fatalf("precondition: moved has pending rows")
 	}
@@ -194,6 +218,12 @@ func TestCmdCloudConfigProjectReassignmentRequeuesHistory(t *testing.T) {
 	if pendingMutationCount(t, cfg, "stays") != 0 {
 		t.Fatalf("other project was requeued")
 	}
+	if len(*calls) != 1 || (*calls)[0] != (catchUpCall{serverURL: "https://team.example.test", token: "tt", project: "moved"}) {
+		t.Fatalf("catch-up pull calls = %+v, want one pull of moved from the new remote", *calls)
+	}
+	if !strings.Contains(stdout, "Pulled 2 chunk(s)") {
+		t.Fatalf("stdout should report the catch-up pull: %q", stdout)
+	}
 
 	// Same remote again is a no-op.
 	stdout, _, recovered = runCloudConfigCLI(t, cfg, "--project", "moved", "--server", "https://team.example.test/", "--token", "tt")
@@ -203,17 +233,96 @@ func TestCmdCloudConfigProjectReassignmentRequeuesHistory(t *testing.T) {
 	if got := pendingMutationCount(t, cfg, "moved"); got != queued {
 		t.Fatalf("pending changed on same-remote set: %d -> %d", queued, got)
 	}
+	if len(*calls) != 1 {
+		t.Fatalf("an unchanged remote must not pull again: %+v", *calls)
+	}
 }
 
 func TestCmdCloudConfigProjectUnenrolledSkipsRequeue(t *testing.T) {
 	stubExitWithPanic(t)
 	cfg := testConfig(t)
-	stdout, stderr, recovered := runCloudConfigCLI(t, cfg, "--project", "loose", "--server", "https://team.example.test")
+	calls := stubCatchUpImport(t, nil)
+	stdout, stderr, recovered := runCloudConfigCLI(t, cfg, "--project", "loose", "--server", "https://team.example.test", "--token", "tt")
 	if recovered != nil {
 		t.Fatalf("set exited: %v stderr=%q", recovered, stderr)
 	}
 	if !strings.Contains(stdout, "not enrolled") {
 		t.Fatalf("stdout = %q, want not-enrolled note", stdout)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("an unenrolled project must not pull: %+v", *calls)
+	}
+}
+
+func TestCmdCloudConfigProjectCatchUpFailureKeepsConfigAndExitsZero(t *testing.T) {
+	stubExitWithPanic(t)
+	t.Setenv(cloudconfig.EnvCloudServer, "")
+	t.Setenv(cloudconfig.EnvCloudToken, "")
+	cfg := testConfig(t)
+	if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://global.example.test", Token: "global-token"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	seedDeliveredProject(t, cfg, "moved")
+	calls := stubCatchUpImport(t, errors.New("dial tcp: connection refused"))
+
+	stdout, stderr, recovered := runCloudConfigCLI(t, cfg, "--project", "moved", "--server", "https://team.example.test", "--token", "tt")
+	if recovered != nil {
+		t.Fatalf("a failed catch-up pull must not exit non-zero: %v stderr=%q", recovered, stderr)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("catch-up pull calls = %+v, want 1", *calls)
+	}
+	if !strings.Contains(stderr, "connection refused") || !strings.Contains(stderr, "engram sync --cloud --import --project moved") {
+		t.Fatalf("stderr must warn with the manual retry command: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Effective remote changed") || pendingMutationCount(t, cfg, "moved") == 0 {
+		t.Fatalf("requeue must still have happened: stdout=%q", stdout)
+	}
+	cc, err := cloudconfig.Load(cfg.DataDir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got, routed := cc.Projects["moved"]; !routed || got.ServerURL != "https://team.example.test" {
+		t.Fatalf("routing must not be rolled back after a failed pull: %+v", cc.Projects)
+	}
+}
+
+func TestCmdCloudConfigProjectWithoutTokenWarnsAutosyncSkips(t *testing.T) {
+	stubExitWithPanic(t)
+	t.Setenv(cloudconfig.EnvCloudServer, "")
+	t.Setenv(cloudconfig.EnvCloudToken, "")
+	cfg := testConfig(t)
+	stubCatchUpImport(t, nil)
+	stdout, stderr, recovered := runCloudConfigCLI(t, cfg, "--project", "loose", "--server", "https://team.example.test")
+	if recovered != nil {
+		t.Fatalf("set exited: %v stderr=%q", recovered, stderr)
+	}
+	out := stdout + stderr
+	if !strings.Contains(out, `autosync will skip project "loose"`) || !strings.Contains(out, "engram cloud config --project loose --server https://team.example.test --token <token>") {
+		t.Fatalf("missing tokenless-override warning: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+func TestPreflightCloudSyncRejectsTokenlessOverride(t *testing.T) {
+	cfg := testConfig(t)
+	t.Setenv(cloudconfig.EnvCloudServer, "")
+	t.Setenv(cloudconfig.EnvCloudToken, "")
+	seed := &cloudConfig{ServerURL: "https://global.example.test", Token: "global-token"}
+	_ = cloudconfig.SetProjectRemote(seed, "notoken", "https://team.example.test", "")
+	if err := saveCloudConfig(cfg, seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	if err := s.EnrollProject("notoken"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	_, err = preflightCloudSync(s, cfg, "notoken", false)
+	if err == nil || !strings.Contains(err.Error(), "engram cloud config --project notoken --server <url> --token <token>") {
+		t.Fatalf("preflight err = %v, want an actionable tokenless-override error", err)
 	}
 }
 
@@ -338,6 +447,7 @@ func TestCmdCloudConfigProjectClearBackToGlobalRequeuesHistory(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	seedDeliveredProject(t, cfg, "routed")
+	calls := stubCatchUpImport(t, nil)
 
 	stdout, stderr, recovered := runCloudConfigCLI(t, cfg, "--project", "routed", "--clear")
 	if recovered != nil {
@@ -345,5 +455,8 @@ func TestCmdCloudConfigProjectClearBackToGlobalRequeuesHistory(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Effective remote changed") || pendingMutationCount(t, cfg, "routed") == 0 {
 		t.Fatalf("clearing back to global did not requeue: stdout=%q", stdout)
+	}
+	if len(*calls) != 1 || (*calls)[0] != (catchUpCall{serverURL: "https://global.example.test", token: "global-token", project: "routed"}) {
+		t.Fatalf("clear must catch up from the global remote: %+v", *calls)
 	}
 }

@@ -1099,6 +1099,9 @@ func cmdCloudConfigProject(cfg store.Config, args []string) {
 		fmt.Printf("✓ Cloud remote override for project %q cleared; it now uses the global remote\n", parsed.project)
 	} else {
 		fmt.Printf("✓ Project %q routed to %s (token %s, remote id %s)\n", parsed.project, after.ServerURL, maskCloudToken(after.Token), after.ID)
+		if after.Token == "" {
+			fmt.Fprintf(os.Stderr, "Warning: autosync will skip project %q until its remote has a token; explicit cloud sync fails too. Set one with `engram cloud config --project %s --server %s --token <token>`.\n", parsed.project, parsed.project, after.ServerURL)
+		}
 	}
 
 	fmt.Println("Restart running `engram serve` / `engram mcp` processes so autosync picks up the new routing.")
@@ -1107,7 +1110,8 @@ func cmdCloudConfigProject(cfg store.Config, args []string) {
 		fmt.Println("Effective remote unchanged; nothing re-queued.")
 		return
 	}
-	if err := requeueProjectHistoryForNewRemote(cfg, parsed.project); err != nil {
+	enrolled, err := requeueProjectHistoryForNewRemote(cfg, parsed.project)
+	if err != nil {
 		// Without the replay the new remote would never receive the project's
 		// history, and a re-run would report "unchanged". Restore the previous
 		// routing so re-running the command retries the reassignment.
@@ -1118,6 +1122,40 @@ func cmdCloudConfigProject(cfg store.Config, args []string) {
 		fatal(fmt.Errorf("%w; the previous cloud config was restored, re-run the command to retry", err))
 		return
 	}
+	if enrolled {
+		catchUpProjectFromNewRemote(cfg, parsed.project)
+	}
+}
+
+// catchUpProjectFromNewRemote pulls project from its new remote right after a
+// route change. Scoped autosync managers advance their pull cursor past
+// projects they do not own, so rows other devices wrote to the new remote
+// while the project was routed elsewhere would otherwise never be pulled. The
+// pull is chunk/manifest based and independent of any autosync cursor; it
+// never pushes (the requeue already covers delivery). A failure only warns:
+// the new routing and the requeue are already saved.
+func catchUpProjectFromNewRemote(cfg store.Config, project string) {
+	warn := func(err error) {
+		fmt.Fprintf(os.Stderr, "Warning: catch-up pull of project %q from its new remote failed: %v\n", project, err)
+		fmt.Fprintf(os.Stderr, "The new routing and the re-queued history are saved. Retry the pull with: engram sync --cloud --import --project %s\n", project)
+	}
+	s, err := storeNew(cfg)
+	if err != nil {
+		warn(err)
+		return
+	}
+	defer s.Close()
+	cc, err := preflightCloudSync(s, cfg, project, false)
+	if err != nil {
+		warn(err)
+		return
+	}
+	result, err := cloudCatchUpPull(s, cc.ServerURL, cc.Token, project)
+	if err != nil {
+		warn(err)
+		return
+	}
+	fmt.Printf("Pulled %d chunk(s) of project %q from its new remote.\n", result.ChunksImported, project)
 }
 
 // cloneCloudConfig deep-copies cc so the pre-change routing can be restored.
@@ -1139,23 +1177,25 @@ func cloudRemoteIdentity(r cloudconfig.Remote) string {
 	return cloudconfig.RemoteID(r.ServerURL, r.Token)
 }
 
-func requeueProjectHistoryForNewRemote(cfg store.Config, project string) error {
+// requeueProjectHistoryForNewRemote re-queues project's history for its new
+// remote and reports whether the project is enrolled for cloud sync.
+func requeueProjectHistoryForNewRemote(cfg store.Config, project string) (bool, error) {
 	s, err := storeNew(cfg)
 	if err != nil {
-		return fmt.Errorf("cloud remote changed but opening the local store to re-queue project history failed: %w", err)
+		return false, fmt.Errorf("cloud remote changed but opening the local store to re-queue project history failed: %w", err)
 	}
 	defer s.Close()
 	queued, err := s.RequeueProjectSyncHistory(project)
 	if errors.Is(err, store.ErrProjectNotEnrolled) {
 		fmt.Printf("Project %q is not enrolled for cloud sync; its history will sync to this remote once enrolled.\n", project)
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("cloud remote changed but re-queueing project history failed: %w", err)
+		return false, fmt.Errorf("cloud remote changed but re-queueing project history failed: %w", err)
 	}
 	fmt.Printf("Effective remote changed: re-queued %d mutation(s) of project %q for full history delivery.\n", queued, project)
 	fmt.Println("Nothing was deleted locally or on the previous remote.")
-	return nil
+	return true, nil
 }
 
 // maskCloudToken never reveals more than the last four characters of a token.

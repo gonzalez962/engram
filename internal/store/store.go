@@ -490,7 +490,23 @@ type ForeignSyncTargetCleanupAction struct {
 	RetargetedMutations int64  `json:"retargeted_mutations"`
 	RetainedMutations   int64  `json:"retained_mutations"`
 	StateRemoved        bool   `json:"state_removed"`
+	// Reason is ForeignSyncTargetReasonOrphanedRemoteState for a per-remote
+	// cloud@<id> state row whose remote is no longer configured; empty for
+	// every other foreign target.
+	Reason string `json:"reason,omitempty"`
 }
+
+// RemoteSyncStateKeyPrefix prefixes the sync_state key of a per-project cloud
+// remote (cloud@<remote-id>). It must stay equal to
+// cloudconfig.RemoteStateKeyPrefix; store does not import cloudconfig. Those
+// rows only hold a remote's pull cursor, lease, and deferred pulls: the journal
+// stays on the default cloud target.
+const RemoteSyncStateKeyPrefix = DefaultSyncTargetKey + "@"
+
+// ForeignSyncTargetReasonOrphanedRemoteState marks a cloud@<id> state row
+// whose remote id matches no configured remote (token rotation or a cleared
+// override leaves them behind).
+const ForeignSyncTargetReasonOrphanedRemoteState = "orphaned_remote_state"
 
 // ForeignSyncTargetCleanupReport is the result of planning or applying closed
 // sync-target cleanup. Planning returns the same actions without mutating data.
@@ -9564,8 +9580,20 @@ type SyncTargetState struct {
 }
 
 // CleanupForeignSyncTargets retargets pending foreign rows to cloud and removes
-// their state only when no terminal journal rows remain.
+// their state only when no terminal journal rows remain. It never touches
+// per-remote cloud@<id> state because it does not know the configured remotes.
 func (s *Store) CleanupForeignSyncTargets(apply bool) (ForeignSyncTargetCleanupReport, error) {
+	return s.CleanupForeignSyncTargetsWithLiveRemotes(apply, nil)
+}
+
+// CleanupForeignSyncTargetsWithLiveRemotes is CleanupForeignSyncTargets that
+// also prunes orphaned per-remote cloud@<id> state rows. liveRemoteStateKeys
+// holds the state keys of every configured remote; a cloud@ key in it is kept.
+// A nil set means the configured remotes are unknown (for example cloud.json
+// could not be read), so every cloud@ row is kept; an empty non-nil set means
+// no per-project remote is configured, so every cloud@ row is an orphan. An
+// orphan that still holds journal or deferred-pull rows is retained.
+func (s *Store) CleanupForeignSyncTargetsWithLiveRemotes(apply bool, liveRemoteStateKeys map[string]bool) (ForeignSyncTargetCleanupReport, error) {
 	report := ForeignSyncTargetCleanupReport{Actions: []ForeignSyncTargetCleanupAction{}}
 	runTx := s.withTx
 	if !apply {
@@ -9594,11 +9622,31 @@ func (s *Store) CleanupForeignSyncTargets(apply bool) (ForeignSyncTargetCleanupR
 			if err := rows.Scan(&action.TargetKey, &action.RetargetedMutations, &action.RetainedMutations); err != nil {
 				return closeRowsWithError(rows, err)
 			}
+			if strings.HasPrefix(action.TargetKey, RemoteSyncStateKeyPrefix) {
+				if liveRemoteStateKeys == nil || liveRemoteStateKeys[action.TargetKey] {
+					continue
+				}
+				action.Reason = ForeignSyncTargetReasonOrphanedRemoteState
+			}
 			action.StateRemoved = action.RetainedMutations == 0
 			report.Actions = append(report.Actions, action)
 		}
 		if err := closeRowsWithError(rows, rows.Err()); err != nil {
 			return err
+		}
+		for i := range report.Actions {
+			action := &report.Actions[i]
+			if action.Reason != ForeignSyncTargetReasonOrphanedRemoteState {
+				continue
+			}
+			// Deferred pulls replay only under their own state key; keep the
+			// orphan until they are resolved instead of stranding them.
+			var deferred int64
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_apply_deferred WHERE target_key = ?`, action.TargetKey).Scan(&deferred); err != nil {
+				return err
+			}
+			action.RetainedMutations += deferred
+			action.StateRemoved = action.RetainedMutations == 0
 		}
 		if !apply || len(report.Actions) == 0 {
 			return nil

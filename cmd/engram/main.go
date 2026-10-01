@@ -157,6 +157,17 @@ var (
 	syncExport = func(sy *engramsync.Syncer, createdBy, project string) (*engramsync.SyncResult, error) {
 		return sy.Export(createdBy, project)
 	}
+	// cloudCatchUpPull is the network step of the catch-up pull that runs after
+	// a project's cloud remote changes. It is the same chunk/manifest import
+	// `engram sync --cloud --import --project <p>` performs, so it does not
+	// depend on any autosync pull cursor.
+	cloudCatchUpPull = func(s *store.Store, serverURL, token, project string) (*engramsync.ImportResult, error) {
+		transport, err := remote.NewRemoteTransport(serverURL, token, project)
+		if err != nil {
+			return nil, err
+		}
+		return syncImport(engramsync.NewCloudWithTransport(s, transport, project))
+	}
 	newCloudAutosyncManager = func(s *store.Store, _ any) cloudAutosyncManager {
 		mgr := autosync.New(s, nil, autosync.DefaultConfig())
 		return autosyncManagerAdapter{manager: mgr}
@@ -601,6 +612,18 @@ func resolveCloudRuntimeConfigForProject(cfg store.Config, project string) (*clo
 	return &cloudconfig.Config{ServerURL: remote.ServerURL, Token: remote.Token}, nil
 }
 
+// projectOverrideLacksToken reports whether project is routed to its own cloud
+// remote whose override has no token. An unreadable cloud.json reports false;
+// resolveCloudRuntimeConfigForProject already surfaces that error.
+func projectOverrideLacksToken(cfg store.Config, project string) bool {
+	cc, err := cloudconfig.Load(cfg.DataDir)
+	if err != nil {
+		return false
+	}
+	override, routed := cc.Projects[strings.TrimSpace(project)]
+	return routed && strings.TrimSpace(override.Token) == ""
+}
+
 func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutateState bool) (*cloudconfig.Config, error) {
 	project = strings.TrimSpace(project)
 	if project != "" {
@@ -622,6 +645,15 @@ func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutate
 	}
 	if _, err := cloudconfig.ValidateServerURL(cc.ServerURL); err != nil {
 		message := fmt.Sprintf("invalid cloud runtime server URL: %v", err)
+		if mutateState {
+			_ = s.MarkSyncBlocked(targetKey, constants.ReasonCloudConfigError, message)
+		}
+		return nil, fmt.Errorf("cloud sync %s: %s", constants.ReasonCloudConfigError, message)
+	}
+	if project != "" && projectOverrideLacksToken(cfg, project) {
+		// Autosync skips a tokenless override; explicit sync fails the same way
+		// instead of sending unauthenticated requests to the project's remote.
+		message := fmt.Sprintf("cloud remote override for project %q has no token: set one with `engram cloud config --project %s --server <url> --token <token>`", project, project)
 		if mutateState {
 			_ = s.MarkSyncBlocked(targetKey, constants.ReasonCloudConfigError, message)
 		}
