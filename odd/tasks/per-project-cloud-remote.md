@@ -35,12 +35,15 @@ autosync manager per process. Users need to separate projects by environment/clo
 ## Tasks
 - [x] T1 — `cloudconfig`: per-project map, load/save, validation, `ResolveForProject`, remote id,
   env override semantics; unit tests.
-- [ ] T2 — (carries T1 review follow-ups: validate loaded overrides in `ResolveForProject`
+- [x] T2 — (carries T1 review follow-ups: validate loaded overrides in `ResolveForProject`
   — empty/invalid `server_url` must surface an error instead of a silent unusable remote;
   trim the global URL in `resolveGlobal`; normalize project names before lookup.) CLI: `engram cloud config --project X --server URL --token T` / `--project X --clear`;
   `engram sync --cloud --project X` + upgrade paths use per-project resolution; reassignment
   re-enqueues full project history; `cloud status` shows per-project remotes; tests.
-- [ ] T3 — Autosync: one manager per remote with separate state key (`cloud@<id>`) for cursor/lease,
+- [ ] T3 — (carries T2 review follow-up: `cloud config --project` saves cloud.json before
+  requeue; if requeue fails the new remote stays saved and re-running reports "unchanged", so
+  history never reaches the new remote — restore the previous config on requeue failure, with a
+  test. Also: `cloudSyncEnabled` status provider must resolve per project.) Autosync: one manager per remote with separate state key (`cloud@<id>`) for cursor/lease,
   project-filtered push/pull, global manager excludes routed projects, status adapter routes by
   project; tests.
 - [ ] T4 — Doctor/cleanup recognizes `cloud@*` keys and prunes orphaned `cloud@*` rows whose id
@@ -69,3 +72,9 @@ autosync manager per process. Users need to separate projects by environment/clo
 
 Note: first RDD preflight defaulted to base 2e28f19 (whole prior branch, ~4.1k lines) and stopped with
 `lens_context_budget_exceeded`; rescoped to this feature's branch point 6961d7e.
+| T2 | delegated (writer trigger: cloud.go, main.go, store.go, cloudconfig + tests) | a14397e | RED: 8 cmd failures + build fails in cloudconfig/store; GREEN: cloudconfig ok, store ok, `go vet ./...` ok, `go build ./...` ok; cmd/engram ok with `ENGRAM_CLOUD_AUTOSYNC` unset (4 `TestCmdServe*SyncStatus*` fail only when the ambient env var is 1, also on base 9f3101a); parent spot check re-ran focused tests ok | medium, granted; reliability lens approved + acknowledged; 1 advisory WARNING moved to T3. Reviewed boundary → a14397e |
+
+T2 notes: "full history" = current-state replay via the enroll/remirror backfill path under a unique
+`reassign:<nanos>` source (not every historical revision). The cloud server appends duplicate
+`cloud_mutations` rows on re-push (cloudstore.go:941), while chunks dedupe by content hash
+(cloudstore.go:962-964). Token rotation on the same server counts as a remote change and requeues.

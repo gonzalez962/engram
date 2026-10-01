@@ -8028,10 +8028,90 @@ func (s *Store) RemirrorProject(project string) error {
 	})
 }
 
+// SyncSourceReassignPrefix prefixes the source of journal rows that replay a
+// project's history after its cloud remote changed.
+const SyncSourceReassignPrefix = "reassign:"
+
+var newReassignSource = func() string {
+	return fmt.Sprintf("%s%d", SyncSourceReassignPrefix, time.Now().UTC().UnixNano())
+}
+
+// ErrProjectNotEnrolled reports that a cloud operation needs an enrolled project.
+var ErrProjectNotEnrolled = errors.New("project is not enrolled for cloud sync")
+
+// RequeueProjectSyncHistory enqueues a full current-state replay of project so
+// a newly assigned cloud remote receives everything. It reuses the enrollment
+// backfill path under a reassign source. While the previous replay is still
+// entirely undelivered its source is reused, so repeated calls do not duplicate
+// rows; once any of it was delivered a fresh replay is queued so the new remote
+// also receives what the old one acknowledged. Acked history is left untouched
+// and only project's rows are written. It returns the number of rows queued and
+// ErrProjectNotEnrolled (queuing nothing) when project is not enrolled.
+func (s *Store) RequeueProjectSyncHistory(project string) (int, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return 0, fmt.Errorf("cloud requeue requires project")
+	}
+	queued := 0
+	err := s.withTx(func(tx *sql.Tx) error {
+		enrolled, err := isProjectEnrolledTx(tx, project)
+		if err != nil {
+			return err
+		}
+		if !enrolled {
+			return ErrProjectNotEnrolled
+		}
+		var maxSeq int64
+		if err := tx.QueryRow(`SELECT ifnull(MAX(seq), 0) FROM sync_mutations`).Scan(&maxSeq); err != nil {
+			return err
+		}
+		source, err := s.reassignSourceTx(tx, project)
+		if err != nil {
+			return err
+		}
+		if err := s.backfillProjectSyncMutationsTx(tx, project, source); err != nil {
+			return err
+		}
+		return tx.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE seq > ?`, maxSeq).Scan(&queued)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return queued, nil
+}
+
+// reassignSourceTx returns the source of the latest reassign replay for project
+// when none of its rows has been acknowledged yet, or a fresh unique source.
+func (s *Store) reassignSourceTx(tx *sql.Tx, project string) (string, error) {
+	var latest sql.NullString
+	err := tx.QueryRow(`
+		SELECT source FROM sync_mutations
+		WHERE project = ? AND substr(source, 1, ?) = ?
+		ORDER BY seq DESC LIMIT 1`, project, len(SyncSourceReassignPrefix), SyncSourceReassignPrefix).Scan(&latest)
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	if latest.Valid {
+		var delivered bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM sync_mutations WHERE source = ? AND acked_at IS NOT NULL)`, latest.String).Scan(&delivered); err != nil {
+			return "", err
+		}
+		if !delivered {
+			return latest.String, nil
+		}
+	}
+	return nextUniqueSyncSourceTx(tx, newReassignSource(), "cloud reassign")
+}
+
 func (s *Store) nextRemirrorSourceTx(tx *sql.Tx) (string, error) {
-	base := strings.TrimSpace(newRemirrorSource())
+	return nextUniqueSyncSourceTx(tx, newRemirrorSource(), "cloud remirror")
+}
+
+func nextUniqueSyncSourceTx(tx *sql.Tx, base, label string) (string, error) {
+	base = strings.TrimSpace(base)
 	if base == "" {
-		return "", fmt.Errorf("cloud remirror source is required")
+		return "", fmt.Errorf("%s source is required", label)
 	}
 	for suffix := 0; ; suffix++ {
 		source := base

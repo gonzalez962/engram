@@ -574,6 +574,30 @@ func resolveCloudRuntimeConfig(cfg store.Config) (*cloudconfig.Config, error) {
 	return cc, nil
 }
 
+// resolveCloudRuntimeConfigForProject returns the cloud server URL and token an
+// explicit project-scoped operation must use. Projects routed to their own
+// remote in cloud.json get that remote (env overrides do not apply); every
+// other project keeps the global resolution of resolveCloudRuntimeConfig.
+// project must already be normalized.
+func resolveCloudRuntimeConfigForProject(cfg store.Config, project string) (*cloudconfig.Config, error) {
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return resolveCloudRuntimeConfig(cfg)
+	}
+	cc, err := cloudconfig.Load(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("read cloud config: %w", err)
+	}
+	if _, routed := cc.Projects[project]; !routed {
+		return resolveCloudRuntimeConfig(cfg)
+	}
+	remote, err := cloudconfig.ResolveForProject(cc, project)
+	if err != nil {
+		return nil, err
+	}
+	return &cloudconfig.Config{ServerURL: remote.ServerURL, Token: remote.Token}, nil
+}
+
 func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutateState bool) (*cloudconfig.Config, error) {
 	project = strings.TrimSpace(project)
 	if project != "" {
@@ -581,7 +605,7 @@ func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutate
 	}
 	targetKey := cloudTargetKeyForProject(project)
 
-	cc, err := resolveCloudRuntimeConfig(cfg)
+	cc, err := resolveCloudRuntimeConfigForProject(cfg, project)
 	if err != nil {
 		return nil, fmt.Errorf("cloud sync config error: %w", err)
 	}
