@@ -33,15 +33,19 @@ autosync manager per process. Users need to separate projects by environment/clo
 - Artifacts in English. Conventional commits, no AI attribution.
 
 ## Tasks
-- [ ] T1 — `cloudconfig`: per-project map, load/save, validation, `ResolveForProject`, remote id,
+- [x] T1 — `cloudconfig`: per-project map, load/save, validation, `ResolveForProject`, remote id,
   env override semantics; unit tests.
-- [ ] T2 — CLI: `engram cloud config --project X --server URL --token T` / `--project X --clear`;
+- [ ] T2 — (carries T1 review follow-ups: validate loaded overrides in `ResolveForProject`
+  — empty/invalid `server_url` must surface an error instead of a silent unusable remote;
+  trim the global URL in `resolveGlobal`; normalize project names before lookup.) CLI: `engram cloud config --project X --server URL --token T` / `--project X --clear`;
   `engram sync --cloud --project X` + upgrade paths use per-project resolution; reassignment
   re-enqueues full project history; `cloud status` shows per-project remotes; tests.
 - [ ] T3 — Autosync: one manager per remote with separate state key (`cloud@<id>`) for cursor/lease,
   project-filtered push/pull, global manager excludes routed projects, status adapter routes by
   project; tests.
-- [ ] T4 — Doctor/cleanup recognizes `cloud@*` keys; docs for the new config; tests.
+- [ ] T4 — Doctor/cleanup recognizes `cloud@*` keys and prunes orphaned `cloud@*` rows whose id
+  no longer matches any configured remote (token rotation changes `RemoteID`; accepted — a fresh
+  pull from seq 0 is safe); docs for the new config; tests.
 
 ## Acceptance criteria
 - A project with an override pushes/pulls only against its remote; others only against global.
@@ -61,3 +65,7 @@ autosync manager per process. Users need to separate projects by environment/clo
 ## Progress / evidence
 | Task | Route | Commit | Checks | Review |
 |------|-------|--------|--------|--------|
+| T1 | delegated (writer trigger: config.go + new remote.go + tests) | 969cfa2 | RED: build fail `got.Projects undefined`; GREEN: `go test ./internal/cloudconfig/...` ok, `go vet` clean, `go build ./...` ok; parent spot check re-ran go test ok | medium, granted; 1 lens (reliability) approved, acknowledged (authority burned). 3 advisory findings moved to T2/T4. Reviewed boundary → 969cfa2 |
+
+Note: first RDD preflight defaulted to base 2e28f19 (whole prior branch, ~4.1k lines) and stopped with
+`lens_context_budget_exceeded`; rescoped to this feature's branch point 6961d7e.

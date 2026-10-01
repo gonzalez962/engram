@@ -9,10 +9,19 @@ import (
 	"path/filepath"
 )
 
-// Config is the on-disk cloud.json shape.
+// Config is the on-disk cloud.json shape. ServerURL and Token describe the
+// global remote; Projects optionally routes individual projects to their own
+// remote and is omitted from cloud.json when empty.
 type Config struct {
+	ServerURL string                   `json:"server_url"`
+	Token     string                   `json:"token"`
+	Projects  map[string]ProjectRemote `json:"projects,omitempty"`
+}
+
+// ProjectRemote is a per-project cloud remote override persisted in cloud.json.
+type ProjectRemote struct {
 	ServerURL string `json:"server_url"`
-	Token     string `json:"token"`
+	Token     string `json:"token,omitempty"`
 }
 
 // Path returns the cloud configuration path under dataDir.
