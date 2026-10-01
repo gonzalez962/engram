@@ -206,3 +206,105 @@ func TestNormalizeDashboardProjectFailsClosedWhenRegistryIsUnavailable(t *testin
 		t.Fatalf("expected registry failure to fail closed as forbidden, got %v", err)
 	}
 }
+
+// TestDashboardListsRegisteredProjectsWithoutChunks proves a freshly
+// registered project with no synced chunks appears as a zero-count row for its
+// grantee, its detail resolves instead of 404, and it stays hidden from a
+// principal without a grant.
+func TestDashboardListsRegisteredProjectsWithoutChunks(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+	cs.SetDashboardAllowedProjects([]string{"env-project"})
+
+	admin, err := cs.CreateHumanUser(ctx, CreateHumanUserParams{Username: "empty-admin", Email: "empty-admin@example.test", DisplayName: "Empty Admin", Role: PrincipalRoleAdmin})
+	if err != nil {
+		t.Fatalf("CreateHumanUser: %v", err)
+	}
+	writeDashboardScopeChunk(t, cs, "env-project")
+	if err := cs.CreateProjectWithGrantAndAudit(ctx,
+		CreateProjectGrantParams{PrincipalID: admin.PrincipalID, Project: "Fresh Project", GrantedByPrincipalID: admin.PrincipalID},
+		AuthAuditEvent{ActorPrincipalID: admin.PrincipalID, ActorSource: "managed", Project: "Fresh Project", Action: "project.create", Outcome: "success"},
+	); err != nil {
+		t.Fatalf("CreateProjectWithGrantAndAudit: %v", err)
+	}
+
+	all, err := cs.ListProjects("")
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if !containsDashboardProject(all, "fresh-project") {
+		t.Fatalf("expected registered project without chunks in deployment list, got %v", dashboardProjectNames(all))
+	}
+	overview, err := cs.AdminOverview()
+	if err != nil {
+		t.Fatalf("AdminOverview: %v", err)
+	}
+	if overview.Projects != 2 || overview.Chunks != 1 {
+		t.Fatalf("expected overview to count the empty project with zero chunks, got %+v", overview)
+	}
+
+	view, err := cs.DashboardStoreForProjects([]string{"Fresh Project"})
+	if err != nil {
+		t.Fatalf("DashboardStoreForProjects grantee: %v", err)
+	}
+	rows, err := view.ListProjects("")
+	if err != nil {
+		t.Fatalf("grantee ListProjects: %v", err)
+	}
+	want := DashboardProjectRow{Project: "fresh-project"}
+	if len(rows) != 1 || rows[0] != want {
+		t.Fatalf("expected grantee to see one zero-count row %+v, got %+v", want, rows)
+	}
+	detail, err := view.ProjectDetail("fresh-project")
+	if err != nil {
+		t.Fatalf("expected empty registered project detail, got %v", err)
+	}
+	if detail.Project != "fresh-project" || detail.Stats != want || len(detail.Sessions) != 0 {
+		t.Fatalf("expected empty detail for fresh-project, got %+v", detail)
+	}
+	if sessions, err := view.ListRecentSessions("fresh-project", "", 10); err != nil || len(sessions) != 0 {
+		t.Fatalf("expected empty sessions for fresh-project, rows=%+v err=%v", sessions, err)
+	}
+
+	other, err := cs.DashboardStoreForProjects([]string{"env-project"})
+	if err != nil {
+		t.Fatalf("DashboardStoreForProjects other: %v", err)
+	}
+	otherRows, err := other.ListProjects("")
+	if err != nil {
+		t.Fatalf("other ListProjects: %v", err)
+	}
+	if containsDashboardProject(otherRows, "fresh-project") {
+		t.Fatalf("expected principal without grant not to see fresh-project, got %v", dashboardProjectNames(otherRows))
+	}
+	if _, err := other.ProjectDetail("fresh-project"); !errors.Is(err, ErrDashboardProjectForbidden) {
+		t.Fatalf("expected ungranted empty project detail to be forbidden, got %v", err)
+	}
+}
+
+func TestReadModelWithRegisteredProjectsAddsZeroCountRows(t *testing.T) {
+	base := dashboardPrincipalReadModel()
+	model := base.withRegisteredProjects([]string{"project-a", " fresh-project ", ""})
+
+	if got := dashboardProjectNames(model.projects); len(got) != 3 || got[0] != "fresh-project" || got[1] != "project-a" || got[2] != "project-b" {
+		t.Fatalf("expected sorted rows including the empty registered project, got %v", got)
+	}
+	if model.admin.Projects != 3 || model.admin.Chunks != base.admin.Chunks {
+		t.Fatalf("expected overview to count the empty project without adding chunks, got %+v", model.admin)
+	}
+	detail, ok := model.projectDetails["fresh-project"]
+	if !ok || detail.Stats != (DashboardProjectRow{Project: "fresh-project"}) || len(detail.Sessions) != 0 {
+		t.Fatalf("expected empty detail for fresh-project, got %+v (ok=%v)", detail, ok)
+	}
+	if model.projectDetails["project-a"].Stats != base.projectDetails["project-a"].Stats {
+		t.Fatalf("expected existing project stats to stay untouched")
+	}
+	if _, leaked := base.projectDetails["fresh-project"]; leaked || len(base.projects) != 2 {
+		t.Fatalf("expected the source model not to be mutated")
+	}
+
+	scoped := model.scopedTo(effectiveDashboardScope(false, map[string]struct{}{"project-a": {}}, nil))
+	if got := dashboardProjectNames(scoped.projects); len(got) != 1 || got[0] != "project-a" {
+		t.Fatalf("expected deployment scope to drop unscoped empty projects, got %v", got)
+	}
+}

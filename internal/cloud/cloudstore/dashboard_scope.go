@@ -88,3 +88,45 @@ func (cs *CloudStore) loadRegisteredDashboardProjects() ([]string, error) {
 	}
 	return projects, nil
 }
+
+// withRegisteredProjects adds a zero-count project row and an empty detail for
+// every registered project that has no synced data yet, so admin-created
+// projects are listed before their first push. Projects that already have
+// rows are left untouched. Callers apply the deployment scope afterwards.
+func (m dashboardReadModel) withRegisteredProjects(registered []string) dashboardReadModel {
+	added := false
+	for _, project := range registered {
+		project = strings.TrimSpace(project)
+		if project == "" {
+			continue
+		}
+		if _, exists := m.projectDetails[project]; exists {
+			continue
+		}
+		if !added {
+			m.projects = append([]DashboardProjectRow(nil), m.projects...)
+			details := make(map[string]DashboardProjectDetail, len(m.projectDetails)+len(registered))
+			for name, detail := range m.projectDetails {
+				details[name] = detail
+			}
+			m.projectDetails = details
+			added = true
+		}
+		row := DashboardProjectRow{Project: project}
+		m.projects = append(m.projects, row)
+		m.projectDetails[project] = DashboardProjectDetail{
+			Project:      project,
+			Stats:        row,
+			Contributors: []DashboardContributorRow{},
+			Sessions:     []DashboardSessionRow{},
+			Observations: []DashboardObservationRow{},
+			Prompts:      []DashboardPromptRow{},
+		}
+	}
+	if !added {
+		return m
+	}
+	sort.Slice(m.projects, func(i, j int) bool { return m.projects[i].Project < m.projects[j].Project })
+	m.admin.Projects = len(m.projects)
+	return m
+}

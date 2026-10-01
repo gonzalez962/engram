@@ -958,7 +958,7 @@ func (cs *CloudStore) buildDashboardReadModel() (dashboardReadModel, error) {
 	if err != nil {
 		return dashboardReadModel{}, err
 	}
-	model = model.scopedTo(scope)
+	model = model.withRegisteredProjects(registered).scopedTo(scope)
 	model.registeredProjects = registered
 	return model, nil
 }
