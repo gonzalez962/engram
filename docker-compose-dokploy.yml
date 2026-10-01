@@ -14,9 +14,15 @@
 # Dokploy guidance applied: no container_name (breaks logs/metrics), no
 # host:container port mappings, and only the public service joins
 # dokploy-network. Postgres stays on the private default network.
+#
+# The database service is named engram-postgres (not "postgres") because
+# dokploy-network is shared by every Dokploy project: a generic hostname can
+# resolve to another project's database. Its healthcheck connects to
+# POSTGRES_DB, so cloud does not start if that database does not exist (the
+# image only creates POSTGRES_DB when the volume is first initialized).
 
 services:
-  postgres:
+  engram-postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -26,7 +32,7 @@ services:
     volumes:
       - engram-prod-local-pg:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'SELECT 1' >/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -39,10 +45,10 @@ services:
       dockerfile: docker/cloud/Dockerfile
     restart: unless-stopped
     depends_on:
-      postgres:
+      engram-postgres:
         condition: service_healthy
     environment:
-      ENGRAM_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      ENGRAM_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@engram-postgres:5432/${POSTGRES_DB}?sslmode=disable
       ENGRAM_JWT_SECRET: ${ENGRAM_JWT_SECRET:?ENGRAM_JWT_SECRET is required}
       ENGRAM_CLOUD_TOKEN: ${ENGRAM_CLOUD_TOKEN:?ENGRAM_CLOUD_TOKEN is required}
       ENGRAM_CLOUD_ADMIN: ${ENGRAM_CLOUD_ADMIN:?ENGRAM_CLOUD_ADMIN is required}
