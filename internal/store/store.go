@@ -6681,6 +6681,13 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 // never included). exclude drops the listed projects and keeps empty-project
 // rows. With both nil it is identical to ListPendingSyncMutations.
 func (s *Store) ListPendingSyncMutationsScoped(targetKey string, include, exclude []string, limit int) ([]SyncMutation, error) {
+	return s.ListPendingSyncMutationsAfterSeqScoped(targetKey, 0, include, exclude, limit)
+}
+
+// ListPendingSyncMutationsAfterSeqScoped is ListPendingSyncMutationsAfterSeq
+// restricted to a project scope inside the query, with the same include and
+// exclude semantics as ListPendingSyncMutationsScoped.
+func (s *Store) ListPendingSyncMutationsAfterSeqScoped(targetKey string, afterSeq int64, include, exclude []string, limit int) ([]SyncMutation, error) {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if limit <= 0 {
 		limit = 100
@@ -6693,8 +6700,9 @@ func (s *Store) ListPendingSyncMutationsScoped(targetKey string, include, exclud
 		FROM sync_mutations sm
 		LEFT JOIN sync_enrolled_projects sep ON sm.project = sep.project
 		WHERE sm.target_key = ? AND sm.acked_at IS NULL AND sm.disposition = 'pending'
+		  AND sm.seq > ?
 		  AND (sm.project = '' OR sep.project IS NOT NULL)`
-	args := []any{targetKey}
+	args := []any{targetKey, afterSeq}
 	if include != nil {
 		query += ` AND sm.project IN (` + sqlPlaceholders(len(include)) + `)`
 		for _, project := range include {
