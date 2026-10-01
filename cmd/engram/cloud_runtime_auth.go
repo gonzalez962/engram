@@ -111,6 +111,25 @@ func (l cloudstoreManagedTokenLookup) FindManagedTokenByHash(ctx context.Context
 	return record, resolvedPrincipal, nil
 }
 
+// cloudManagedTokenUsageStore is the optional storage capability
+// cloudstoreManagedTokenLookup uses to record managed token usage.
+// *cloudstore.CloudStore satisfies it; stores without it (test fakes) make
+// usage recording a no-op instead of widening cloudManagedTokenHashStore.
+type cloudManagedTokenUsageStore interface {
+	TouchPrincipalTokenLastUsed(ctx context.Context, tokenID string) error
+}
+
+// RecordManagedTokenUse implements auth.ManagedTokenUsageRecorder. The
+// resolver calls it only after a successful managed-token authentication;
+// the store throttles the actual write.
+func (l cloudstoreManagedTokenLookup) RecordManagedTokenUse(ctx context.Context, tokenID string) error {
+	usageStore, ok := l.store.(cloudManagedTokenUsageStore)
+	if !ok {
+		return nil
+	}
+	return usageStore.TouchPrincipalTokenLastUsed(ctx, tokenID)
+}
+
 // cloudProjectGrantStore is the narrow storage seam
 // cloudPrincipalProjectAuthorizer depends on. *cloudstore.CloudStore
 // satisfies it structurally; tests substitute an in-memory fake.

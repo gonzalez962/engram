@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -90,6 +91,15 @@ type ManagedTokenRecord struct {
 
 type ManagedTokenLookup interface {
 	FindManagedTokenByHash(ctx context.Context, hash string) (ManagedTokenRecord, Principal, error)
+}
+
+// ManagedTokenUsageRecorder is an optional capability a ManagedTokenLookup
+// may implement to record that a managed token was used. PrincipalResolver
+// calls it only after a successful managed-token authentication (token found,
+// not revoked, principal enabled and valid). Implementations are expected to
+// throttle their own writes; a recording failure never fails authentication.
+type ManagedTokenUsageRecorder interface {
+	RecordManagedTokenUse(ctx context.Context, tokenID string) error
 }
 
 type ManagedTokenHasher struct {
@@ -280,6 +290,7 @@ func (r *PrincipalResolver) ResolveBearerToken(ctx context.Context, token string
 				return Principal{}, ErrPrincipalDisabled
 			}
 			principal.TokenID = record.ID
+			r.recordManagedTokenUse(ctx, record.ID)
 			return principal, nil
 		}
 		if !errors.Is(err, ErrUnknownToken) {
@@ -287,6 +298,19 @@ func (r *PrincipalResolver) ResolveBearerToken(ctx context.Context, token string
 		}
 	}
 	return Principal{}, ErrUnknownToken
+}
+
+// recordManagedTokenUse records usage of an authenticated managed token when
+// the configured lookup supports it. Failures are logged and swallowed so
+// usage bookkeeping can never deny an otherwise valid request.
+func (r *PrincipalResolver) recordManagedTokenUse(ctx context.Context, tokenID string) {
+	recorder, ok := r.managedTokens.(ManagedTokenUsageRecorder)
+	if !ok || strings.TrimSpace(tokenID) == "" {
+		return
+	}
+	if err := recorder.RecordManagedTokenUse(ctx, tokenID); err != nil {
+		log.Printf("[cloud-auth] record managed token use failed: token_id=%s err=%v", tokenID, err)
+	}
 }
 
 func (r *PrincipalResolver) resolveLegacy(token string) (Principal, bool) {
