@@ -1,0 +1,72 @@
+# Engram Cloud — Dokploy deployment (Docker Compose service type)
+#
+# Set these variables in Dokploy (Compose > Environment); Dokploy writes them
+# to a .env file next to this compose file and interpolates ${...} below:
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
+#   ENGRAM_JWT_SECRET, ENGRAM_CLOUD_TOKEN, ENGRAM_CLOUD_ADMIN,
+#   ENGRAM_CLOUD_TOKEN_PEPPER, ENGRAM_CLOUD_ALLOWED_PROJECTS
+#   (optional) ENGRAM_CLOUD_MAX_PUSH_BYTES
+#
+# Domain: add it in Dokploy (Compose > Domains) with service "cloud" and
+# container port 18080. Dokploy generates the Traefik labels; no host ports
+# are published.
+#
+# Dokploy guidance applied: no container_name (breaks logs/metrics), no
+# host:container port mappings, and only the public service joins
+# dokploy-network. Postgres stays on the private default network.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+    volumes:
+      - engram-prod-local-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - default
+
+  cloud:
+    build:
+      context: .
+      dockerfile: docker/cloud/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ENGRAM_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      ENGRAM_JWT_SECRET: ${ENGRAM_JWT_SECRET:?ENGRAM_JWT_SECRET is required}
+      ENGRAM_CLOUD_TOKEN: ${ENGRAM_CLOUD_TOKEN:?ENGRAM_CLOUD_TOKEN is required}
+      ENGRAM_CLOUD_ADMIN: ${ENGRAM_CLOUD_ADMIN:?ENGRAM_CLOUD_ADMIN is required}
+      ENGRAM_CLOUD_TOKEN_PEPPER: ${ENGRAM_CLOUD_TOKEN_PEPPER:?ENGRAM_CLOUD_TOKEN_PEPPER is required}
+      ENGRAM_CLOUD_ALLOWED_PROJECTS: ${ENGRAM_CLOUD_ALLOWED_PROJECTS:?ENGRAM_CLOUD_ALLOWED_PROJECTS is required}
+      ENGRAM_CLOUD_MAX_PUSH_BYTES: ${ENGRAM_CLOUD_MAX_PUSH_BYTES:-}
+      ENGRAM_CLOUD_HOST: 0.0.0.0
+      ENGRAM_PORT: "18080"
+    command: ["cloud", "serve"]
+    expose:
+      - "18080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:18080/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - dokploy-network
+      - default
+
+volumes:
+  engram-prod-local-pg:
+
+networks:
+  dokploy-network:
+    external: true
