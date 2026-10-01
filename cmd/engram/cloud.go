@@ -357,6 +357,10 @@ func cmdCloudUpgradeDoctor(cfg store.Config) {
 	}
 	defer s.Close()
 
+	if err := tokenlessOverrideError(cfg, project); err != nil {
+		fatal(err)
+		return
+	}
 	cloudConfigured := false
 	if cc, cfgErr := resolveCloudRuntimeConfigForProject(cfg, project); cfgErr == nil {
 		if cc != nil {
@@ -513,6 +517,10 @@ func cmdCloudUpgradeBootstrap(cfg store.Config) {
 		fatal(fmt.Errorf("cloud upgrade bootstrap requires configured cloud server"))
 		return
 	}
+	if err := tokenlessOverrideError(cfg, project); err != nil {
+		fatal(err)
+		return
+	}
 	validatedURL, err := cloudconfig.ValidateServerURL(cc.ServerURL)
 	if err != nil {
 		fatal(fmt.Errorf("invalid cloud runtime server URL: %w", err))
@@ -571,6 +579,10 @@ func cmdCloudUpgradeRemirror(cfg store.Config) {
 	}
 	if cc == nil || strings.TrimSpace(cc.ServerURL) == "" {
 		fatal(fmt.Errorf("cloud upgrade remirror requires configured cloud server"))
+		return
+	}
+	if err := tokenlessOverrideError(cfg, project); err != nil {
+		fatal(err)
 		return
 	}
 	validatedURL, err := cloudconfig.ValidateServerURL(cc.ServerURL)

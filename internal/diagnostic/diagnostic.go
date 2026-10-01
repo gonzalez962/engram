@@ -29,6 +29,10 @@ type Scope struct {
 	Now                    time.Time
 	ReadSQLiteLockSnapshot func(context.Context) (store.SQLiteLockSnapshot, error)
 	DetectProject          func(string) (DetectedProject, bool)
+	// DataDir locates cloud.json so sync-target checks and repairs can tell
+	// live per-project cloud@<id> remote state from orphaned state. Empty
+	// means the configured remotes are unknown: no cloud@ row is judged.
+	DataDir string
 }
 
 type DetectedProject struct {

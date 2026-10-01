@@ -54,7 +54,7 @@ autosync manager per process. Users need to separate projects by environment/clo
   (e) align tokenless-override handling between autosync (skips) and explicit sync.) Doctor/cleanup recognizes `cloud@*` keys and prunes orphaned `cloud@*` rows whose id
   no longer matches any configured remote (token rotation changes `RemoteID`; accepted — a fresh
   pull from seq 0 is safe); docs for the new config; tests.
-- [ ] T5 — T4 follow-ups: (a) `engram doctor` check `SyncTargetClosedSpaceCheck`
+- [x] T5 — T4 follow-ups: (a) `engram doctor` check `SyncTargetClosedSpaceCheck`
   (internal/diagnostic/checks.go ~553-597) still flags live `cloud@<id>` rows as foreign — feed it
   the live remote keys (Scope needs DataDir); (b) orphaned `cloud@<id>` rows with leftover
   `sync_apply_deferred` rows keep doctor repair `blocked` forever — discard/report those deferred
@@ -102,3 +102,9 @@ share a LeaseOwner; remote managers now get an id suffix.
 T4 notes: verified (i) explicit chunk import ignores autosync `last_pulled_seq` (internal/sync/sync.go:833-878)
 and (ii) server materializes cloud_chunks in the same tx as cloud_mutations (cloudstore.go:913, 955-970).
 Manual pull retry is `engram sync --cloud --import --project <p>` (without --import it pushes).
+| T5 | delegated (writer trigger: checks.go, diagnostic.go, repair.go, store.go, doctor.go, main.go, cloud.go + tests + docs) | 7d64e7a | RED per item ((c) proof-only, no code change needed); GREEN: diagnostic ok, store ok (148s), cmd/engram ok (100s), vet ok, build ok, all with `ENGRAM_CLOUD_AUTOSYNC` unset; parent spot check: diagnostic + focused cmd tests ok | medium, granted; reliability lens approved + acknowledged; 3 SUGGESTIONs only (plan/apply re-resolve remotes, project-name normalization untested, tokenless-before-enrollment ordering untested) — left as optional follow-ups. Reviewed boundary → 7d64e7a |
+
+Feature status: all tasks T1–T5 implemented, committed and reviewed locally. Branch chain (local, no PRs yet):
+feat/per-project-cloud-remote ← pcr-t1-cloudconfig ← pcr-t2-cli ← pcr-t3-autosync ← pcr-t4-doctor-docs ← pcr-t5-doctor-followups.
+Behavior change to note in PRs: `engram cloud upgrade doctor` now fails (instead of reporting) for a tokenless project override.
+Next: user opens PRs (feature-branch-chain) when ready.

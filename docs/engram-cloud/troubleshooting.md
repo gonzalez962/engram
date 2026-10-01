@@ -102,6 +102,22 @@ engram sync --cloud --import --project <project>
 
 Nothing needs rolling back; re-running the pull is safe because already-imported chunks are skipped.
 
+## Doctor reports orphaned remote state
+
+`engram doctor --check sync_target_closed_space` reports `orphaned_remote_state` (a warning) when a `cloud@<id>` sync-state row belongs to a project remote that is no longer configured. Clearing an override or rotating its token changes the remote id, so the old row can never advance again. Rows of remotes that are still configured are never reported. If `cloud.json` cannot be read, doctor reports a single `remote_sync_state_unvalidated` note instead and judges no `cloud@` row.
+
+Remove the orphan with:
+
+```bash
+engram doctor repair --project <project> --check sync_target_closed_space --apply
+```
+
+Run it with `--dry-run` first to see what would change. The repair also discards any deferred pulls recorded for the removed remote (reported as `discarded_deferred`): they were pulled from a remote you no longer use and could never be replayed. If a project then needs a fresh pull from its current remote, run:
+
+```bash
+engram sync --cloud --import --project <project>
+```
+
 ---
 
 ## Error: `chunk_id does not match payload content hash`

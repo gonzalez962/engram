@@ -3,6 +3,7 @@ package diagnostic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -87,6 +88,7 @@ type SyncTargetCleanupAction struct {
 	RetainedMutations   int64  `json:"retained_mutations"`
 	StateRemoved        bool   `json:"state_removed"`
 	Reason              string `json:"reason,omitempty"`
+	DiscardedDeferred   int64  `json:"discarded_deferred,omitempty"`
 }
 
 // ReasonCloudConfigUnreadable marks a sync-target cleanup that kept every
@@ -177,7 +179,11 @@ func planOrphanedPendingRelationsRepair(plan *RepairPlan, scope Scope) error {
 }
 
 func planForeignSyncTargetCleanup(plan *RepairPlan, scope Scope) error {
-	cleanup, err := scope.Store.CleanupForeignSyncTargets(false)
+	liveRemotes, err := liveRemoteKeysForScope(scope)
+	if err != nil && !errors.Is(err, errRemoteKeysUnknown) {
+		plan.Skipped = append(plan.Skipped, RepairSkip{ReasonCode: ReasonCloudConfigUnreadable, Message: fmt.Sprintf("cloud.json could not be read (%v); no cloud@ remote state was pruned", err)})
+	}
+	cleanup, err := scope.Store.CleanupForeignSyncTargetsWithLiveRemotes(false, liveRemotes)
 	if err != nil {
 		return err
 	}
@@ -187,9 +193,50 @@ func planForeignSyncTargetCleanup(plan *RepairPlan, scope Scope) error {
 	return nil
 }
 
+// ApplySyncTargetCleanup applies the closed sync-target cleanup BuildRepairPlan
+// planned, resolving the live remotes from scope the same way, and records the
+// applied actions and status on plan. Orphaned remote state is removable
+// together with its deferred pulls (DiscardedDeferred), so only retained
+// journal rows block the repair.
+func ApplySyncTargetCleanup(plan *RepairPlan, scope Scope) error {
+	liveRemotes, _ := liveRemoteKeysForScope(scope)
+	cleanup, err := scope.Store.CleanupForeignSyncTargetsWithLiveRemotes(true, liveRemotes)
+	if err != nil {
+		return err
+	}
+	plan.TargetActions = make([]SyncTargetCleanupAction, 0, len(cleanup.Actions))
+	if len(cleanup.Actions) > 0 {
+		plan.Status = "applied"
+	}
+	for _, action := range cleanup.Actions {
+		plan.TargetActions = append(plan.TargetActions, SyncTargetCleanupActionFromStore(action))
+		if action.RetainedMutations > 0 {
+			plan.Status = "blocked"
+			if cleanup.Applied {
+				plan.Status = "partial"
+			}
+		}
+	}
+	return nil
+}
+
+// errRemoteKeysUnknown reports a scope without a DataDir: the configured
+// remotes are unknown, which is not a cloud.json read failure.
+var errRemoteKeysUnknown = errors.New("cloud data directory is not set")
+
+// liveRemoteKeysForScope returns the live cloud@<id> state keys for scope, or
+// nil and an error when they are unknown (no DataDir, or cloud.json could not
+// be read). Callers must then keep and not judge any cloud@ row.
+func liveRemoteKeysForScope(scope Scope) (map[string]bool, error) {
+	if strings.TrimSpace(scope.DataDir) == "" {
+		return nil, errRemoteKeysUnknown
+	}
+	return LiveCloudRemoteStateKeys(scope.DataDir)
+}
+
 // SyncTargetCleanupActionFromStore converts one store cleanup classification.
 func SyncTargetCleanupActionFromStore(action store.ForeignSyncTargetCleanupAction) SyncTargetCleanupAction {
-	return SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations, RetainedMutations: action.RetainedMutations, StateRemoved: action.StateRemoved, Reason: action.Reason}
+	return SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations, RetainedMutations: action.RetainedMutations, StateRemoved: action.StateRemoved, Reason: action.Reason, DiscardedDeferred: action.DiscardedDeferred}
 }
 
 // LiveCloudRemoteStateKeys returns the sync_state key (cloud@<remote-id>) of

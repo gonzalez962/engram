@@ -494,6 +494,10 @@ type ForeignSyncTargetCleanupAction struct {
 	// cloud@<id> state row whose remote is no longer configured; empty for
 	// every other foreign target.
 	Reason string `json:"reason,omitempty"`
+	// DiscardedDeferred counts the sync_apply_deferred rows of an orphaned
+	// cloud@<id> state row that cleanup discards (or would discard when only
+	// planning) together with the state row.
+	DiscardedDeferred int64 `json:"discarded_deferred,omitempty"`
 }
 
 // RemoteSyncStateKeyPrefix prefixes the sync_state key of a per-project cloud
@@ -9592,7 +9596,8 @@ func (s *Store) CleanupForeignSyncTargets(apply bool) (ForeignSyncTargetCleanupR
 // A nil set means the configured remotes are unknown (for example cloud.json
 // could not be read), so every cloud@ row is kept; an empty non-nil set means
 // no per-project remote is configured, so every cloud@ row is an orphan. An
-// orphan that still holds journal or deferred-pull rows is retained.
+// orphan that still holds journal rows is retained; an orphan's deferred-pull
+// rows are discarded with its state row and counted in DiscardedDeferred.
 func (s *Store) CleanupForeignSyncTargetsWithLiveRemotes(apply bool, liveRemoteStateKeys map[string]bool) (ForeignSyncTargetCleanupReport, error) {
 	report := ForeignSyncTargetCleanupReport{Actions: []ForeignSyncTargetCleanupAction{}}
 	runTx := s.withTx
@@ -9639,14 +9644,20 @@ func (s *Store) CleanupForeignSyncTargetsWithLiveRemotes(apply bool, liveRemoteS
 			if action.Reason != ForeignSyncTargetReasonOrphanedRemoteState {
 				continue
 			}
-			// Deferred pulls replay only under their own state key; keep the
-			// orphan until they are resolved instead of stranding them.
-			var deferred int64
-			if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_apply_deferred WHERE target_key = ?`, action.TargetKey).Scan(&deferred); err != nil {
+			// Deferred pulls replay only under their own state key, and no
+			// autosync manager runs for a remote that is no longer configured,
+			// so they could never be resolved and would block the repair
+			// forever. Discarding them is safe: they are rows pulled from that
+			// removed remote, not local writes, and a catch-up pull (or
+			// `engram sync --cloud --import --project <p>`) re-imports state
+			// from the project's current remote. They go with the state row,
+			// so an orphan retained for journal rows keeps them too.
+			if !action.StateRemoved {
+				continue
+			}
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_apply_deferred WHERE target_key = ?`, action.TargetKey).Scan(&action.DiscardedDeferred); err != nil {
 				return err
 			}
-			action.RetainedMutations += deferred
-			action.StateRemoved = action.RetainedMutations == 0
 		}
 		if !apply || len(report.Actions) == 0 {
 			return nil
@@ -9676,6 +9687,11 @@ func (s *Store) CleanupForeignSyncTargetsWithLiveRemotes(apply bool, liveRemoteS
 				movedAny = true
 			}
 			if action.StateRemoved {
+				if action.DiscardedDeferred > 0 {
+					if _, err := s.execHook(tx, `DELETE FROM sync_apply_deferred WHERE target_key = ?`, action.TargetKey); err != nil {
+						return err
+					}
+				}
 				if _, err := s.execHook(tx, `DELETE FROM sync_state WHERE target_key = ?`, action.TargetKey); err != nil {
 					return err
 				}

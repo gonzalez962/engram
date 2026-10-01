@@ -35,12 +35,15 @@ const ReasonQuarantinedPulledSessionIdentity = "quarantined_pulled_session_ident
 // targets.
 const ReasonForeignSyncTarget = "foreign_sync_target"
 
-// orphanedPendingRelationSampleLimit bounds how many candidate relations the
-// store's bounded diagnostic read returns to the aggregate doctor finding, so
-// a large legacy backlog cannot flood diagnostic output. The full candidate
-// set is re-derived by the repair plan and apply path from the same store
-// evidence.
-const orphanedPendingRelationSampleLimit = 10
+// ReasonOrphanedRemoteSyncState marks a CheckSyncTargetClosedSpace finding for
+// a per-project cloud@<id> state row whose remote is no longer configured.
+// doctor repair removes it, so it is a warning rather than an error.
+const ReasonOrphanedRemoteSyncState = store.ForeignSyncTargetReasonOrphanedRemoteState
+
+// ReasonRemoteSyncStateUnvalidated marks the informational note emitted when
+// cloud.json could not be read, so no cloud@<id> row could be judged live or
+// orphaned.
+const ReasonRemoteSyncStateUnvalidated = "remote_sync_state_unvalidated"
 
 type SessionProjectDirectoryMismatchCheck struct{}
 type ManualSessionNameProjectMismatchCheck struct{}
@@ -584,9 +587,23 @@ func (c SyncTargetClosedSpaceCheck) Run(ctx context.Context, scope Scope) (Check
 	for _, project := range enrolled {
 		closed[syncTargetKeyForClosedSpace(project.Project)] = true
 	}
+	// Per-project cloud@<id> rows are legitimate while their remote is
+	// configured. Without a readable cloud.json no such row can be judged, so
+	// none is reported as foreign and one informational note says so instead.
+	liveRemotes, remotesErr := liveRemoteKeysForScope(scope)
+	unvalidatedRemoteRows := 0
 	findings := make([]Finding, 0)
 	for _, state := range states {
 		if closed[state.TargetKey] {
+			continue
+		}
+		if strings.HasPrefix(state.TargetKey, store.RemoteSyncStateKeyPrefix) {
+			switch {
+			case liveRemotes == nil:
+				unvalidatedRemoteRows++
+			case !liveRemotes[state.TargetKey]:
+				findings = append(findings, orphanedRemoteSyncStateFinding(c.Code(), state))
+			}
 			continue
 		}
 		findings = append(findings, Finding{
@@ -604,7 +621,43 @@ func (c SyncTargetClosedSpaceCheck) Run(ctx context.Context, scope Scope) (Check
 			RequiresConfirmation: true,
 		})
 	}
+	if unvalidatedRemoteRows > 0 {
+		findings = append(findings, unvalidatedRemoteSyncStateFinding(c.Code(), unvalidatedRemoteRows, remotesErr))
+	}
 	return resultFromFindings(c.Code(), map[string]any{"sync_targets_evaluated": len(states), "enrolled_projects": len(enrolled)}, findings), nil
+}
+
+func orphanedRemoteSyncStateFinding(checkID string, state store.SyncTargetState) Finding {
+	return Finding{
+		CheckID:    checkID,
+		Severity:   SeverityWarning,
+		ReasonCode: ReasonOrphanedRemoteSyncState,
+		Message:    fmt.Sprintf("Remote sync state %q belongs to a cloud remote that is no longer configured.", state.TargetKey),
+		Why:        "A cloud@<id> row holds one per-project remote's pull cursor, lease, and deferred pulls. Clearing an override or rotating its token changes the remote id, so no autosync manager will ever advance this row again.",
+		Evidence: mustJSON(map[string]any{
+			"target_key": state.TargetKey,
+			"lifecycle":  state.Lifecycle,
+		}),
+		SafeNextStep:         "Run `engram doctor repair --project <project> --check " + CheckSyncTargetClosedSpace + " --apply` to remove it. Deferred pulls recorded for the removed remote are discarded with it; run `engram sync --cloud --import --project <project>` afterwards if a project needs a fresh pull from its current remote.",
+		RequiresConfirmation: true,
+	}
+}
+
+func unvalidatedRemoteSyncStateFinding(checkID string, rows int, cause error) Finding {
+	evidence := map[string]any{"remote_state_rows": rows}
+	if cause != nil {
+		evidence["error"] = cause.Error()
+	}
+	return Finding{
+		CheckID:              checkID,
+		Severity:             SeverityInfo,
+		ReasonCode:           ReasonRemoteSyncStateUnvalidated,
+		Message:              fmt.Sprintf("%d per-project remote sync state row(s) could not be validated against the configured cloud remotes.", rows),
+		Why:                  "cloud.json could not be read (or no data directory was given), so doctor cannot tell live cloud@<id> remote state from orphaned state and reports neither.",
+		Evidence:             mustJSON(evidence),
+		SafeNextStep:         "Fix or restore cloud.json (see `engram cloud status`), then run doctor again to validate remote sync state.",
+		RequiresConfirmation: false,
+	}
 }
 
 // safeNextStepForForeignSyncTarget selects the doctor guidance for a foreign

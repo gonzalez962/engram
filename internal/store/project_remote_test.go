@@ -359,23 +359,54 @@ func TestCleanupForeignSyncTargetsUnknownRemotesPrunesNoRemoteState(t *testing.T
 	}
 }
 
-func TestCleanupForeignSyncTargetsRetainsOrphanWithDeferredRows(t *testing.T) {
+func countTargetDeferredRows(t *testing.T, s *Store, targetKey string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_apply_deferred WHERE target_key = ?`, targetKey).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// An orphaned cloud@<id> row's deferred pulls can never replay (no manager
+// runs for that key), so cleanup discards them with the state row and reports
+// them separately instead of retaining the orphan forever.
+func TestCleanupForeignSyncTargetsDiscardsOrphanDeferredRows(t *testing.T) {
 	s := newTestStore(t)
-	const orphan = "cloud@dddddddddddd"
+	const orphan, live = "cloud@dddddddddddd", "cloud@eeeeeeeeeeee"
 	seedSyncStateRow(t, s, orphan)
-	if _, err := s.DB().Exec(`INSERT INTO sync_apply_deferred (sync_id, entity, payload, target_key) VALUES ('deferred-1', 'observation', '{}', ?)`, orphan); err != nil {
-		t.Fatalf("seed deferred row: %v", err)
+	seedSyncStateRow(t, s, live)
+	for i, key := range []string{orphan, orphan, live} {
+		if _, err := s.DB().Exec(`INSERT INTO sync_apply_deferred (sync_id, entity, payload, target_key) VALUES (?, 'observation', '{}', ?)`, "deferred-"+string(rune('a'+i)), key); err != nil {
+			t.Fatalf("seed deferred row: %v", err)
+		}
+	}
+	liveKeys := map[string]bool{live: true}
+
+	planned, err := s.CleanupForeignSyncTargetsWithLiveRemotes(false, liveKeys)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	action, listed := cleanupActionFor(planned, orphan)
+	if !listed || !action.StateRemoved || action.RetainedMutations != 0 || action.DiscardedDeferred != 2 {
+		t.Fatalf("planned orphan = %+v (listed=%v), want removable with 2 discarded deferred rows", action, listed)
+	}
+	if !syncStateExists(t, s, orphan) || countTargetDeferredRows(t, s, orphan) != 2 {
+		t.Fatal("planning must not delete state or deferred rows")
 	}
 
-	report, err := s.CleanupForeignSyncTargetsWithLiveRemotes(true, map[string]bool{})
-	if err != nil {
-		t.Fatalf("apply: %v", err)
+	applied, err := s.CleanupForeignSyncTargetsWithLiveRemotes(true, liveKeys)
+	if err != nil || !applied.Applied {
+		t.Fatalf("apply: %+v, %v", applied, err)
 	}
-	action, listed := cleanupActionFor(report, orphan)
-	if !listed || action.StateRemoved || action.RetainedMutations != 1 {
-		t.Fatalf("orphan with deferred rows = %+v (listed=%v), want retained", action, listed)
+	action, listed = cleanupActionFor(applied, orphan)
+	if !listed || action.RetainedMutations != 0 || action.DiscardedDeferred != 2 {
+		t.Fatalf("applied orphan = %+v (listed=%v)", action, listed)
 	}
-	if !syncStateExists(t, s, orphan) {
-		t.Fatal("orphan state with deferred rows must be kept")
+	if syncStateExists(t, s, orphan) || countTargetDeferredRows(t, s, orphan) != 0 {
+		t.Fatal("orphan state and its deferred rows must be removed together")
+	}
+	if !syncStateExists(t, s, live) || countTargetDeferredRows(t, s, live) != 1 {
+		t.Fatal("live remote state and its deferred rows must never be touched")
 	}
 }
