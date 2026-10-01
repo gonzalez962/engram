@@ -460,3 +460,111 @@ func TestCmdCloudConfigProjectClearBackToGlobalRequeuesHistory(t *testing.T) {
 		t.Fatalf("clear must catch up from the global remote: %+v", *calls)
 	}
 }
+
+const tokenlessOverrideGuidance = "engram cloud config --project notoken --server <url> --token <token>"
+
+// seedTokenlessOverride routes project "notoken" to a remote with no token,
+// keeps a fully configured global remote, and enrolls the project.
+func seedTokenlessOverride(t *testing.T, cfg store.Config) {
+	t.Helper()
+	t.Setenv(cloudconfig.EnvCloudServer, "")
+	t.Setenv(cloudconfig.EnvCloudToken, "")
+	seed := &cloudConfig{ServerURL: "https://global.example.test", Token: "global-token"}
+	if err := cloudconfig.SetProjectRemote(seed, "notoken", "https://team.example.test", ""); err != nil {
+		t.Fatalf("set override: %v", err)
+	}
+	if err := saveCloudConfig(cfg, seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	if err := s.EnrollProject("notoken"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+}
+
+func TestPreflightCloudSyncTokenlessOverrideBlocksOnlyProjectStatusKey(t *testing.T) {
+	cfg := testConfig(t)
+	seedTokenlessOverride(t, cfg)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := preflightCloudSync(s, cfg, "notoken", true); err == nil || !strings.Contains(err.Error(), tokenlessOverrideGuidance) {
+		t.Fatalf("preflight err = %v, want the tokenless-override error", err)
+	}
+
+	// The reserved inbox row always carries its own lifecycle; every other row
+	// must stay idle and reason-free unless preflight blocked it.
+	rows, err := s.DB().Query(`SELECT target_key, lifecycle, ifnull(reason_code, '') FROM sync_state WHERE target_key <> ? AND (lifecycle <> 'idle' OR reason_code IS NOT NULL) ORDER BY target_key`, store.SyncInboxTargetKey)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	var blocked []string
+	for rows.Next() {
+		var key, lifecycle, reason string
+		if err := rows.Scan(&key, &lifecycle, &reason); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		blocked = append(blocked, key+"|"+lifecycle+"|"+reason)
+	}
+	want := cloudTargetKeyForProject("notoken") + "|" + store.SyncLifecycleDegraded + "|cloud_config_error"
+	if cloudTargetKeyForProject("notoken") != "cloud:notoken" || len(blocked) != 1 || blocked[0] != want {
+		t.Fatalf("blocked sync_state rows = %v, want exactly [%s] (never the global cloud row or a cloud@ remote row)", blocked, want)
+	}
+}
+
+func TestCmdCloudUpgradeRejectsTokenlessOverride(t *testing.T) {
+	for _, sub := range []string{"bootstrap", "remirror", "doctor"} {
+		t.Run(sub, func(t *testing.T) {
+			stubExitWithPanic(t)
+			cfg := testConfig(t)
+			seedTokenlessOverride(t, cfg)
+			called := false
+			oldBootstrap, oldRemirror := runUpgradeBootstrap, runUpgradeRemirror
+			runUpgradeBootstrap = func(*store.Store, string, *cloudconfig.Config) (*engramsync.UpgradeBootstrapResult, error) {
+				called = true
+				return &engramsync.UpgradeBootstrapResult{}, nil
+			}
+			runUpgradeRemirror = func(*store.Store, string, *cloudconfig.Config) (*engramsync.SyncResult, error) {
+				called = true
+				return &engramsync.SyncResult{}, nil
+			}
+			t.Cleanup(func() { runUpgradeBootstrap, runUpgradeRemirror = oldBootstrap, oldRemirror })
+
+			withArgs(t, "engram", "cloud", "upgrade", sub, "--project", "notoken")
+			_, stderr, recovered := captureOutputAndRecover(t, func() { cmdCloud(cfg) })
+			if recovered == nil || !strings.Contains(stderr, tokenlessOverrideGuidance) {
+				t.Fatalf("upgrade %s recovered=%v stderr=%q, want the tokenless-override error", sub, recovered, stderr)
+			}
+			if called {
+				t.Fatalf("upgrade %s must not reach the remote with a tokenless override", sub)
+			}
+		})
+	}
+}
+
+func TestStoreSyncStatusProviderReportsTokenlessOverrideBlocked(t *testing.T) {
+	cfg := testConfig(t)
+	seedTokenlessOverride(t, cfg)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	p := storeSyncStatusProvider{store: s, cfg: cfg}
+	ok, code, msg := p.cloudSyncEnabled("notoken")
+	if ok || code != "cloud_config_error" || !strings.Contains(msg, tokenlessOverrideGuidance) {
+		t.Fatalf("cloudSyncEnabled = (%v, %q, %q), want blocked with the tokenless-override guidance", ok, code, msg)
+	}
+	status := p.Status("notoken")
+	if status.Enabled || status.ReasonCode != "cloud_config_error" {
+		t.Fatalf("status = %+v, want disabled with cloud_config_error", status)
+	}
+}

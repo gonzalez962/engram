@@ -69,7 +69,7 @@ func cmdDoctor(cfg store.Config) {
 		}
 	}
 
-	report, err := runDiagnostics(context.Background(), s, strings.TrimSpace(project), strings.TrimSpace(check))
+	report, err := runDiagnostics(context.Background(), diagnostic.Scope{Store: s, Project: strings.TrimSpace(project), DataDir: cfg.DataDir}, strings.TrimSpace(check))
 	if err != nil {
 		report = diagnostic.ErrorReport(project, err)
 		if jsonOut {
@@ -310,18 +310,19 @@ func cmdDoctorRepair(cfg store.Config) {
 	}
 
 	ctx := context.Background()
-	report, err := runDiagnostics(ctx, s, project, check)
+	scope := diagnostic.Scope{Store: s, Project: project, DataDir: cfg.DataDir}
+	report, err := runDiagnostics(ctx, scope, check)
 	if err != nil {
 		failDoctorRepair(err.Error())
 		return
 	}
-	plan, err := buildRepairPlan(ctx, diagnostic.Scope{Store: s, Project: project}, report, check, mode)
+	plan, err := buildRepairPlan(ctx, scope, report, check, mode)
 	if err != nil {
 		failDoctorRepair(err.Error())
 		return
 	}
 	if check == diagnostic.CheckInvalidSessionIdentity && replacementSelected {
-		plan = diagnostic.PlanSessionIdentityReplacement(diagnostic.Scope{Store: s, Project: project}, report, plan, sourceID, sourceSelected, replacementID)
+		plan = diagnostic.PlanSessionIdentityReplacement(scope, report, plan, sourceID, sourceSelected, replacementID)
 		if plan.Status == "blocked" {
 			writeDoctorRepairJSON(plan)
 			return
@@ -375,29 +376,13 @@ func cmdDoctorRepair(cfg store.Config) {
 		return
 	}
 	if check == diagnostic.CheckSyncTargetClosedSpace {
-		// Per-remote cloud@<id> state is kept for every configured remote and
-		// pruned only when its remote is gone. An unreadable cloud.json leaves
-		// every cloud@ row in place (fail safe) and is reported.
-		liveRemoteKeys, cfgErr := diagnostic.LiveCloudRemoteStateKeys(cfg.DataDir)
-		if cfgErr != nil {
-			plan.Skipped = append(plan.Skipped, diagnostic.RepairSkip{ReasonCode: diagnostic.ReasonCloudConfigUnreadable, Message: fmt.Sprintf("cloud.json could not be read (%v); no cloud@ remote state was pruned", cfgErr)})
-		}
-		cleanup, err := s.CleanupForeignSyncTargetsWithLiveRemotes(mode == diagnostic.RepairModeApply, liveRemoteKeys)
-		if err != nil {
-			failDoctorRepair(err.Error())
-			return
-		}
-		plan.TargetActions = make([]diagnostic.SyncTargetCleanupAction, 0, len(cleanup.Actions))
-		if mode == diagnostic.RepairModeApply && len(cleanup.Actions) > 0 {
-			plan.Status = "applied"
-		}
-		for _, action := range cleanup.Actions {
-			plan.TargetActions = append(plan.TargetActions, diagnostic.SyncTargetCleanupActionFromStore(action))
-			if action.RetainedMutations > 0 && mode == diagnostic.RepairModeApply {
-				plan.Status = "blocked"
-				if cleanup.Applied {
-					plan.Status = "partial"
-				}
+		// BuildRepairPlan already planned the cleanup against the live
+		// per-project remotes in cloud.json (an unreadable cloud.json keeps
+		// every cloud@ row and is reported in Skipped); apply replays it.
+		if mode == diagnostic.RepairModeApply {
+			if err := diagnostic.ApplySyncTargetCleanup(&plan, scope); err != nil {
+				failDoctorRepair(err.Error())
+				return
 			}
 		}
 		writeDoctorRepairJSON(plan)

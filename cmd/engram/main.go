@@ -137,9 +137,11 @@ var (
 	storeExport        = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
 	storeExportProject = func(s *store.Store, project string) (*store.ExportData, error) { return s.ExportProject(project) }
 	jsonMarshalIndent  = json.MarshalIndent
-	runDiagnostics     = func(ctx context.Context, s *store.Store, project, check string) (diagnostic.Report, error) {
+	runDiagnostics     = func(ctx context.Context, scope diagnostic.Scope, check string) (diagnostic.Report, error) {
 		runner := diagnostic.NewRunner()
-		scope := diagnostic.Scope{Store: s, Project: project, Now: time.Now()}
+		if scope.Now.IsZero() {
+			scope.Now = time.Now()
+		}
 		if strings.TrimSpace(check) != "" {
 			return runner.RunOne(ctx, scope, check)
 		}
@@ -485,6 +487,11 @@ func (p storeSyncStatusProvider) cloudSyncEnabled(project string) (bool, string,
 	if strings.TrimSpace(project) == "" {
 		return false, "project_required", "cloud sync status requires an explicit project scope"
 	}
+	if projectOverrideLacksToken(p.cfg, project) {
+		// Autosync skips a tokenless override and explicit sync rejects it, so
+		// status reports it as blocked instead of enabled.
+		return false, constants.ReasonCloudConfigError, tokenlessOverrideMessage(project)
+	}
 	enrolled, err := p.store.IsProjectEnrolled(project)
 	if err != nil {
 		return false, "status_unavailable", fmt.Sprintf("cloud enrollment status is unavailable: %v", err)
@@ -612,8 +619,29 @@ func projectOverrideLacksToken(cfg store.Config, project string) bool {
 	if err != nil {
 		return false
 	}
-	override, routed := cc.Projects[strings.TrimSpace(project)]
+	project = strings.TrimSpace(project)
+	if normalized, _ := store.NormalizeProject(project); strings.TrimSpace(normalized) != "" {
+		project = strings.TrimSpace(normalized)
+	}
+	override, routed := cc.Projects[project]
 	return routed && strings.TrimSpace(override.Token) == ""
+}
+
+// tokenlessOverrideMessage is the actionable guidance every project-scoped
+// cloud operation reports for a project routed to a remote without a token.
+func tokenlessOverrideMessage(project string) string {
+	return fmt.Sprintf("cloud remote override for project %q has no token: set one with `engram cloud config --project %s --server <url> --token <token>`", project, project)
+}
+
+// tokenlessOverrideError returns the tokenless-override error for project, or
+// nil when project is not routed to a tokenless remote. Upgrade commands use
+// it so they fail like explicit sync preflight instead of sending
+// unauthenticated requests to the project's remote.
+func tokenlessOverrideError(cfg store.Config, project string) error {
+	if strings.TrimSpace(project) == "" || !projectOverrideLacksToken(cfg, project) {
+		return nil
+	}
+	return fmt.Errorf("cloud sync %s: %s", constants.ReasonCloudConfigError, tokenlessOverrideMessage(project))
 }
 
 func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutateState bool) (*cloudconfig.Config, error) {
@@ -645,7 +673,7 @@ func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutate
 	if project != "" && projectOverrideLacksToken(cfg, project) {
 		// Autosync skips a tokenless override; explicit sync fails the same way
 		// instead of sending unauthenticated requests to the project's remote.
-		message := fmt.Sprintf("cloud remote override for project %q has no token: set one with `engram cloud config --project %s --server <url> --token <token>`", project, project)
+		message := tokenlessOverrideMessage(project)
 		if mutateState {
 			_ = s.MarkSyncBlocked(targetKey, constants.ReasonCloudConfigError, message)
 		}

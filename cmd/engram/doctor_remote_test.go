@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -112,5 +113,82 @@ func TestCmdDoctorRepairUnreadableCloudConfigPrunesNoRemoteState(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("plan must report the unreadable cloud config: %v", plan)
+	}
+}
+
+func seedProjectRemoteConfig(t *testing.T, cfg store.Config) (live, orphan string) {
+	t.Helper()
+	t.Setenv(cloudconfig.EnvCloudServer, "")
+	t.Setenv(cloudconfig.EnvCloudToken, "")
+	cc := &cloudconfig.Config{ServerURL: "https://global.example.test", Token: "global-token"}
+	if err := cloudconfig.SetProjectRemote(cc, "alpha", "https://team.example.test", "team-token"); err != nil {
+		t.Fatalf("set override: %v", err)
+	}
+	if err := cloudconfig.Save(cfg.DataDir, cc); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	live = cloudconfig.RemoteStateKeyPrefix + cloudconfig.RemoteID("https://team.example.test", "team-token")
+	orphan = cloudconfig.RemoteStateKeyPrefix + cloudconfig.RemoteID("https://team.example.test", "old-token")
+	return live, orphan
+}
+
+func TestCmdDoctorCheckTreatsLiveRemoteStateAsLegitimate(t *testing.T) {
+	cfg := testConfig(t)
+	live, _ := seedProjectRemoteConfig(t, cfg)
+	seedDoctorRemoteStates(t, cfg, live)
+
+	withArgs(t, "engram", "doctor", "--json", "--check", "sync_target_closed_space")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("doctor stderr=%q", stderr)
+	}
+	if report := decodeDoctorReport(t, stdout); report["status"] != "ok" {
+		t.Fatalf("live cloud@ state must not be a finding: %s", stdout)
+	}
+}
+
+func TestCmdDoctorRepairDiscardsOrphanDeferredPullsInsteadOfBlocking(t *testing.T) {
+	cfg := testConfig(t)
+	live, orphan := seedProjectRemoteConfig(t, cfg)
+	seedDoctorRemoteStates(t, cfg, live, orphan)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	for i, key := range []string{orphan, live} {
+		if _, err := s.DB().Exec(`INSERT INTO sync_apply_deferred (sync_id, entity, payload, target_key) VALUES (?, 'observation', '{}', ?)`, fmt.Sprintf("deferred-%d", i), key); err != nil {
+			t.Fatalf("seed deferred: %v", err)
+		}
+	}
+	_ = s.Close()
+
+	withArgs(t, "engram", "doctor", "repair", "--project", "valid", "--check", "sync_target_closed_space", "--dry-run")
+	dryOut, dryErr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if dryErr != "" {
+		t.Fatalf("dry-run stderr=%q", dryErr)
+	}
+	dry := decodeRepairPlan(t, dryOut)
+	dryActions, _ := dry["target_actions"].([]any)
+	if len(dryActions) != 1 || dryActions[0].(map[string]any)["discarded_deferred"] != float64(1) {
+		t.Fatalf("dry-run plan=%v, want the orphan with one deferred row to discard", dry)
+	}
+	if !doctorSyncStateExists(t, cfg, orphan) {
+		t.Fatal("dry-run must not delete the orphan")
+	}
+
+	plan := runDoctorTargetRepairApply(t, cfg)
+	if plan["status"] != "applied" {
+		t.Fatalf("plan=%v, want applied (not blocked)", plan)
+	}
+	actions, _ := plan["target_actions"].([]any)
+	if len(actions) != 1 {
+		t.Fatalf("target_actions=%v, want only the orphan", actions)
+	}
+	action := actions[0].(map[string]any)
+	if action["target_key"] != orphan || action["retained_mutations"] != float64(0) || action["discarded_deferred"] != float64(1) || action["state_removed"] != true {
+		t.Fatalf("orphan action=%v", action)
+	}
+	if doctorSyncStateExists(t, cfg, orphan) || !doctorSyncStateExists(t, cfg, live) {
+		t.Fatal("repair must remove only the orphaned remote state")
 	}
 }
