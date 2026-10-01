@@ -74,5 +74,13 @@ Trigger evidence: mapping needed >5 lookups (explorer used); write touches multi
   which also fails on base `7182fa4` (pre-existing, untouched package). Same result with and without DSN.
 - `go test ./cmd/engram/ -run 'Cloud|Dashboard' -count=1`: ok (with and without DSN)
 
+## Review
+- RDD assess (base 7182fa4, committed-only): medium, `review_due=slice_budget_reached`. Consent: granted.
+- Lineage `review-3ddde1aee3e163d0`, one lens (reliability): approved and acknowledged.
+- Advisory (non-blocking) follow-ups:
+  - R3-cache-invalidation-scope: other writes to `cloud_project_controls` (pause/resume, removal)
+    must also invalidate the dashboard read model; consider a generation guard against stale builds.
+  - R3-failclosed-masks-outage: registry load failure maps to Forbidden (403) instead of 5xx.
+
 ## Next step
 User decides on push/PR. Pre-existing chunkcodec failure is out of scope.
