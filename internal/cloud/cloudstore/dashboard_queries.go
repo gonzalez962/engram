@@ -107,6 +107,10 @@ type dashboardReadModel struct {
 	contributors   []DashboardContributorRow
 	projectDetails map[string]DashboardProjectDetail
 	admin          DashboardAdminOverview
+	// registeredProjects lists the admin-registered projects (rows in
+	// cloud_project_controls) captured when the model was built. Together
+	// with the env allowlist they form the deployment scope.
+	registeredProjects []string
 }
 
 type dashboardEntityKey struct {
@@ -733,6 +737,18 @@ func applyDashboardMutation(
 	return nil
 }
 
+// scopedTo filters the model to the deployment scope. A restricted scope with
+// no projects yields an empty model rather than an unfiltered one.
+func (m dashboardReadModel) scopedTo(scope dashboardDeploymentScope) dashboardReadModel {
+	if scope.all {
+		return m
+	}
+	if len(scope.projects) == 0 {
+		return dashboardReadModel{projects: []DashboardProjectRow{}, contributors: []DashboardContributorRow{}, projectDetails: map[string]DashboardProjectDetail{}}
+	}
+	return m.scoped(scope.projects)
+}
+
 func (m dashboardReadModel) scoped(allowed map[string]struct{}) dashboardReadModel {
 	// Empty map or wildcard sentinel "*" means no filtering.
 	if len(allowed) == 0 {
@@ -925,11 +941,16 @@ func (cs *CloudStore) loadDashboardReadModel() (dashboardReadModel, error) {
 }
 
 func (cs *CloudStore) buildDashboardReadModel() (dashboardReadModel, error) {
-	chunks, err := cs.loadChunkRows("")
+	registered, err := cs.loadRegisteredDashboardProjects()
 	if err != nil {
 		return dashboardReadModel{}, err
 	}
-	mutations, err := cs.loadMutationRows("")
+	scope := cs.dashboardScope(registered)
+	chunks, err := cs.loadChunkRows(scope)
+	if err != nil {
+		return dashboardReadModel{}, err
+	}
+	mutations, err := cs.loadMutationRows(scope)
 	if err != nil {
 		return dashboardReadModel{}, err
 	}
@@ -937,7 +958,9 @@ func (cs *CloudStore) buildDashboardReadModel() (dashboardReadModel, error) {
 	if err != nil {
 		return dashboardReadModel{}, err
 	}
-	return model.scoped(cs.dashboardAllowedScopes), nil
+	model = model.withRegisteredProjects(registered).scopedTo(scope)
+	model.registeredProjects = registered
+	return model, nil
 }
 
 func (cs *CloudStore) ListProjects(query string) ([]DashboardProjectRow, error) {
@@ -1051,13 +1074,18 @@ func (cs *CloudStore) normalizeDashboardProject(project string) (string, error) 
 	if project == "" {
 		return "", fmt.Errorf("%w", ErrDashboardProjectInvalid)
 	}
-	if cs.dashboardAllowedAll {
+	if cs.dashboardScope(nil).allows(project) {
 		return project, nil
 	}
-	if len(cs.dashboardAllowedScopes) > 0 {
-		if _, ok := cs.dashboardAllowedScopes[project]; !ok {
-			return "", fmt.Errorf("%w", ErrDashboardProjectForbidden)
-		}
+	// Outside the env allowlist: the project may still be admin-registered.
+	// Registered projects are captured by the cached read model; failing to
+	// load it fails closed as forbidden while preserving the cause.
+	model, err := cs.loadDashboardReadModel()
+	if err != nil {
+		return "", fmt.Errorf("%w: resolve deployment scope: %w", ErrDashboardProjectForbidden, err)
+	}
+	if !cs.dashboardScope(model.registeredProjects).allows(project) {
+		return "", fmt.Errorf("%w", ErrDashboardProjectForbidden)
 	}
 	return project, nil
 }
@@ -1106,16 +1134,17 @@ func (cs *CloudStore) DashboardStoreForProjects(projects []string) (*DashboardSc
 		}
 	}
 
+	scope := cs.dashboardScope(model.registeredProjects)
 	allowed := principalAllowed
-	if !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
+	if !scope.all {
 		allowed = make(map[string]struct{})
 		if principalAll {
-			for project := range cs.dashboardAllowedScopes {
+			for project := range scope.projects {
 				allowed[project] = struct{}{}
 			}
 		} else {
 			for project := range principalAllowed {
-				if _, ok := cs.dashboardAllowedScopes[project]; ok {
+				if scope.allows(project) {
 					allowed[project] = struct{}{}
 				}
 			}
@@ -1526,33 +1555,15 @@ type dashboardMutationRow struct {
 	occurredAt time.Time
 }
 
-func (cs *CloudStore) loadChunkRows(project string) ([]dashboardChunkRow, error) {
+func (cs *CloudStore) loadChunkRows(scope dashboardDeploymentScope) ([]dashboardChunkRow, error) {
 	if cs == nil || cs.db == nil {
 		return nil, fmt.Errorf("cloudstore: not initialized")
 	}
-	project = strings.TrimSpace(project)
 	query := `SELECT chunk_id, project_name, created_by, created_at, payload FROM cloud_chunks`
 	args := []any{}
-	if project == "" && !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
-		allowed := make([]string, 0, len(cs.dashboardAllowedScopes))
-		for name := range cs.dashboardAllowedScopes {
-			allowed = append(allowed, name)
-		}
-		sort.Strings(allowed)
+	if !scope.all {
 		query += ` WHERE project_name = ANY($1)`
-		args = append(args, allowed)
-	}
-	if project != "" {
-		if !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
-			if _, ok := cs.dashboardAllowedScopes[project]; !ok {
-				return []dashboardChunkRow{}, nil
-			}
-		}
-		if len(args) > 0 {
-			return nil, fmt.Errorf("cloudstore: internal dashboard query invariant violated")
-		}
-		query += ` WHERE project_name = $1`
-		args = append(args, project)
+		args = append(args, scope.sortedProjects())
 	}
 	query += ` ORDER BY created_at DESC, chunk_id DESC`
 	rows, err := cs.db.QueryContext(context.Background(), query, args...)
@@ -1583,33 +1594,15 @@ func (cs *CloudStore) loadChunkRows(project string) ([]dashboardChunkRow, error)
 	return result, nil
 }
 
-func (cs *CloudStore) loadMutationRows(project string) ([]dashboardMutationRow, error) {
+func (cs *CloudStore) loadMutationRows(scope dashboardDeploymentScope) ([]dashboardMutationRow, error) {
 	if cs == nil || cs.db == nil {
 		return nil, fmt.Errorf("cloudstore: not initialized")
 	}
-	project = strings.TrimSpace(project)
 	query := `SELECT seq, project, entity, entity_key, op, payload::text, occurred_at FROM cloud_mutations`
 	args := []any{}
-	if project == "" && !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
-		allowed := make([]string, 0, len(cs.dashboardAllowedScopes))
-		for name := range cs.dashboardAllowedScopes {
-			allowed = append(allowed, name)
-		}
-		sort.Strings(allowed)
+	if !scope.all {
 		query += ` WHERE project = ANY($1)`
-		args = append(args, allowed)
-	}
-	if project != "" {
-		if !cs.dashboardAllowedAll && len(cs.dashboardAllowedScopes) > 0 {
-			if _, ok := cs.dashboardAllowedScopes[project]; !ok {
-				return []dashboardMutationRow{}, nil
-			}
-		}
-		if len(args) > 0 {
-			return nil, fmt.Errorf("cloudstore: internal dashboard mutation query invariant violated")
-		}
-		query += ` WHERE project = $1`
-		args = append(args, project)
+		args = append(args, scope.sortedProjects())
 	}
 	query += ` ORDER BY seq ASC, occurred_at ASC`
 	rows, err := cs.db.QueryContext(context.Background(), query, args...)
