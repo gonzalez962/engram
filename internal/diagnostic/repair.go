@@ -29,6 +29,7 @@ var repairImplementations = map[string]struct{}{
 	CheckManualSessionNameProjectMismatch: {},
 	CheckInvalidSessionIdentity:           {},
 	CheckOrphanedObservationSession:       {},
+	CheckOrphanedPendingRelations:         {},
 	CheckSyncMutationRequiredFields:       {},
 	CheckSyncTargetClosedSpace:            {},
 }
@@ -75,6 +76,8 @@ type RepairCounts struct {
 	PromptsApplied            int64 `json:"prompts_applied"`
 	CorrectedMutationsPlanned int64 `json:"corrected_mutations_planned"`
 	CorrectedMutationsApplied int64 `json:"corrected_mutations_applied"`
+	RelationsPlanned          int64 `json:"relations_planned"`
+	RelationsApplied          int64 `json:"relations_applied"`
 }
 
 // SyncTargetCleanupAction identifies one sync target doctor can remove without
@@ -101,10 +104,14 @@ type RepairPlan struct {
 	TargetActions       []SyncTargetCleanupAction          `json:"target_actions,omitempty"`
 	PlaceholderSessions []store.OrphanedSessionPlaceholder `json:"placeholder_sessions,omitempty"`
 	IdentityRepair      *store.SessionIdentityRepairPlan   `json:"identity_repair,omitempty"`
-	Blockers            []RepairSkip                       `json:"blockers,omitempty"`
-	Skipped             []RepairSkip                       `json:"skipped,omitempty"`
-	Counts              RepairCounts                       `json:"counts"`
-	BackupPath          string                             `json:"backup_path,omitempty"`
+	// OrphanedPendingRelations carries the fresh store evidence behind the
+	// orphaned_pending_relations repair: candidate rows plus the
+	// one-endpoint-missing and live pending counts the repair will not touch.
+	OrphanedPendingRelations *store.OrphanedPendingRelationEvidenceReport `json:"orphaned_pending_relations,omitempty"`
+	Blockers                 []RepairSkip                                 `json:"blockers,omitempty"`
+	Skipped                  []RepairSkip                                 `json:"skipped,omitempty"`
+	Counts                   RepairCounts                                 `json:"counts"`
+	BackupPath               string                                       `json:"backup_path,omitempty"`
 }
 
 func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check string, mode RepairMode) (RepairPlan, error) {
@@ -134,6 +141,10 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 		planInvalidSessionIdentityRepair(&plan, report)
 	case CheckOrphanedObservationSession:
 		planOrphanedObservationSessionRepair(&plan, report)
+	case CheckOrphanedPendingRelations:
+		if err := planOrphanedPendingRelationsRepair(&plan, scope); err != nil {
+			return RepairPlan{}, err
+		}
 	case CheckSyncTargetClosedSpace:
 		if err := planForeignSyncTargetCleanup(&plan, scope); err != nil {
 			return RepairPlan{}, err
@@ -143,10 +154,28 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 	}
 
 	dedupeAndSortRepairPlan(&plan)
-	if len(plan.Actions) == 0 && len(plan.TargetActions) == 0 && len(plan.PlaceholderSessions) == 0 {
+	if len(plan.Actions) == 0 && len(plan.TargetActions) == 0 && len(plan.PlaceholderSessions) == 0 && plan.OrphanedPendingRelations == nil {
 		plan.Status = "noop"
 	}
 	return plan, nil
+}
+
+// planOrphanedPendingRelationsRepair derives its candidates from fresh store
+// evidence instead of the doctor report: both-endpoints-absent rows belong to
+// no project, so the planner never scopes or filters them. Plan and dry-run
+// only report; apply revalidates the predicate again inside the store
+// transaction.
+func planOrphanedPendingRelationsRepair(plan *RepairPlan, scope Scope) error {
+	evidence, err := scope.Store.ListOrphanedPendingRelationEvidence()
+	if err != nil {
+		return err
+	}
+	if len(evidence.Candidates) == 0 {
+		return nil
+	}
+	plan.OrphanedPendingRelations = &evidence
+	plan.Counts.RelationsPlanned = int64(len(evidence.Candidates))
+	return nil
 }
 
 func planForeignSyncTargetCleanup(plan *RepairPlan, scope Scope) error {

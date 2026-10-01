@@ -95,6 +95,24 @@ functions fail CI. Removed entries pass and report that the debt tightened;
 review and deliberately refresh the baseline with `make deadcode-baseline` in
 the same change. Do not update a baseline merely to accept new debt.
 
+The default analyzer runs with command-scoped `GOTOOLCHAIN=go<version>+auto`,
+where `<version>` comes from the `go` directive in the repository's `go.mod`,
+not its optional `toolchain` directive or your ambient `GOTOOLCHAIN`. Go may
+automatically download that toolchain (or a newer required toolchain); the default
+analyzer requires a Go 1.21 or newer launcher for toolchain selection. Allow
+download access or provide the toolchain locally. Missing or invalid module
+minimums and analyzer/toolchain failures stop the check; a failed analyzer never
+refreshes the baseline.
+
+`DEADCODE_RATCHET_ANALYZER` bypasses this selection entirely: owners of that
+explicit executable override are responsible for its compatible toolchain and
+analyzer behavior. `--compare <baseline> <candidate>` only compares identity
+files and does not invoke Go.
+
+Patchless minimums from Go 1.21 onward select the `.0` release (for example,
+`go 1.24` selects `go1.24.0+auto`). Explicit patches and historical release
+names through Go 1.20 are preserved.
+
 ### Performance Ratchet
 
 Pushes to `main` compare the store search and scan benchmarks with the exact

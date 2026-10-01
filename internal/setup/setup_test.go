@@ -336,7 +336,8 @@ func TestInstallCodexWindowsPreservesLeadingBOM(t *testing.T) {
 	resetSetupSeams(t)
 	useIsolatedProfile(t)
 	runtimeGOOS = "windows"
-	lookPathFn = func(string) (string, error) { return "", errors.New("not found") }
+	lookPathFn = func(string) (string, error) { return "mock-codex", nil }
+	runCommand = func(string, ...string) ([]byte, error) { return []byte("ok"), nil }
 	osExecutable = func() (string, error) { return `C:\Engram\engram.exe`, nil }
 	configPath := codexConfigPath()
 	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
@@ -369,7 +370,8 @@ func TestInstallCodexWindowsWritesOneCanonicalHookMarker(t *testing.T) {
 	resetSetupSeams(t)
 	useIsolatedProfile(t)
 	runtimeGOOS = "windows"
-	lookPathFn = func(string) (string, error) { return "", errors.New("not found") }
+	lookPathFn = func(string) (string, error) { return "mock-codex", nil }
+	runCommand = func(string, ...string) ([]byte, error) { return []byte("ok"), nil }
 
 	first := `C:\Program Files\Engram\工具\engram.exe`
 	second := `C:\Program Files\Engram Next\工具\engram.exe`
@@ -482,6 +484,8 @@ func TestInstallCodexInjectsTOMLAndIsIdempotent(t *testing.T) {
 	resetSetupSeams(t)
 	useIsolatedProfile(t)
 	runtimeGOOS = "linux"
+	lookPathFn = func(string) (string, error) { return "mock-codex", nil }
+	runCommand = func(string, ...string) ([]byte, error) { return []byte("ok"), nil }
 
 	configPath := codexConfigPath()
 	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
@@ -547,23 +551,11 @@ func TestInstallCodexInjectsTOMLAndIsIdempotent(t *testing.T) {
 		if !strings.Contains(text, `args = ["mcp", "--tools=agent"]`) {
 			t.Fatalf("expected engram args in config, got:\n%s", text)
 		}
-		instructionsPath := codexInstructionsPath()
-		if !strings.Contains(text, fmt.Sprintf("model_instructions_file = %q", instructionsPath)) {
-			t.Fatalf("expected model_instructions_file in config, got:\n%s", text)
+		if strings.Contains(text, "model_instructions_file") {
+			t.Fatalf("did not expect model_instructions_file (it replaces Codex's built-in prompt), got:\n%s", text)
 		}
-		compactPromptPath := codexCompactPromptPath()
-		if !strings.Contains(text, fmt.Sprintf("experimental_compact_prompt_file = %q", compactPromptPath)) {
-			t.Fatalf("expected compact prompt file key in config, got:\n%s", text)
-		}
-		firstSection := strings.Index(text, "[profile]")
-		if firstSection == -1 {
-			t.Fatalf("expected [profile] section in config")
-		}
-		if idx := strings.Index(text, "model_instructions_file"); idx == -1 || idx > firstSection {
-			t.Fatalf("expected model_instructions_file to be top-level before sections, got:\n%s", text)
-		}
-		if idx := strings.Index(text, "experimental_compact_prompt_file"); idx == -1 || idx > firstSection {
-			t.Fatalf("expected compact prompt key to be top-level before sections, got:\n%s", text)
+		if strings.Contains(text, "experimental_compact_prompt_file") {
+			t.Fatalf("did not expect experimental_compact_prompt_file, got:\n%s", text)
 		}
 		return text
 	}
@@ -599,6 +591,76 @@ func TestInstallCodexInjectsTOMLAndIsIdempotent(t *testing.T) {
 
 // TestInstallCodexPluginCLIPresent verifies that when the codex CLI is in PATH,
 // installCodex() runs marketplace add + plugin add with the correct arguments.
+func assertCodexPluginSetupError(t *testing.T, result *Result, err error, reason string) {
+	t.Helper()
+	if result != nil || err == nil {
+		t.Fatalf("expected nil result and partial setup error, got %#v, %v", result, err)
+	}
+	for _, want := range []string{reason, "MCP config and instruction files were written", "plugin was not installed", "codex plugin marketplace add " + codexMarketplace + " --ref main", "codex plugin add engram@engram"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err, want)
+		}
+	}
+	for _, path := range []string{codexConfigPath(), codexInstructionsPath(), codexCompactPromptPath()} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Errorf("partial setup file %s missing: %v", path, statErr)
+		}
+	}
+}
+
+func TestInstallCodexPluginFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		failCall int
+		want     string
+	}{
+		{"marketplace failure", 1, "marketplace add failed"},
+		{"plugin failure", 2, "plugin add failed"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetSetupSeams(t)
+			useIsolatedProfile(t)
+			lookPathFn = func(string) (string, error) { return "mock-codex", nil }
+			calls := 0
+			failure := errors.New("mock command failure")
+			runCommand = func(name string, args ...string) ([]byte, error) {
+				calls++
+				if calls == tt.failCall {
+					return []byte("mock diagnostic"), failure
+				}
+				return []byte("ok"), nil
+			}
+			result, err := Install("codex")
+			assertCodexPluginSetupError(t, result, err, tt.want)
+			if err != nil && (!errors.Is(err, failure) || !strings.Contains(err.Error(), "mock diagnostic")) {
+				t.Errorf("command cause/output missing: %v", err)
+			}
+			if calls != tt.failCall {
+				t.Errorf("got %d commands, want %d", calls, tt.failCall)
+			}
+		})
+	}
+}
+
+func TestRemoveTopLevelTOMLKeyWhitespace(t *testing.T) {
+	for _, key := range []string{"model_instructions_file", "experimental_compact_prompt_file"} {
+		for _, whitespace := range []string{"", " ", "\t", " \t "} {
+			t.Run(key+strconv.Quote(whitespace), func(t *testing.T) {
+				preserved := key + "_extra = \"keep\"\nother = \"keep\"\n[profile]\n" + key + "\t= \"table value\"\n"
+				input := "\ufeff" + key + whitespace + "= \"legacy\"\n" + preserved
+				want := "\ufeff" + preserved
+				got := removeTopLevelTOMLKey(input, key)
+				if got != want {
+					t.Fatalf("got %q, want %q", got, want)
+				}
+				if again := removeTopLevelTOMLKey(got, key); again != got {
+					t.Fatalf("not idempotent: %q", again)
+				}
+			})
+		}
+	}
+}
+
 func TestInstallCodexPluginCLIPresent(t *testing.T) {
 	resetSetupSeams(t)
 	useIsolatedProfile(t)
@@ -655,8 +717,8 @@ func TestInstallCodexPluginCLIPresent(t *testing.T) {
 	}
 }
 
-// TestInstallCodexPluginCLIAbsent verifies that when the codex CLI is not in
-// PATH, installCodex() does not fail — MCP config is still written and Files==3.
+// TestInstallCodexPluginCLIAbsent verifies partial setup fails honestly when
+// the Codex CLI is unavailable, while preserving the files already written.
 func TestInstallCodexPluginCLIAbsent(t *testing.T) {
 	resetSetupSeams(t)
 	useIsolatedProfile(t)
@@ -670,15 +732,7 @@ func TestInstallCodexPluginCLIAbsent(t *testing.T) {
 	}
 
 	result, err := Install("codex")
-	if err != nil {
-		t.Fatalf("Install(codex) should succeed even without codex CLI, got: %v", err)
-	}
-	if result.Agent != "codex" {
-		t.Fatalf("unexpected agent: %q", result.Agent)
-	}
-	if result.Files != 3 {
-		t.Fatalf("expected 3 files written, got %d", result.Files)
-	}
+	assertCodexPluginSetupError(t, result, err, "codex CLI not found")
 
 	// Verify the TOML config was still written.
 	configPath := codexConfigPath()
@@ -760,7 +814,9 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if result.Agent != "pi" || result.Destination != agentDir || result.Files != 1 {
 		t.Fatalf("unexpected install result: %#v", result)
 	}
-	wantCommands := []string{"pi install npm:gentle-engram@0.1.16", "pi install npm:pi-mcp-adapter"}
+	// Pi >= 0.99.0 ships built-in MCP and an installed pi-mcp-adapter replaces it,
+	// so setup must never install the adapter.
+	wantCommands := []string{"pi install npm:gentle-engram@0.1.16"}
 	if !reflect.DeepEqual(commands, wantCommands) {
 		t.Fatalf("unexpected pi install commands: got %#v want %#v", commands, wantCommands)
 	}
@@ -775,10 +831,8 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if err := json.Unmarshal(settingsRaw, &settings); err != nil {
 		t.Fatalf("parse settings: %v", err)
 	}
-	for _, pkg := range []string{"npm:gentle-engram@0.1.16", "npm:pi-mcp-adapter"} {
-		if !slices.Contains(settings.Packages, pkg) {
-			t.Fatalf("expected settings packages to include %q, got %#v", pkg, settings.Packages)
-		}
+	if want := []string{"npm:gentle-engram@0.1.16"}; !reflect.DeepEqual(settings.Packages, want) {
+		t.Fatalf("expected fresh settings packages %#v without pi-mcp-adapter, got %#v", want, settings.Packages)
 	}
 
 	if _, err := os.Stat(filepath.Join(agentDir, "mcp.json")); !os.IsNotExist(err) {
@@ -939,6 +993,33 @@ func TestEnsurePiPackageSettingsMigratesLegacyPackageIdempotently(t *testing.T) 
 	}
 	if changed {
 		t.Fatal("expected repeated package migration to leave settings unchanged")
+	}
+}
+
+func TestEnsurePiPackageSettingsDoesNotAddMCPAdapter(t *testing.T) {
+	resetSetupSeams(t)
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.16"]}`), 0644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	original, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+
+	changed, err := ensurePiPackageSettings(settingsPath)
+	if err != nil {
+		t.Fatalf("ensure Pi packages: %v", err)
+	}
+	if changed {
+		t.Fatal("expected settings without pi-mcp-adapter to stay unchanged")
+	}
+	after, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings after ensure: %v", err)
+	}
+	if string(after) != string(original) {
+		t.Fatalf("expected settings to stay byte-identical, got %s", after)
 	}
 }
 
@@ -2710,7 +2791,7 @@ func TestInstallCodexErrorPropagation(t *testing.T) {
 		resetSetupSeams(t)
 		writeCodexMemoryInstructionFilesFn = func() (string, error) { return "/tmp/instructions", nil }
 		injectCodexMCPFn = func(string, string) error { return nil }
-		injectCodexMemoryConfigFn = func(string, string, string) error { return errors.New("memory config failed") }
+		injectCodexMemoryConfigFn = func(string) error { return errors.New("memory config failed") }
 
 		_, err := installCodex()
 		if err == nil || !strings.Contains(err.Error(), "memory config failed") {
@@ -2936,16 +3017,16 @@ func TestGeminiAndCodexHelpersErrorPaths(t *testing.T) {
 			t.Fatalf("make config path directory: %v", err)
 		}
 
-		err := injectCodexMemoryConfig(configPath, "/tmp/instructions.md", "/tmp/compact.md")
+		err := injectCodexMemoryConfig(configPath)
 		if err == nil || !strings.Contains(err.Error(), "read config") {
 			t.Fatalf("expected read config error, got %v", err)
 		}
 	})
 
-	t.Run("injectCodexMemoryConfig creates missing config", func(t *testing.T) {
+	t.Run("injectCodexMemoryConfig creates missing config without override keys", func(t *testing.T) {
 		configPath := filepath.Join(t.TempDir(), "config.toml")
 
-		err := injectCodexMemoryConfig(configPath, "/tmp/instructions.md", "/tmp/compact.md")
+		err := injectCodexMemoryConfig(configPath)
 		if err != nil {
 			t.Fatalf("injectCodexMemoryConfig failed: %v", err)
 		}
@@ -2955,11 +3036,41 @@ func TestGeminiAndCodexHelpersErrorPaths(t *testing.T) {
 			t.Fatalf("read config: %v", err)
 		}
 		text := string(raw)
-		if !strings.Contains(text, "model_instructions_file = \"/tmp/instructions.md\"") {
-			t.Fatalf("expected model_instructions_file in config, got:\n%s", text)
+		if strings.Contains(text, "model_instructions_file") {
+			t.Fatalf("did not expect model_instructions_file in config, got:\n%s", text)
 		}
-		if !strings.Contains(text, "experimental_compact_prompt_file = \"/tmp/compact.md\"") {
-			t.Fatalf("expected compact prompt file in config, got:\n%s", text)
+		if strings.Contains(text, "experimental_compact_prompt_file") {
+			t.Fatalf("did not expect experimental_compact_prompt_file in config, got:\n%s", text)
+		}
+	})
+
+	t.Run("injectCodexMemoryConfig strips legacy override keys", func(t *testing.T) {
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		legacy := "model = \"gpt-5\"\n" +
+			"model_instructions_file = \"/home/u/.codex/engram-instructions.md\"\n" +
+			"experimental_compact_prompt_file = \"/home/u/.codex/engram-compact-prompt.md\"\n" +
+			"\n[projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n"
+		if err := os.WriteFile(configPath, []byte(legacy), 0644); err != nil {
+			t.Fatalf("seed config: %v", err)
+		}
+
+		if err := injectCodexMemoryConfig(configPath); err != nil {
+			t.Fatalf("injectCodexMemoryConfig failed: %v", err)
+		}
+
+		raw, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatalf("read config: %v", err)
+		}
+		text := string(raw)
+		if strings.Contains(text, "model_instructions_file") || strings.Contains(text, "experimental_compact_prompt_file") {
+			t.Fatalf("expected legacy override keys removed, got:\n%s", text)
+		}
+		if !strings.Contains(text, "model = \"gpt-5\"") {
+			t.Fatalf("expected unrelated top-level key preserved, got:\n%s", text)
+		}
+		if !strings.Contains(text, "trust_level = \"trusted\"") {
+			t.Fatalf("expected section content preserved, got:\n%s", text)
 		}
 	})
 
@@ -2970,7 +3081,7 @@ func TestGeminiAndCodexHelpersErrorPaths(t *testing.T) {
 			return errors.New("write config boom")
 		}
 
-		err := injectCodexMemoryConfig(configPath, "/tmp/instructions.md", "/tmp/compact.md")
+		err := injectCodexMemoryConfig(configPath)
 		if err == nil || !strings.Contains(err.Error(), "write config") {
 			t.Fatalf("expected write config error, got %v", err)
 		}
@@ -3159,6 +3270,7 @@ func TestAdditionalHelperBranches(t *testing.T) {
 		if err := os.WriteFile(blocked, []byte("x"), 0644); err != nil {
 			t.Fatalf("write home file: %v", err)
 		}
+		t.Setenv("CODEX_HOME", "")
 		userHomeDir = func() (string, error) { return blocked, nil }
 		runtimeGOOS = "linux"
 
