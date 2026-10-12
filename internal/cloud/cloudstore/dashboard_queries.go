@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/chunkcodec"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v3/internal/sync"
 )
 
 var ErrDashboardProjectInvalid = errors.New("cloudstore: dashboard project is invalid")
@@ -819,6 +819,7 @@ func (m dashboardReadModel) scoped(allowed map[string]struct{}) dashboardReadMod
 			Contributors: len(contributors),
 			Chunks:       totalChunks,
 		},
+		registeredProjects: m.registeredProjects,
 	}
 }
 
@@ -904,7 +905,16 @@ func (m dashboardReadModel) filterPrompts(project, query string) []DashboardProm
 	return rows
 }
 
+// loadDashboardReadModel applies legacy deployment policy at every read boundary.
 func (cs *CloudStore) loadDashboardReadModel() (dashboardReadModel, error) {
+	model, err := cs.loadDashboardNeutralReadModel()
+	if err != nil {
+		return dashboardReadModel{}, err
+	}
+	return model.scoped(cs.dashboardAllowedScopes), nil
+}
+
+func (cs *CloudStore) loadDashboardNeutralReadModel() (dashboardReadModel, error) {
 	if cs == nil {
 		return dashboardReadModel{}, fmt.Errorf("cloudstore: not initialized")
 	}
@@ -946,11 +956,11 @@ func (cs *CloudStore) buildDashboardReadModel() (dashboardReadModel, error) {
 		return dashboardReadModel{}, err
 	}
 	scope := cs.dashboardScope(registered)
-	chunks, err := cs.loadChunkRows(scope)
+	chunks, err := cs.loadChunkRows(scope, "")
 	if err != nil {
 		return dashboardReadModel{}, err
 	}
-	mutations, err := cs.loadMutationRows(scope)
+	mutations, err := cs.loadMutationRows(scope, "")
 	if err != nil {
 		return dashboardReadModel{}, err
 	}
@@ -958,7 +968,7 @@ func (cs *CloudStore) buildDashboardReadModel() (dashboardReadModel, error) {
 	if err != nil {
 		return dashboardReadModel{}, err
 	}
-	model = model.withRegisteredProjects(registered).scopedTo(scope)
+	model = model.withRegisteredProjectNames(registered).scopedTo(scope)
 	model.registeredProjects = registered
 	return model, nil
 }
@@ -1106,20 +1116,31 @@ func (cs *CloudStore) AdminOverview() (DashboardAdminOverview, error) {
 }
 
 // DashboardScopedStore is an immutable, request-owned view over CloudStore's
-// deployment-scoped dashboard read model. It never updates the shared cache.
+// permission-neutral dashboard read model. It never updates the shared cache.
 type DashboardScopedStore struct {
 	base    *CloudStore
 	model   dashboardReadModel
 	allowed map[string]struct{}
 }
 
-// DashboardStoreForProjects intersects the already deployment-scoped cached
-// model with the supplied principal grants. An empty grant set intentionally
-// produces an empty view rather than widening access.
+// DashboardStoreForProjects scopes the neutral cache by managed grants only.
+// An empty grant set intentionally produces an empty view, never wildcard access.
 func (cs *CloudStore) DashboardStoreForProjects(projects []string) (*DashboardScopedStore, error) {
-	model, err := cs.loadDashboardReadModel()
+	model, err := cs.loadDashboardNeutralReadModel()
 	if err != nil {
 		return nil, err
+	}
+	// Grants carry normalized identities, while the read model retains canonical
+	// names. An ambiguous identity must authorize neither project, even when a
+	// canonical name itself equals that identity.
+	canonicalByGrant := make(map[string]string, len(model.projects))
+	for _, row := range model.projects {
+		key := NormalizeProjectGrant(row.Project)
+		if _, exists := canonicalByGrant[key]; exists {
+			canonicalByGrant[key] = ""
+		} else {
+			canonicalByGrant[key] = row.Project
+		}
 	}
 	principalAllowed := make(map[string]struct{}, len(projects))
 	principalAll := false
@@ -1128,28 +1149,14 @@ func (cs *CloudStore) DashboardStoreForProjects(projects []string) (*DashboardSc
 			principalAll = true
 			continue
 		}
-		project = NormalizeProjectGrant(project)
-		if project != "" {
-			principalAllowed[project] = struct{}{}
+		key := NormalizeProjectGrant(project)
+		if canonical := canonicalByGrant[key]; key != "" && canonical != "" {
+			principalAllowed[canonical] = struct{}{}
 		}
 	}
 
-	scope := cs.dashboardScope(model.registeredProjects)
 	allowed := principalAllowed
-	if !scope.all {
-		allowed = make(map[string]struct{})
-		if principalAll {
-			for project := range scope.projects {
-				allowed[project] = struct{}{}
-			}
-		} else {
-			for project := range principalAllowed {
-				if scope.allows(project) {
-					allowed[project] = struct{}{}
-				}
-			}
-		}
-	} else if principalAll {
+	if principalAll {
 		allowed = map[string]struct{}{"*": {}}
 	}
 
@@ -1167,10 +1174,14 @@ func (s *DashboardScopedStore) scopedProject(project string) (string, error) {
 	if project == "" {
 		return "", ErrDashboardProjectInvalid
 	}
-	if _, all := s.allowed["*"]; !all {
-		if _, ok := s.allowed[project]; !ok {
+	if _, all := s.allowed["*"]; all {
+		if _, ok := s.model.projectDetails[project]; !ok {
 			return "", ErrDashboardProjectForbidden
 		}
+		return project, nil
+	}
+	if _, ok := s.allowed[project]; !ok {
+		return "", ErrDashboardProjectForbidden
 	}
 	return project, nil
 }
@@ -1555,13 +1566,20 @@ type dashboardMutationRow struct {
 	occurredAt time.Time
 }
 
-func (cs *CloudStore) loadChunkRows(scope dashboardDeploymentScope) ([]dashboardChunkRow, error) {
+func (cs *CloudStore) loadChunkRows(scope dashboardDeploymentScope, project string) ([]dashboardChunkRow, error) {
 	if cs == nil || cs.db == nil {
 		return nil, fmt.Errorf("cloudstore: not initialized")
 	}
+	project = strings.TrimSpace(project)
 	query := `SELECT chunk_id, project_name, created_by, created_at, payload FROM cloud_chunks`
 	args := []any{}
-	if !scope.all {
+	if project != "" {
+		if !scope.all && !scope.allows(project) {
+			return []dashboardChunkRow{}, nil
+		}
+		query += ` WHERE project_name = $1`
+		args = append(args, project)
+	} else if !scope.all {
 		query += ` WHERE project_name = ANY($1)`
 		args = append(args, scope.sortedProjects())
 	}
@@ -1594,13 +1612,20 @@ func (cs *CloudStore) loadChunkRows(scope dashboardDeploymentScope) ([]dashboard
 	return result, nil
 }
 
-func (cs *CloudStore) loadMutationRows(scope dashboardDeploymentScope) ([]dashboardMutationRow, error) {
+func (cs *CloudStore) loadMutationRows(scope dashboardDeploymentScope, project string) ([]dashboardMutationRow, error) {
 	if cs == nil || cs.db == nil {
 		return nil, fmt.Errorf("cloudstore: not initialized")
 	}
+	project = strings.TrimSpace(project)
 	query := `SELECT seq, project, entity, entity_key, op, payload::text, occurred_at FROM cloud_mutations`
 	args := []any{}
-	if !scope.all {
+	if project != "" {
+		if !scope.all && !scope.allows(project) {
+			return []dashboardMutationRow{}, nil
+		}
+		query += ` WHERE project = $1`
+		args = append(args, project)
+	} else if !scope.all {
 		query += ` WHERE project = ANY($1)`
 		args = append(args, scope.sortedProjects())
 	}

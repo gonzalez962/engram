@@ -30,8 +30,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	projectpkg "github.com/Gentleman-Programming/engram/v2/internal/project"
-	"github.com/Gentleman-Programming/engram/v2/internal/timeutil"
+	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
+	"github.com/Gentleman-Programming/engram/v3/internal/timeutil"
+	"golang.org/x/text/unicode/norm"
 	sqlite "modernc.org/sqlite"
 )
 
@@ -92,6 +93,10 @@ var (
 	// yet. The caller must write the mutation to sync_apply_deferred and ACK
 	// the sequence so the cursor does not stall.
 	ErrRelationFKMissing = errors.New("relation FK precondition not met: referenced observation missing")
+
+	// ErrRelationProjectMismatch reports existing endpoints outside the relation's
+	// effective project. It shares the missing-endpoint retry/rearm lifecycle.
+	ErrRelationProjectMismatch = errors.New("relation FK precondition not met: referenced observation effective project mismatch")
 
 	// ErrCrossProjectRelation is returned by JudgeRelation when the source and
 	// target observations belong to different projects. The write is rejected
@@ -194,6 +199,19 @@ func observationState(reviewAfterValue *string) string {
 		return ObservationStateNeedsReview
 	}
 	return ObservationStateActive
+}
+
+// ObservationVersion is an immutable snapshot of an observation's title and
+// content captured before a topic_key upsert or a content-changing mem_update
+// overwrote it. Versions are numbered per observation starting at 1: the older
+// the state, the lower the number.
+type ObservationVersion struct {
+	ID            int64  `json:"id"`
+	ObservationID int64  `json:"observation_id"`
+	Title         string `json:"title"`
+	Content       string `json:"content"`
+	Version       int    `json:"version"`
+	CreatedAt     string `json:"created_at"`
 }
 
 type SearchResult struct {
@@ -1219,6 +1237,78 @@ func (s *Store) setUserVersion(v int) error {
 	return err
 }
 
+// manualSessionIDPrefix is the literal prefix of the manual-save session
+// identity convention.
+const manualSessionIDPrefix = "manual-save-"
+
+// manualSaveOwnerProject reports whether a session id names project under the
+// manual-save convention. Both sides are canonicalized, so a suffix that
+// normalizes to the project qualifies even when it is not byte-identical. The
+// prefix itself stays exact, matching the manual-name rule the diagnostic
+// applies in internal/diagnostic/checks.go.
+func manualSaveOwnerProject(id, project string) bool {
+	suffix, ok := strings.CutPrefix(id, manualSessionIDPrefix)
+	if !ok {
+		return false
+	}
+	canonicalProject, _ := NormalizeProject(project)
+	if canonicalProject == "" {
+		return false
+	}
+	canonicalSuffix, _ := NormalizeProject(suffix)
+	return canonicalSuffix == canonicalProject
+}
+
+// backfillLegacySessionOwnershipModes classifies rows that predate the
+// ownership column. The non-manual branch stays one set-based statement so
+// SQLite's case-insensitive LIKE keeps deciding what "not a manual-save id"
+// means; only the owner test needs canonicalization, which SQL cannot express.
+// Both phases are idempotent and keyed on a still-NULL mode, so an interrupted
+// backfill is completed by the next migration run.
+func (s *Store) backfillLegacySessionOwnershipModes() error {
+	if _, err := s.execHook(s.db, `
+		UPDATE sessions SET ownership_mode = ?
+		WHERE ownership_mode IS NULL
+			AND id NOT LIKE 'manual-save-%'
+			AND ifnull(trim(project), '') <> ''`, SessionOwnershipShared); err != nil {
+		return err
+	}
+	rows, err := s.db.Query(`
+		SELECT id, ifnull(project, '')
+		FROM sessions
+		WHERE ownership_mode IS NULL AND ifnull(trim(project), '') <> ''`)
+	if err != nil {
+		return err
+	}
+	// Owners are collected before any write: the read cursor holds the
+	// connection open, so executing the stamp while it is still live would
+	// contend with it.
+	var owners []string
+	for rows.Next() {
+		var id, project string
+		if err := rows.Scan(&id, &project); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if manualSaveOwnerProject(id, project) {
+			owners = append(owners, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range owners {
+		if _, err := s.execHook(s.db, `UPDATE sessions SET ownership_mode = ? WHERE id = ? AND ownership_mode IS NULL`, SessionOwnershipProjectOwned, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) migrate() error {
 	schema := `
 			CREATE TABLE IF NOT EXISTS sessions (
@@ -1271,6 +1361,16 @@ func (s *Store) migrate() error {
 			tokenize='trigram',
 			content='observations',
 			content_rowid='id'
+		);
+
+		CREATE TABLE IF NOT EXISTS observation_versions (
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+			title          TEXT,
+			content        TEXT NOT NULL,
+			version        INTEGER NOT NULL,
+			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(observation_id, version)
 		);
 
 			CREATE TABLE IF NOT EXISTS user_prompts (
@@ -1438,12 +1538,7 @@ func (s *Store) migrate() error {
 	}
 	// Legacy rows remain unclassified unless their persisted identity proves a
 	// deterministic manual-save owner. Never infer ownership from an ID alone.
-	if _, err := s.execHook(s.db, `
-		UPDATE sessions SET ownership_mode = CASE
-			WHEN id = 'manual-save-' || project AND ifnull(trim(project), '') <> '' THEN 'project_owned'
-			WHEN id NOT LIKE 'manual-save-%' AND ifnull(trim(project), '') <> '' THEN 'shared'
-			ELSE ownership_mode END
-		WHERE ownership_mode IS NULL`); err != nil {
+	if err := s.backfillLegacySessionOwnershipModes(); err != nil {
 		return err
 	}
 
@@ -2132,9 +2227,10 @@ func (s *Store) RepairPendingSessionDirectories(project string, apply bool) ([]S
 	project = strings.TrimSpace(project)
 	actions := make([]SyncMutationDirectoryRepairAction, 0)
 	run := func(tx *sql.Tx) error {
-		projects := []string{project}
-		if project == "" {
-			projects = nil
+		// Discover raw spellings even for a canonical --project filter. Exact
+		// journal lookups must retain those spellings; ownership checks must not.
+		var projects []string
+		{
 			rows, err := tx.Query(`SELECT DISTINCT project FROM sync_mutations WHERE target_key = ? AND disposition = ? AND acked_at IS NULL AND project != '' UNION SELECT DISTINCT s.project FROM sessions s JOIN sync_mutations m ON m.entity_key = s.id WHERE m.target_key = ? AND m.project = '' AND m.entity = 'session' AND m.op = 'upsert' AND m.disposition = ? AND m.acked_at IS NULL AND s.project != ''`, DefaultSyncTargetKey, SyncMutationDispositionPending, DefaultSyncTargetKey, SyncMutationDispositionPending)
 			if err != nil {
 				return err
@@ -2154,7 +2250,24 @@ func (s *Store) RepairPendingSessionDirectories(project string, apply bool) ([]S
 				return err
 			}
 		}
+		// Blank journal owners are selected by their normalized local project
+		// in listPendingProjectMutationsTx, so include each canonical spelling once.
+		seen := make(map[string]bool, len(projects))
 		for _, name := range projects {
+			seen[name] = true
+		}
+		for _, name := range projects {
+			canonical, _ := NormalizeProject(name)
+			if canonical != "" && !seen[canonical] {
+				projects = append(projects, canonical)
+				seen[canonical] = true
+			}
+		}
+		for _, name := range projects {
+			canonical, _ := NormalizeProject(name)
+			if canonical == "" || (project != "" && canonical != project) {
+				continue
+			}
 			mutations, err := s.listPendingProjectMutationsTx(tx, name)
 			if err != nil {
 				return err
@@ -2176,7 +2289,8 @@ func (s *Store) RepairPendingSessionDirectories(project string, apply bool) ([]S
 					return err
 				}
 				normalizedLocalProject, _ := NormalizeProject(localProject)
-				if strings.TrimSpace(normalizedLocalProject) != name || (mutation.Project != "" && mutation.Project != name) {
+				normalizedMutationProject, _ := NormalizeProject(mutation.Project)
+				if normalizedLocalProject != canonical || (mutation.Project != "" && normalizedMutationProject != canonical) {
 					continue
 				}
 				eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
@@ -2187,11 +2301,11 @@ func (s *Store) RepairPendingSessionDirectories(project string, apply bool) ([]S
 					continue
 				}
 				if apply {
-					if _, err := s.execHook(tx, `UPDATE sync_mutations SET payload = ?, project = ? WHERE seq = ? AND target_key = ? AND project = ? AND acked_at IS NULL AND disposition = ?`, eval.repairedPayload, name, mutation.Seq, DefaultSyncTargetKey, mutation.Project, SyncMutationDispositionPending); err != nil {
+					if _, err := s.execHook(tx, `UPDATE sync_mutations SET payload = ?, project = ? WHERE seq = ? AND target_key = ? AND project = ? AND acked_at IS NULL AND disposition = ?`, eval.repairedPayload, canonical, mutation.Seq, DefaultSyncTargetKey, mutation.Project, SyncMutationDispositionPending); err != nil {
 						return err
 					}
 				}
-				actions = append(actions, SyncMutationDirectoryRepairAction{Seq: mutation.Seq, Project: name, EntityKey: mutation.EntityKey})
+				actions = append(actions, SyncMutationDirectoryRepairAction{Seq: mutation.Seq, Project: canonical, EntityKey: mutation.EntityKey})
 			}
 		}
 		return nil
@@ -2427,7 +2541,12 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 				return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload directory conflicts with local session directory"), nil
 			}
 		}
-		if op == SyncOpUpsert && body.Directory == "" {
+		if op == SyncOpUpsert && body.OwnershipMode == SessionOwnershipProjectOwned {
+			if err := ValidateCloudSessionDirectory([]byte(payload)); err != nil {
+				return blocked(UpgradeReasonBlockedLegacyMutationManual, err.Error()), nil
+			}
+		}
+		if op == SyncOpUpsert && body.Directory == "" && body.OwnershipMode != SessionOwnershipProjectOwned {
 			var directory string
 			err := tx.QueryRow(`SELECT ifnull(directory, '') FROM sessions WHERE id = ?`, body.ID).Scan(&directory)
 			if errors.Is(err, sql.ErrNoRows) || strings.TrimSpace(directory) == "" {
@@ -3136,15 +3255,32 @@ func (s *Store) StartSession(id, project, directory string) error {
 // lease. It preserves the existing session identity and refuses to reopen an
 // ended session; EndSession remains terminal truth.
 func (s *Store) StartSessionWithOwnershipMode(id, project, directory, mode string) error {
-	return s.startSessionRegistration(id, project, directory, mode, false, nil)
+	return s.startSessionRegistration(id, project, directory, mode, false, nil, false)
 }
 
 // ResumeSessionWithOwnershipMode atomically selects and registers a live runtime
 // identity. Ended rows remain terminal; ordinary and MCP registrations do not opt in.
 func (s *Store) ResumeSessionWithOwnershipMode(id, project, directory, mode string) (string, error) {
 	effective := id
-	err := s.startSessionRegistration(id, project, directory, mode, true, &effective)
+	err := s.startSessionRegistration(id, project, directory, mode, true, &effective, false)
 	if err != nil {
+		return "", err
+	}
+	return effective, nil
+}
+
+// ErrSessionIsolationConflict refuses reuse of a runtime-bound or shared identity as a satellite.
+var ErrSessionIsolationConflict = errors.New("isolated session registration requires an empty directory; existing runtime-bound sessions cannot be reused")
+
+// RegisterIsolatedSession atomically validates the root and selected continuation
+// before any ownership repair, sync mutation, or lease renewal. It never clears
+// a nonblank directory and uses project-owned registration rules with no directory.
+// An existing shared row is refused whatever produced it (runtime registration,
+// Cloud pull or local import), because isolated registration never changes a
+// persisted ownership mode and a shared lease would accept cross-project writes.
+func (s *Store) RegisterIsolatedSession(id, project string, resume bool) (string, error) {
+	effective := id
+	if err := s.startSessionRegistration(id, project, "", SessionOwnershipProjectOwned, resume, &effective, true); err != nil {
 		return "", err
 	}
 	return effective, nil
@@ -3209,7 +3345,7 @@ func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
 	return prefix + max.Add(max, big.NewInt(1)).String(), nil
 }
 
-func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string) error {
+func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string, isolated bool) error {
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
@@ -3228,6 +3364,29 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 		// attempt may become the terminal response.
 		claimed = false
 		id = root
+		validateIsolation := func(sessionID string) error {
+			if !isolated {
+				return nil
+			}
+			var existingDirectory, existingMode string
+			err := tx.QueryRow(`SELECT ifnull(directory, ''), ifnull(ownership_mode, '') FROM sessions WHERE id = ?`, sessionID).Scan(&existingDirectory, &existingMode)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(existingDirectory) != "" {
+				return fmt.Errorf("%w: %q", ErrSessionIsolationConflict, sessionID)
+			}
+			if strings.TrimSpace(existingMode) == SessionOwnershipShared {
+				return fmt.Errorf("%w: %q has shared ownership", ErrSessionIsolationConflict, sessionID)
+			}
+			return nil
+		}
+		if err := validateIsolation(root); err != nil {
+			return err
+		}
 		if resume {
 			// Validate terminal root ownership before looking up any continuation.
 			// A compatible suffix cannot bypass the requested identity's owner.
@@ -3262,6 +3421,11 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 				return err
 			}
 			*effective = id
+		}
+		if id != root {
+			if err := validateIsolation(id); err != nil {
+				return err
+			}
 		}
 		existingProject, existingMode, found, err := sessionOwnershipTx(tx, id)
 		if err != nil {
@@ -3359,11 +3523,85 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 	return nil
 }
 
+// ErrRuntimeSessionScopeConflict refuses runtime-root reuse outside its binding.
+var ErrRuntimeSessionScopeConflict = errors.New("runtime session scope conflict")
+
+func runtimeSessionTx(tx *sql.Tx, root, project, directory, mode string) (string, error) {
+	if err := validateSessionID(root); err != nil {
+		return "", err
+	}
+	if !validSessionOwnershipMode(mode) {
+		return "", ErrInvalidSessionOwnershipMode
+	}
+	project, _ = NormalizeProject(project)
+	if project == "" {
+		return "", ErrProjectRequired
+	}
+	validate := func(id string, live bool) error {
+		var owner, ownership, scope string
+		var ended *string
+		if err := tx.QueryRow(`SELECT ifnull(project, ''), ifnull(ownership_mode, ''), ifnull(directory, ''), ended_at FROM sessions WHERE id = ?`, id).Scan(&owner, &ownership, &scope, &ended); err != nil {
+			return err
+		}
+		owner, _ = NormalizeProject(strings.TrimSpace(owner))
+		ownership = strings.TrimSpace(ownership)
+		if sessionRegistrationProjectError(id, owner, ownership, project, mode) != nil || ownership != mode || strings.TrimSpace(directory) == "" || strings.TrimSpace(scope) == "" || projectpkg.RuntimeWorktreeDirectory(scope) != projectpkg.RuntimeWorktreeDirectory(directory) {
+			return ErrRuntimeSessionScopeConflict
+		}
+		if live && ended != nil {
+			return sql.ErrNoRows
+		}
+		return nil
+	}
+	if err := validate(root, false); err != nil {
+		return "", err
+	}
+	id, err := continuationSessionTx(tx, root)
+	if err != nil {
+		return "", err
+	}
+	if err := validate(id, true); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// ResolveRuntimeSessionWithOwnershipMode reads the authoritative live binding;
+// unlike resume registration it cannot create or advance a continuation.
+func (s *Store) ResolveRuntimeSessionWithOwnershipMode(root, project, directory, mode string) (string, error) {
+	var id string
+	err := s.withTx(func(tx *sql.Tx) error {
+		var err error
+		id, err = runtimeSessionTx(tx, root, project, directory, mode)
+		return err
+	})
+	return id, err
+}
+
+// EndRuntimeSession resolves and ends within one writer reservation. Generic
+// EndSession retains its exact-ID behavior for all existing callers.
+func (s *Store) EndRuntimeSession(root, project, directory, mode, summary string) (string, error) {
+	var id string
+	err := s.withTx(func(tx *sql.Tx) error {
+		var err error
+		id, err = runtimeSessionTx(tx, root, project, directory, mode)
+		if err != nil {
+			return err
+		}
+		return s.endSessionOperation(id, summary)(tx)
+	})
+	return id, err
+}
+
 func (s *Store) EndSession(id string, summary string) error {
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
-	return s.withTx(func(tx *sql.Tx) error {
+	return s.withTx(s.endSessionOperation(id, summary))
+}
+
+func (s *Store) endSessionOperation(id, summary string) func(*sql.Tx) error {
+	return func(tx *sql.Tx) error {
 		res, err := s.execHook(tx,
 			`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
 			nullableString(summary), id,
@@ -3401,7 +3639,7 @@ func (s *Store) EndSession(id string, summary string) error {
 			EndedAt:       &endedAt,
 			Summary:       storedSummary,
 		})
-	})
+	}
 }
 
 func (s *Store) GetSession(id string) (*Session, error) {
@@ -3726,6 +3964,15 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 				topicKey, nullableString(p.Project), scope,
 			).Scan(&existingID)
 			if err == nil {
+				// Capture the pre-overwrite state before the topic_key upsert
+				// rewrites it in place (#184).
+				prev, err := s.getObservationTx(tx, existingID)
+				if err != nil {
+					return err
+				}
+				if err := s.captureObservationVersionTx(tx, prev); err != nil {
+					return err
+				}
 				if _, err := s.execHook(tx,
 					`UPDATE observations
 					 SET session_id = ?,
@@ -4757,6 +5004,15 @@ func (s *Store) updateObservation(id int64, p UpdateObservationParams, expected 
 		}
 		if p.TopicKey != nil {
 			topicKey = normalizeTopicKey(*p.TopicKey)
+		}
+
+		// Capture the pre-update state when the user-visible content (title or
+		// body) actually changes (#184). Metadata-only updates (type, scope,
+		// topic_key) do not create a version entry.
+		if title != obs.Title || content != obs.Content {
+			if err := s.captureObservationVersionTx(tx, obs); err != nil {
+				return err
+			}
 		}
 
 		if _, err := s.execHook(tx,
@@ -7804,7 +8060,7 @@ func (s *Store) recordRelationApplyFailureTx(tx *sql.Tx, targetKey string, mutat
 
 	status := ""
 	switch {
-	case errors.Is(applyErr, ErrRelationFKMissing):
+	case errors.Is(applyErr, ErrRelationFKMissing), errors.Is(applyErr, ErrRelationProjectMismatch):
 		status = "deferred"
 	case errors.Is(applyErr, ErrApplyDead):
 		status = "dead"
@@ -7991,10 +8247,11 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 // The domain must be carried explicitly by the caller; it is never inferred
 // from the target key, because a cloud chunk's tracking key and its admission
 // rule answer different questions. cloud=true runs the strict cloud-inbound
-// directory admission (validatePulledSessionDirectory), so a session upsert
+// directory admission (validatePulledSessionDirectory), so a shared session upsert
 // with a blank or missing directory fails the whole chunk atomically — no
-// session persisted, chunk not recorded — mirroring how ApplyPulledMutation
-// fails the same payload. cloud=false keeps the local partial-session domain:
+// session persisted, chunk not recorded. Only per-mutation Cloud pull admits a
+// blank or omitted directory (validatePulledSessionDirectoryCloudMutation).
+// cloud=false keeps the local partial-session domain:
 // blank directories are accepted and the skip-plus-evidence quarantine ladder
 // behaves exactly as before.
 func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations []SyncMutation, cloud bool) error {
@@ -8029,7 +8286,7 @@ func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations [
 			mutation.Seq = seq
 			mutation.TargetKey = targetKey
 			mutation.Source = SyncSourceRemote
-			if applyErr := s.applyPulledMutationForDomainTx(tx, mutation, cloud, targetKey); applyErr != nil {
+			if applyErr := s.applyPulledMutationForDomainTx(tx, mutation, cloud, targetKey, pulledChunkDirectoryAdmission(cloud)); applyErr != nil {
 				if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
 					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
 				} else if !handled {
@@ -8452,8 +8709,14 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 			if !plan.stampOwnershipMode[sessionID] {
 				continue
 			}
-			res, err := s.execHook(tx, rescueSessionQuery.updateOwnershipMode,
-				target, target, SessionOwnershipProjectOwned, SessionOwnershipShared, sessionID, sqlWhitespaceTrimSet,
+			// The owner test is canonical, so it cannot be one SQL CASE over
+			// `id = 'manual-save-' || project`.
+			mode := SessionOwnershipShared
+			if manualSaveOwnerProject(sessionID, target) {
+				mode = SessionOwnershipProjectOwned
+			}
+			res, err := s.execHook(tx, rescueSessionQuery.stampOwnershipMode,
+				target, mode, sessionID, sqlWhitespaceTrimSet,
 			)
 			if err != nil {
 				return err
@@ -8618,10 +8881,10 @@ func (r *ProjectRescueResult) countOutcome(outcome rescueOutcome) {
 type rescueRecordQuery struct {
 	// selectSessionID reads the parent session id of one record. It is empty for
 	// sessions, which have no parent.
-	selectSessionID     string
-	selectProject       string
-	updateProject       string
-	updateOwnershipMode string
+	selectSessionID    string
+	selectProject      string
+	updateProject      string
+	stampOwnershipMode string
 }
 
 var (
@@ -8636,9 +8899,9 @@ var (
 		updateProject:   `UPDATE user_prompts SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
 	}
 	rescueSessionQuery = rescueRecordQuery{
-		selectProject:       `SELECT project FROM sessions WHERE id = ?`,
-		updateProject:       `UPDATE sessions SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
-		updateOwnershipMode: `UPDATE sessions SET project = ?, ownership_mode = CASE WHEN id = 'manual-save-' || ? THEN ? ELSE ? END WHERE id = ? AND ifnull(trim(ownership_mode, ?), '') = ''`,
+		selectProject:      `SELECT project FROM sessions WHERE id = ?`,
+		updateProject:      `UPDATE sessions SET project = ? WHERE id = ? AND ifnull(trim(project), '') = ''`,
+		stampOwnershipMode: `UPDATE sessions SET project = ?, ownership_mode = ? WHERE id = ? AND ifnull(trim(ownership_mode, ?), '') = ''`,
 	}
 )
 
@@ -8990,7 +9253,7 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 	return s.mergeProjects(sources, canonical, false)
 }
 
-// MergeExplicitProjectVariants admits explicitly named separator variants for admin use.
+// MergeExplicitProjectVariants admits explicitly named separator and normalization variants for admin use.
 func (s *Store) MergeExplicitProjectVariants(sources []string, canonical string) (*MergeResult, error) {
 	return s.mergeProjects(sources, canonical, true)
 }
@@ -9033,8 +9296,11 @@ func (s *Store) PreviewExplicitProjectMerge(source, canonical string) (*Explicit
 	if canonical == ReservedInboxProjectName {
 		return nil, fmt.Errorf("reserved inbox project cannot be a merge destination")
 	}
-	if canonical == "" || normalizedSource == "" || normalizedSource == canonical || !mergeProjectEligible(normalizedSource, canonical, true) {
-		return nil, fmt.Errorf("source project %q must be a distinct separator variant of canonical project %q", source, canonical)
+	// Preserve the raw legacy spelling for SQL selection. Unicode-equivalent
+	// names may normalize to the target but still identify distinct stored rows.
+	unicodeVariant := !norm.NFC.IsNormalString(strings.TrimSpace(source))
+	if canonical == "" || normalizedSource == "" || (normalizedSource == canonical && !unicodeVariant) || !mergeProjectEligible(normalizedSource, canonical, true) {
+		return nil, fmt.Errorf("source project %q must be a distinct separator variant or Unicode normalization variant of canonical project %q", source, canonical)
 	}
 	name := strings.TrimSpace(source)
 	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
@@ -11139,14 +11405,16 @@ func (s *Store) adoptSessionOwnershipTx(tx *sql.Tx, sessionID, project string) e
 }
 
 func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
-	return s.applyPulledMutationForDomainTx(tx, mutation, false, "")
+	return s.applyPulledMutationForDomainTx(tx, mutation, false, "", pulledSessionDirectoryLocal)
 }
 
+// applyCloudPulledMutationTx admits the historical blank-string session shape
+// that only the per-mutation Cloud pull carries; Cloud chunks stay strict.
 func (s *Store) applyCloudPulledMutationTx(tx *sql.Tx, targetKey string, mutation SyncMutation) error {
-	return s.applyPulledMutationForDomainTx(tx, mutation, true, targetKey)
+	return s.applyPulledMutationForDomainTx(tx, mutation, true, targetKey, pulledSessionDirectoryCloudMutation)
 }
 
-func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation, cloud bool, targetKey string) error {
+func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation, cloud bool, targetKey string, directoryAdmission pulledSessionDirectoryAdmission) error {
 	switch mutation.Entity {
 	case SyncEntityRelation:
 		return s.applyRelationUpsertTx(tx, mutation)
@@ -11186,7 +11454,7 @@ func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation
 				return err
 			}
 		}
-		if err := validatePulledSessionDirectoryForDomain(cloud, []byte(mutation.Payload)); err != nil {
+		if err := validatePulledSessionDirectoryAdmission(directoryAdmission, []byte(mutation.Payload)); err != nil {
 			return err
 		}
 		return s.applySessionPayloadTx(tx, payload)
@@ -11261,25 +11529,64 @@ func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation
 	}
 }
 
-// validatePulledSessionDirectoryForDomain selects the directory admission rule
-// for a pulled session upsert. Cloud inbound stays strict byte-for-byte; the
-// local pull domain (ApplyPulledChunk and the deferred replay it feeds) accepts
-// a blank directory as the intentional local partial-session state.
-func validatePulledSessionDirectoryForDomain(cloud bool, raw []byte) error {
+// pulledSessionDirectoryAdmission names the directory rule a pulled session
+// upsert must satisfy. The import path selects it explicitly; it is never
+// inferred from the target key.
+type pulledSessionDirectoryAdmission int
+
+const (
+	// pulledSessionDirectoryLocal accepts a missing key or any JSON string: the
+	// local pull domain (ApplyPulledChunk and the deferred replay it feeds).
+	pulledSessionDirectoryLocal pulledSessionDirectoryAdmission = iota
+	// pulledSessionDirectoryCloudStrict requires a present non-blank string for
+	// shared and legacy sessions: Cloud chunk import. Project-owned sessions
+	// follow ValidateCloudSessionDirectory.
+	pulledSessionDirectoryCloudStrict
+	// pulledSessionDirectoryCloudMutation accepts a missing key or any JSON
+	// string for every ownership mode: per-mutation Cloud pull
+	// (ApplyPulledMutation / autosync).
+	pulledSessionDirectoryCloudMutation
+)
+
+func pulledChunkDirectoryAdmission(cloud bool) pulledSessionDirectoryAdmission {
 	if cloud {
-		return validatePulledSessionDirectory(raw)
+		return pulledSessionDirectoryCloudStrict
 	}
-	return validatePulledSessionDirectoryLocal(raw)
+	return pulledSessionDirectoryLocal
 }
 
-// validatePulledSessionDirectory is the strict cloud-inbound admission check
-// (ApplyPulledMutation / autosync). A missing directory key and a blank value
-// are both rejected with the historical wording; cloud payloads must name a
-// concrete directory because the cloud has no local state to complete against.
+// validatePulledSessionDirectoryAdmission applies the selected directory rule
+// to a pulled session upsert payload.
+func validatePulledSessionDirectoryAdmission(admission pulledSessionDirectoryAdmission, raw []byte) error {
+	switch admission {
+	case pulledSessionDirectoryCloudStrict:
+		return validatePulledSessionDirectory(raw)
+	case pulledSessionDirectoryCloudMutation:
+		return validatePulledSessionDirectoryCloudMutation(raw)
+	default:
+		return validatePulledSessionDirectoryLocal(raw)
+	}
+}
+
+// validatePulledSessionDirectory is the Cloud chunk import admission check.
+// Shared and legacy sessions must name a concrete directory; project-owned
+// sessions follow ValidateCloudSessionDirectory.
 func validatePulledSessionDirectory(raw []byte) error {
+	return ValidateCloudSessionDirectory(raw)
+}
+
+// ValidateCloudSessionDirectory admits omitted or blank string directories for
+// project-owned sessions, including isolated registrations. Shared and legacy
+// sessions still require a concrete directory. Null and non-string values never
+// stand in for a blank directory.
+func ValidateCloudSessionDirectory(raw []byte) error {
 	var fields map[string]json.RawMessage
 	if err := decodeSyncPayload(raw, &fields); err != nil {
 		return err
+	}
+	var mode string
+	if err := json.Unmarshal(fields["ownership_mode"], &mode); err == nil && mode == SessionOwnershipProjectOwned {
+		return validatePulledSessionDirectoryLocal(raw)
 	}
 	directory, ok := fields["directory"]
 	if !ok {
@@ -11290,6 +11597,16 @@ func validatePulledSessionDirectory(raw []byte) error {
 		return fmt.Errorf("%w: directory must be non-blank", ErrPulledSessionDirectoryInvalid)
 	}
 	return nil
+}
+
+// validatePulledSessionDirectoryCloudMutation admits historical Cloud session
+// events whose directory is a JSON string (blank included) or absent, for every
+// ownership mode. The row is applied as carried: an inert partial session with
+// no lease, invented ended_at or directory, and the existing upsert never
+// erases a concrete directory or a project-owned owner. JSON null and
+// non-string values stay fail-closed without moving the cursor.
+func validatePulledSessionDirectoryCloudMutation(raw []byte) error {
+	return validatePulledSessionDirectoryLocal(raw)
 }
 
 // validatePulledSessionDirectoryLocal is the local pull-path admission check.
@@ -11495,7 +11812,8 @@ func relationEndpointPredicate(sourceID, targetID, payloadProject, outerProject 
 //  1. JSON-decode the payload into syncRelationPayload. Decode errors return
 //     ErrApplyDead (non-retryable).
 //  2. Verify both source and target observations exist locally by sync_id.
-//     If either is missing, return ErrRelationFKMissing. The caller must write
+//     If either is absent, return ErrRelationFKMissing; if both exist but fail
+//     the effective-project check, return ErrRelationProjectMismatch. Both defer
 //     the raw mutation to sync_apply_deferred and ACK the seq.
 //  3. INSERT INTO memory_relations with ON CONFLICT(sync_id) DO UPDATE
 //     (last-write-wins, preserving the original created_at).
@@ -11563,7 +11881,16 @@ func (s *Store) applyRelationUpsertTx(tx *sql.Tx, mutation SyncMutation) error {
 		return fmt.Errorf("applyRelationUpsertTx: check observations: %w", err)
 	}
 	if obsCount < requiredObservations {
-		return ErrRelationFKMissing
+		// Diagnose only after the unchanged scoped predicate fails. Distinct
+		// identities preserve duplicate-row and self-edge absence checks.
+		var existingCount int
+		if err := tx.QueryRow(`SELECT count(DISTINCT sync_id) FROM observations WHERE sync_id IN (?, ?)`, p.SourceID, p.TargetID).Scan(&existingCount); err != nil {
+			return fmt.Errorf("applyRelationUpsertTx: check endpoint existence: %w", err)
+		}
+		if existingCount < requiredObservations {
+			return ErrRelationFKMissing
+		}
+		return ErrRelationProjectMismatch
 	}
 
 	// Step 3: upsert into memory_relations keyed on sync_id (idempotent re-apply).
@@ -11667,6 +11994,180 @@ func (s *Store) getObservationTx(tx *sql.Tx, id int64) (*Observation, error) {
 	return &o, nil
 }
 
+// captureObservationVersionTx snapshots an observation's pre-overwrite
+// title/content into observation_versions with the next per-observation
+// version number. Call it before the write that replaces the state.
+func (s *Store) captureObservationVersionTx(tx *sql.Tx, obs *Observation) error {
+	_, err := s.execHook(tx,
+		`INSERT INTO observation_versions (observation_id, title, content, version, created_at)
+		 SELECT ?, ?, ?, COALESCE(MAX(version), 0) + 1, datetime('now')
+		 FROM observation_versions WHERE observation_id = ?`,
+		obs.ID, obs.Title, obs.Content, obs.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("capture observation version: %w", err)
+	}
+	return nil
+}
+
+// GetObservationVersions returns every captured version for an observation,
+// oldest first, numbering starting at 1. Versions survive soft deletes: they
+// are immutable history, read directly from the version table. A missing or
+// untouched observation yields an empty slice, never an error.
+//
+// Callers serving one bounded response should prefer GetObservationVersionPage,
+// which never materializes the full unbounded history.
+func (s *Store) GetObservationVersions(id int64) ([]ObservationVersion, error) {
+	rows, err := s.queryItHook(s.db,
+		`SELECT id, observation_id, ifnull(title, ''), content, version, ifnull(created_at, '')
+		 FROM observation_versions WHERE observation_id = ? ORDER BY version ASC`, id,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var versions []ObservationVersion
+	for rows.Next() {
+		var v ObservationVersion
+		if err := rows.Scan(&v.ID, &v.ObservationID, &v.Title, &v.Content, &v.Version, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		versions = append(versions, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return versions, nil
+}
+
+// DefaultObservationVersionPageSize is the bound applied to a single history
+// page when the caller does not choose a limit; MCP include_history renders
+// exactly this many most recent versions per call.
+const DefaultObservationVersionPageSize = 50
+
+// MaxObservationVersionPageSize caps a caller-supplied history page so one
+// bounded read stays resource-safe no matter how many snapshots are stored.
+const MaxObservationVersionPageSize = 100
+
+// ObservationVersionPage is one bounded page of an observation's captured
+// version history, oldest first (ascending version numbers), plus the truthful
+// total count of stored versions and a continuation cursor when older versions
+// remain beyond the page.
+type ObservationVersionPage struct {
+	Versions []ObservationVersion
+	Total    int
+	HasMore  bool
+	// NextCursor is the oldest version in Versions when HasMore is true: pass
+	// it as the cursor argument to fetch the next (older) page.
+	NextCursor int64
+}
+
+// GetObservationVersionPage returns one bounded page of an observation's
+// version history, oldest first (ascending version number) so rendering stays
+// chronological. Cursor 0 starts from the most recent versions; a cursor from a
+// previous page's NextCursor (set only when HasMore is true) fetches the older
+// page continuing before it. Total is the full stored count and is truthful
+// even when the page is truncated. Versions survive soft deletes and a missing
+// or untouched observation yields an empty page with Total 0, never an error.
+//
+// limit must be between 1 and MaxObservationVersionPageSize; cursor must be
+// non-negative.
+func (s *Store) GetObservationVersionPage(id int64, limit int, cursor int64) (ObservationVersionPage, error) {
+	if limit < 1 || limit > MaxObservationVersionPageSize {
+		return ObservationVersionPage{}, fmt.Errorf("GetObservationVersionPage: limit must be between 1 and %d", MaxObservationVersionPageSize)
+	}
+	if cursor < 0 {
+		return ObservationVersionPage{}, fmt.Errorf("GetObservationVersionPage: cursor must be non-negative")
+	}
+
+	// Run the count and the page query inside one read transaction: a
+	// concurrent version capture or hard delete can otherwise commit between
+	// the two reads and leave Total, Versions, or HasMore mutually
+	// inconsistent. The tx connection is shared, so the count rows are closed
+	// once their value is read and before the page query starts.
+	tx, err := s.beginTxHook()
+	if err != nil {
+		return ObservationVersionPage{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Truthful total: the page count is the full stored count and never shrinks
+	// when a page only carries the most recent versions.
+	page := ObservationVersionPage{}
+	totalRows, err := s.queryItHook(tx,
+		`SELECT COUNT(*) FROM observation_versions WHERE observation_id = ?`, id,
+	)
+	if err != nil {
+		return page, err
+	}
+	if totalRows.Next() {
+		if err := totalRows.Scan(&page.Total); err != nil {
+			return page, closeRowsWithError(totalRows, err)
+		}
+	}
+	if err := closeRowsWithError(totalRows, totalRows.Err()); err != nil {
+		return page, err
+	}
+
+	// Fetch limit+1 rows newest first: the extra row is discarded only to prove
+	// whether an older page still exists, so HasMore is exact and never guessed.
+	query := `SELECT id, observation_id, ifnull(title, ''), content, version, ifnull(created_at, '')
+		 FROM observation_versions WHERE observation_id = ?`
+	args := []any{id}
+	if cursor > 0 {
+		query += ` AND version < ?`
+		args = append(args, cursor)
+	}
+	query += ` ORDER BY version DESC LIMIT ?`
+	args = append(args, limit+1)
+
+	rows, err := s.queryItHook(tx, query, args...)
+	if err != nil {
+		return page, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	fetched := make([]ObservationVersion, 0, limit+1)
+	for rows.Next() {
+		var v ObservationVersion
+		if err := rows.Scan(&v.ID, &v.ObservationID, &v.Title, &v.Content, &v.Version, &v.CreatedAt); err != nil {
+			return page, err
+		}
+		fetched = append(fetched, v)
+	}
+	if err := rows.Err(); err != nil {
+		return page, err
+	}
+
+	if len(fetched) > limit {
+		page.HasMore = true
+		fetched = fetched[:limit]
+	}
+	page.Versions = reverseObservationVersions(fetched)
+	if page.HasMore {
+		// Versions is ascending (oldest first): the continuation cursor is the
+		// oldest version shown on this page, so the next page reads strictly
+		// older versions (version < cursor) without re-shipping this page.
+		oldest := page.Versions[0]
+		page.NextCursor = int64(oldest.Version)
+	}
+	if err := s.commitHook(tx); err != nil {
+		return page, err
+	}
+	return page, nil
+}
+
+// reverseObservationVersions returns versions in ascending version order. The
+// page query fetches newest first so the bounded page reads chronologically.
+func reverseObservationVersions(versions []ObservationVersion) []ObservationVersion {
+	reversed := make([]ObservationVersion, len(versions))
+	for i, v := range versions {
+		reversed[len(versions)-1-i] = v
+	}
+	return reversed
+}
+
 // getObservationIncludingDeletedTx is reserved for explicit destructive paths.
 // Ordinary reads and mutations must use getObservationTx so soft-deleted rows stay hidden.
 func (s *Store) getObservationIncludingDeletedTx(tx *sql.Tx, id int64) (*Observation, error) {
@@ -11718,10 +12219,9 @@ func observationPayloadFromObservation(obs *Observation) syncObservationPayload 
 // applySessionPayloadTx upserts a pulled session with the same directory
 // completion CASE as createSessionTx/startSessionTx: an existing concrete
 // directory is preserved (a later blank payload cannot erase it) and an
-// existing blank adopts an incoming concrete value. Cloud callers always pass
-// the strict directory validation before reaching this upsert, so their
-// payloads carry concrete directories and keep whichever concrete value
-// arrived first.
+// existing blank adopts an incoming concrete value. Cloud chunks pass the strict
+// directory validation; a per-mutation Cloud pull may carry a present blank
+// string, which leaves an existing concrete directory untouched.
 func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
 	if err := validateSessionID(payload.ID); err != nil {
 		return err
@@ -12446,7 +12946,7 @@ func normalizeScope(scope string) string {
 }
 
 // NormalizeProject applies canonical project name normalization:
-// lowercase + trim whitespace + collapse consecutive hyphens/underscores.
+// Unicode NFC + lowercase + trim whitespace + collapse consecutive hyphens/underscores.
 // Returns the normalized name and a warning message if the name was changed
 // (empty string if no change was needed).
 // Exported so MCP and CLI handlers can surface the warning to users.
@@ -12938,7 +13438,7 @@ func (s *Store) ListDeferredProjectsForTarget(targetKey string) ([]string, error
 //   - Calls applyPulledMutationTx inside a transaction.
 //   - On success: the apply itself deletes the deferred row (applyRelationUpsertTx
 //     already includes DELETE FROM sync_apply_deferred on success path).
-//   - On ErrRelationFKMissing: increments retry_count; if retry_count reaches 5,
+//   - On ErrRelationFKMissing or ErrRelationProjectMismatch: increments retry_count; if retry_count reaches 5,
 //     marks apply_status='dead'. Otherwise updates last_error + last_attempted_at.
 //   - On ErrApplyDead or other decode errors: marks apply_status='dead'.
 //
@@ -13043,7 +13543,7 @@ func (s *Store) ReplayDeferredForScope(targetKey, project string) (result Replay
 		// Classify the error and update the deferred row.
 		newRetry := row.retryCount + 1
 		var newStatus string
-		if (errors.Is(applyErr, ErrRelationFKMissing) || errors.Is(applyErr, errPulledParentSessionMissing)) && newRetry < deadThreshold {
+		if (errors.Is(applyErr, ErrRelationFKMissing) || errors.Is(applyErr, ErrRelationProjectMismatch) || errors.Is(applyErr, errPulledParentSessionMissing)) && newRetry < deadThreshold {
 			// Still retryable.
 			newStatus = "deferred"
 			result.Failed++
@@ -13090,12 +13590,12 @@ func (s *Store) RearmEligibleDeadRelationsForScope(targetKey, project string) (i
 		  AND entity = ?
 		  AND apply_status = 'dead'
 		  AND retry_count = ?
-		  AND last_error = ?
+		  AND last_error IN (?, ?)
 		  AND sync_id = payload_sync_id
 		  AND entity_key = payload_sync_id
 		  AND op = ?
 		ORDER BY first_seen_at
-	`, targetKey, project, SyncEntityRelation, deadThreshold, ErrRelationFKMissing.Error(), SyncOpUpsert)
+	`, targetKey, project, SyncEntityRelation, deadThreshold, ErrRelationFKMissing.Error(), ErrRelationProjectMismatch.Error(), SyncOpUpsert)
 	if err != nil {
 		return 0, fmt.Errorf("rearm eligible dead relations: list: %w", err)
 	}
@@ -13154,11 +13654,11 @@ func (s *Store) RearmEligibleDeadRelationsForScope(targetKey, project string) (i
 			  AND entity = ?
 			  AND apply_status = 'dead'
 			  AND retry_count = ?
-			  AND last_error = ?
+			  AND last_error IN (?, ?)
 			  AND sync_id = payload_sync_id
 			  AND entity_key = payload_sync_id
 			  AND op = ?
-		`, row.syncID, targetKey, project, SyncEntityRelation, deadThreshold, ErrRelationFKMissing.Error(), SyncOpUpsert)
+		`, row.syncID, targetKey, project, SyncEntityRelation, deadThreshold, ErrRelationFKMissing.Error(), ErrRelationProjectMismatch.Error(), SyncOpUpsert)
 		if err != nil {
 			return rearmed, fmt.Errorf("rearm eligible dead relation %s: %w", row.syncID, err)
 		}

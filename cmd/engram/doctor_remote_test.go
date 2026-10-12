@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloudconfig"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloudconfig"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
 func seedDoctorRemoteStates(t *testing.T, cfg store.Config, keys ...string) {

@@ -15,8 +15,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/project"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/project"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 	mcppkg "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -1461,11 +1461,11 @@ func TestHandleSavePromptCaptureFailureIsNonFatal(t *testing.T) {
 	activity.RecordPrompt(defaultSessionID("engram"), "engram", "prompt capture should fail non-fatally")
 	h := handleSave(s, MCPConfig{}, activity)
 
-	originalAddPromptIfMissing := addPromptIfMissing
-	addPromptIfMissing = func(*store.Store, store.AddPromptParams) (int64, bool, error) {
-		return 0, false, errors.New("forced prompt capture failure")
+	originalCapturePromptForSave := capturePromptForSave
+	capturePromptForSave = func(*store.Store, *bool, store.AddPromptParams) error {
+		return errors.New("forced prompt capture failure")
 	}
-	t.Cleanup(func() { addPromptIfMissing = originalAddPromptIfMissing })
+	t.Cleanup(func() { capturePromptForSave = originalCapturePromptForSave })
 
 	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"title":   "Non fatal prompt capture",
@@ -3798,7 +3798,7 @@ func TestMemDoctorOmittedProjectUsesAutoDetectedScope(t *testing.T) {
 	dir := t.TempDir()
 	initTestGitRepo(t, dir)
 	t.Chdir(dir)
-	detected, err := resolveWriteProject()
+	detected, err := resolveWriteProject(newMCPTestStore(t))
 	if err != nil {
 		t.Fatalf("resolveWriteProject: %v", err)
 	}
@@ -5163,7 +5163,7 @@ func TestSessionEndFailsClosedWhenRepositoryBindingUnavailable(t *testing.T) {
 	initTestGitRepo(t, dir)
 	t.Chdir(dir)
 
-	initial, err := resolveWriteProject()
+	initial, err := resolveWriteProject(newMCPTestStore(t))
 	if err != nil {
 		t.Fatalf("create repository binding: %v", err)
 	}
@@ -6696,7 +6696,7 @@ func TestAmbiguousRecoveryReadHintKeepsSameReadTool(t *testing.T) {
 		initTestGitRepo(t, child)
 	}
 	t.Chdir(parent)
-	res, err := resolveWriteProject()
+	res, err := resolveWriteProject(newMCPTestStore(t))
 	if !errors.Is(err, project.ErrAmbiguousProject) {
 		t.Fatalf("expected ambiguity, got %v", err)
 	}
@@ -7975,6 +7975,148 @@ func TestMemCurrentProject_WarningCase3(t *testing.T) {
 	}
 }
 
+// TestMemCurrentProject_ExplicitWorkspace checks workspace selection and metadata.
+func TestMemCurrentProject_ExplicitWorkspace(t *testing.T) {
+	t.Setenv("ENGRAM_PROJECT", "")
+	newRepo := func(project string) string {
+		t.Helper()
+		dir := t.TempDir()
+		initTestGitRepo(t, dir)
+		cmd := exec.Command("git", "-C", dir, "remote", "add", "origin",
+			"git@github.com:user/"+project+".git")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git remote add: %v\n%s", err, out)
+		}
+		return dir
+	}
+	directory := newRepo("directory-project")
+	alias := newRepo("alias-project")
+	processDir := newRepo("process-project")
+	t.Chdir(processDir)
+	processCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		args        map[string]any
+		wantProject string
+		wantDir     string
+	}{
+		{"directory", map[string]any{"directory": directory}, "directory-project", directory},
+		{"cwd alias", map[string]any{"cwd": alias}, "alias-project", alias},
+		{"directory takes precedence", map[string]any{"directory": directory, "cwd": alias}, "directory-project", directory},
+		{"empty directory uses alias", map[string]any{"directory": "", "cwd": alias}, "alias-project", alias},
+		{"whitespace directory uses alias", map[string]any{"directory": " \t ", "cwd": alias}, "alias-project", alias},
+		{"blank arguments use process cwd", map[string]any{"directory": " \t ", "cwd": " \t "}, "process-project", processCwd},
+		{"no arguments use process cwd", nil, "process-project", processCwd},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newMCPTestStore(t)
+			res, err := handleCurrentProject(s, MCPConfig{})(context.Background(),
+				mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: tt.args}})
+			if err != nil {
+				t.Fatalf("handler error: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("unexpected error: %s", callResultText(t, res))
+			}
+			var got struct {
+				Project       string `json:"project"`
+				ProjectSource string `json:"project_source"`
+				ProjectPath   string `json:"project_path"`
+				Cwd           string `json:"cwd"`
+			}
+			if err := json.Unmarshal([]byte(callResultText(t, res)), &got); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if got.Project != tt.wantProject {
+				t.Errorf("project = %q, want %q", got.Project, tt.wantProject)
+			}
+			if got.ProjectSource != "git_remote" {
+				t.Errorf("project_source = %q, want git_remote", got.ProjectSource)
+			}
+			wantPath, err := filepath.EvalSymlinks(tt.wantDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotPath, err := filepath.EvalSymlinks(got.ProjectPath)
+			if err != nil {
+				t.Fatalf("resolve project_path %q: %v", got.ProjectPath, err)
+			}
+			if filepath.Clean(gotPath) != filepath.Clean(wantPath) {
+				t.Errorf("project_path = %q, want %q", got.ProjectPath, wantPath)
+			}
+			if got.Cwd != tt.wantDir {
+				t.Errorf("cwd = %q, want %q", got.Cwd, tt.wantDir)
+			}
+			afterCwd, err := os.Getwd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if afterCwd != processCwd {
+				t.Errorf("process cwd changed to %q, want %q", afterCwd, processCwd)
+			}
+		})
+	}
+}
+
+// TestMemCurrentProject_NonexistentExplicitWorkspace preserves basename fallback.
+func TestMemCurrentProject_NonexistentExplicitWorkspace(t *testing.T) {
+	t.Setenv("ENGRAM_PROJECT", "")
+	missing := filepath.Join(t.TempDir(), "missing-workspace")
+	s := newMCPTestStore(t)
+
+	res, err := handleCurrentProject(s, MCPConfig{})(context.Background(),
+		mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+			"directory": missing,
+		}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+	var got struct {
+		Project       string `json:"project"`
+		ProjectSource string `json:"project_source"`
+		ProjectPath   string `json:"project_path"`
+		Cwd           string `json:"cwd"`
+	}
+	text := callResultText(t, res)
+	if err := json.Unmarshal([]byte(text), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Project != "missing-workspace" {
+		t.Errorf("project = %q, want missing-workspace", got.Project)
+	}
+	if got.ProjectSource != project.SourceDirBasename {
+		t.Errorf("project_source = %q, want %q", got.ProjectSource, project.SourceDirBasename)
+	}
+	wantPath, err := filepath.Abs(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(got.ProjectPath) != filepath.Clean(wantPath) {
+		t.Errorf("project_path = %q, want %q", got.ProjectPath, wantPath)
+	}
+	if got.Cwd != missing {
+		t.Errorf("cwd = %q, want %q", got.Cwd, missing)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(text), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["error_hint"]; ok {
+		t.Errorf("unexpected error_hint in response: %s", text)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Errorf("missing workspace was created or cannot be checked: %v", err)
+	}
+}
+
 // ─── Test helpers (Batch 3) ───────────────────────────────────────────────────
 
 // initTestGitRepo creates a git repo in dir, configures user, and optionally
@@ -8012,7 +8154,7 @@ func TestResolveWriteProject_AutoDetects(t *testing.T) {
 	initTestGitRepo(t, dir)
 	t.Chdir(dir)
 
-	res, err := resolveWriteProject()
+	res, err := resolveWriteProject(newMCPTestStore(t))
 	if err != nil {
 		t.Fatalf("resolveWriteProject: %v", err)
 	}
@@ -8040,7 +8182,7 @@ func TestResolveWriteProject_UsesConfigFromRepoRootSubdir(t *testing.T) {
 	}
 	t.Chdir(subdir)
 
-	res, err := resolveWriteProject()
+	res, err := resolveWriteProject(newMCPTestStore(t))
 	if err != nil {
 		t.Fatalf("resolveWriteProject: %v", err)
 	}
@@ -8060,7 +8202,7 @@ func TestResolveWriteProject_InvalidConfigFailsClearly(t *testing.T) {
 	}
 	t.Chdir(dir)
 
-	_, err := resolveWriteProject()
+	_, err := resolveWriteProject(newMCPTestStore(t))
 	if !errors.Is(err, project.ErrInvalidConfig) || !strings.Contains(err.Error(), "project_name") {
 		t.Fatalf("expected clear invalid config project_name error, got %v", err)
 	}
@@ -8162,7 +8304,7 @@ func TestResolveWriteProject_AmbiguousError(t *testing.T) {
 	}
 	t.Chdir(parent)
 
-	_, err := resolveWriteProject()
+	_, err := resolveWriteProject(newMCPTestStore(t))
 	if !errors.Is(err, project.ErrAmbiguousProject) {
 		t.Errorf("expected ErrAmbiguousProject, got %v", err)
 	}
@@ -10966,7 +11108,7 @@ func TestHandleContextPersonalScopeIgnoresCWDProject(t *testing.T) {
 // handleSessionSummary writes under that project instead of falling back to cwd
 // detection. Mirrors TestProcessOverrideSaveHandlerWritesToDefaultProject for save.
 func TestSessionSummary_ProcessOverrideWritesToDefaultProject(t *testing.T) {
-	// Use a temp dir that has no git repo — without the fix, resolveWriteProject()
+	// Use a temp dir that has no git repo — without the fix, resolveWriteProject(newMCPTestStore(t))
 	// would return an error or a wrong project; with the fix it uses the override.
 	dir := t.TempDir()
 	t.Chdir(dir)

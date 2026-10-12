@@ -1004,7 +1004,13 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 			return result
 		}
 		if op == SyncOpUpsert {
-			require("directory")
+			if rawStringField("ownership_mode") == SessionOwnershipProjectOwned {
+				if err := ValidateCloudSessionDirectory([]byte(trimmed)); err != nil {
+					missing = append(missing, "directory")
+				}
+			} else {
+				require("directory")
+			}
 		}
 	case SyncEntityObservation:
 		if field("sync_id") == "" && strings.TrimSpace(entityKey) == "" {
@@ -1050,8 +1056,9 @@ func ValidateSyncMutationPayload(entity, op, payload, entityKey string) SyncMuta
 	return result
 }
 
-// RepairObservationMutationTitles restores the single title field that can be
-// proved from a matching titleless local observation. It deliberately does not
+// RepairObservationMutationTitles restores a missing payload title from a
+// matching local observation's current title, or derives a blank source title
+// from its content. It deliberately does not
 // enqueue a replacement mutation: the existing journal row keeps its sequence
 // and all delivery state while only its frozen payload is corrected.
 func (s *Store) RepairObservationMutationTitles(project string, apply bool) (SyncMutationTitleRepairReport, error) {
@@ -1108,6 +1115,10 @@ func (s *Store) RepairObservationMutationTitles(project string, apply bool) (Syn
 		}
 		repairedObservations := make(map[int64]struct{})
 		for _, repair := range repairs {
+			// A valid current title is copied only into the frozen payload.
+			if strings.TrimSpace(repair.sourceTitle) != "" {
+				continue
+			}
 			if _, repaired := repairedObservations[repair.observationID]; repaired {
 				continue
 			}
@@ -1167,10 +1178,21 @@ func (s *Store) observationMutationTitleRepairTx(tx *sql.Tx, mutation SyncMutati
 	observationProject, _ := NormalizeProject(derefString(observation.Project))
 	mutationProject, _ := NormalizeProject(mutation.Project)
 	payloadProject, _ := NormalizeProject(payloadString("project"))
-	if strings.TrimSpace(observation.Title) != "" || (mutationProject != "" && mutationProject != observationProject) || (payloadProject != "" && payloadProject != observationProject) {
+	if (mutationProject != "" && mutationProject != observationProject) || (payloadProject != "" && payloadProject != observationProject) {
 		return SyncMutationTitleRepairAction{}, "", 0, "", false, nil
 	}
-	title := deriveObservationRepairTitle(observation.Content)
+	var title string
+	if strings.TrimSpace(observation.Title) != "" {
+		// Trust the current local projection, not historical payload content.
+		// Legacy blank project references are safe only within the existing query.
+		if mutation.Source != SyncSourceLocal || observationProject == "" ||
+			payloadString("session_id") != observation.SessionID || payloadString("scope") != observation.Scope {
+			return SyncMutationTitleRepairAction{}, "", 0, "", false, nil
+		}
+		title = observation.Title
+	} else {
+		title = deriveObservationRepairTitle(observation.Content)
+	}
 	if err := ValidateObservationTitle(title); err != nil {
 		return SyncMutationTitleRepairAction{}, "", 0, "", false, nil
 	}
@@ -1243,11 +1265,15 @@ func (s *Store) ApplySessionProjectReclassification(actions []SessionProjectRecl
 	result.BackupPath = backupPath
 	err = s.withTx(func(tx *sql.Tx) error {
 		for _, action := range normalized {
+			// The owner test is canonical, so it cannot be one SQL CASE over
+			// `id = 'manual-save-' || project`.
+			mode := SessionOwnershipShared
+			if manualSaveOwnerProject(action.SessionID, action.ToProject) {
+				mode = SessionOwnershipProjectOwned
+			}
 			res, err := s.execHook(tx, `UPDATE sessions
-				SET project = ?, ownership_mode = CASE
-					WHEN id = 'manual-save-' || ? THEN 'project_owned'
-					ELSE 'shared' END
-				WHERE id = ? AND project = ?`, action.ToProject, action.ToProject, action.SessionID, action.FromProject)
+				SET project = ?, ownership_mode = ?
+				WHERE id = ? AND project = ?`, action.ToProject, mode, action.SessionID, action.FromProject)
 			if err != nil {
 				return fmt.Errorf("reclassify session %q: %w", action.SessionID, err)
 			}

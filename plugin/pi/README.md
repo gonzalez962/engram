@@ -19,6 +19,61 @@ Pi is great at doing the work in front of it. The problem is everything around t
 
 Engram is persistent memory for AI coding agents. `gentle-engram` connects Pi to that memory so your agent can save the useful parts of a session and retrieve them later — without stuffing raw tool output back into the prompt.
 
+## Local bridge ownership protocol
+
+Native Engram exposes a session-scoped responder on the local `pi.events` bus after
+`session_start`. This is routing context, **not authentication**, and does not itself
+suppress any Claude hooks. Consumers must route to the bus for the exact Pi runtime
+session; ownership of a parent never establishes ownership of a nested session.
+
+- Request channel: `engram:bridge:claim:v1`
+- Request fields: `{ runtimeSessionId: string, nonce: string, operation: "session-register" | "prompt-capture", promptDigest?: string }`
+- Reply channel: `engram:bridge:decision:v1`
+- Reply fields: the exact three required request fields, the supplied `promptDigest`
+  when it is a string, and `status: "owned" | "unknown"`.
+
+Runtime IDs are opaque and compared without trimming. Nonces must be nonblank
+strings of at most 256 JavaScript string units; consumers generate a fresh nonce
+per query and correlate all three fields. Invalid requests and foreign IDs receive
+no reply. Since `emit` does not await listeners, subscribe before emitting and use
+a bounded consumer timeout (allow for the responder's 1000 ms decision budget).
+No reply is not proof that native Engram is absent.
+
+An eligible `session-register` claim can confirm registration using the existing
+native registration path before the provider spawns, joining a pending registration.
+Only its validated server acknowledgement permits `owned`; UI readiness never does.
+
+A `prompt-capture` claim **never registers or captures a prompt**. It requires
+`promptDigest`: exactly 64 lowercase hexadecimal characters encoding SHA-256 of
+UTF-8 bytes of the original prompt after JavaScript `.trim()`. Only a matching
+current native turn with a confirmed `/prompts` reply `{ id: <positive safe integer>,
+status: "saved" }` permits `owned`. Missing, invalid, or mismatched digests return
+`unknown`. The proof stores only the digest and routing identities, not plaintext,
+private content, or durable metadata. Every `before_agent_start` clears prior proof
+before initialization or early returns; lifecycle changes also invalidate it.
+Short prompts (trimmed length <=10) retain the existing native skip policy and
+therefore cannot establish prompt ownership. Failed or ambiguous delivery cannot
+reuse a previous turn's proof, even for repeated identical prompts.
+
+Digest matching identifies the original input, **not full-fidelity storage**:
+native persistence still redacts private tags before truncating to 2000 JavaScript
+string units plus an ellipsis when needed. Consumers must account for this policy
+when deciding which capture is duplicate; ownership does not assert that private
+or truncated content was stored. Failed, unresolved, stale, closing, or timed-out
+claims cannot return `owned`. Timeout does not cancel an existing registration or
+trigger a retry, and never emits a late positive decision. Unknown retains hooks.
+
+Listeners and pending reply delivery are removed on shutdown **and reload**;
+reload still skips persistence shutdown. Each new native session must establish
+its own registration. Cross-runtime bridge routing and hook suppression are
+consumer responsibilities, not a process-global readiness signal.
+
+## Per-save prompt capture
+
+Native `mem_save` honors `capture_prompt` (optional boolean, default `true`). It sends the available current turn's already-redacted, truncated prompt for the same session/project to Go core, which best-effort stores it using exact session/project/stored-content dedupe. Missing context or a capture failure does not fail the observation save. Prompt rows are independent; no observation-ID link is created.
+
+`capture_prompt=false` skips only that save's capture attempt. It does **not** disable `before_agent_start` lifecycle capture or remove previously captured prompts. Synthetic/short turns, another runtime/project, and shutdown/reload cannot reuse the preceding turn's prompt. Enqueuing steer/follow-up input preserves the active run's capture. The initial user `message_start` after `before_agent_start` also preserves it; each subsequent user `message_start` marks consumption of queued input and clears both prompt context and ownership proof. Queued turns never inherit or capture prompt context, even when their text repeats the previous prompt. The next normal `before_agent_start` establishes its own context.
+
 ## At a glance
 
 | You want                    | Engram gives Pi                                  |
@@ -75,14 +130,119 @@ Engram does not try to make the model read everything. It gives the model a disc
 
 Engram includes a terminal UI for browsing sessions, observations, prompts, projects, timelines, and search results. Engram Cloud adds browser visibility for shared project memory.
 
+## Core resume compatibility
+
+`gentle-engram` 0.3.0 negotiates root session resume through `GET /health`:
+`capabilities.root_session_resume: true` enables it; explicit false or malformed
+capability data disables it. When the capability is absent, a stable core version
+of **3.0.0 or newer** (optionally prefixed with `v`) is accepted. The tagged
+v3.0.0 server implements core-selected continuation identities; earlier releases
+are not inferred compatible. Unknown, malformed, and prerelease versions require
+explicit support advertisement.
+
+Each root registration flight retains its first resume-support decision and
+rechecks health before every dispatch. If support changes (including unreadable
+health after supported health), the retry stops before another POST. Retry once
+core health is stable: the earlier registration may have succeeded despite a
+lost acknowledgement, but no unacknowledged identity is adopted. Stable support
+permits an idempotent retry with the same resume flag.
+
+Without resume support, fresh root sessions and still-active persisted mappings
+can register normally without resume. If an ended identity needs continuation,
+attributed writes stop with a diagnostic naming the plugin and core versions,
+the support requirement, and upgrade guidance. Upgrade the Engram binary and
+restart the running server, then retry; updating only the Pi package is not
+sufficient. The plugin never invents a continuation ID or adopts a failed
+registration. Read-only memory tools do not require resume support. Cross-project
+satellite saves still require `isolated_session_registration: true` separately.
+
+## Read-only caller-binding diagnostic
+
+Pi-native `mem_doctor` preserves the existing project/check request to `GET /doctor`
+and adds a separate `caller_binding` assessment from `POST /doctor/caller-binding`.
+Pi supplies observed runtime identity, a read-only effective mapping, and host API
+availability; Go evaluates persisted session state. Model parameters cannot supply
+these caller facts. A foreign project target does not inherit an unvalidated
+mapping or create a satellite.
+
+Project checks and caller binding are displayed separately. Healthy project checks
+can coexist with a blocked or unknown caller. An ended root is not itself a blocker:
+a live continuation may remain valid, or the normal registration path may support
+safe resume. Missing or throwing host APIs provide missing evidence, not readiness.
+An unsupported, failed, or malformed caller endpoint yields `unknown` with safe
+support-verification guidance while retaining the project report.
+
+Diagnosis never registers, renews leases, creates continuations, ends sessions,
+appends mapping entries, or repairs bindings. Even `ok` does not guarantee a later
+write. Only the six allowlisted fields in `caller_binding` are intended as shareable
+evidence: no identities, projects, paths, raw responses, or errors are included.
+The original project report is **not** asserted privacy-safe. CLI, HTTP project-only,
+and MCP doctor behavior are unchanged. This diagnostic relates to #1622 and #1635;
+it does not resolve either incident or weaken session guards.
+
+## Opt-in Pi session registration trace
+
+For an affected quit/resume cycle, set `ENGRAM_PI_SESSION_TRACE=1` before launching
+Pi with `gentle-engram` 0.3.0 or a local source checkout. The older `0.2.0` package
+does not include this instrumentation. When using a local extension, do not load
+an installed npm copy at the same time.
+
+If your Pi `settings.json` lists an installed `npm:gentle-engram` version under `packages`,
+temporarily remove only that entry before launching the local extension, then
+restore it after collecting the trace. Keep other packages enabled: `-e` adds
+an extension; it does not replace the installed package.
+
+From the repository root in a POSIX shell, set `SESSION_ID` to the ID
+of the conversation you intend to resume, then run:
+
+```bash
+ENGRAM_PI_SESSION_TRACE=1 pi -e ./plugin/pi/index.ts --session "${SESSION_ID:?Set SESSION_ID to the conversation you intend to resume}"
+```
+
+Use the entrypoint that actually fails; the printed launcher hint is not known to
+reproduce every report. The flag is inherited by child processes. Loading or
+reloading this instrumented extension is required; setting it in an unrelated
+shell does not change a running Pi process.
+
+Lifecycle and registration emit JSON lines prefixed with `[engram:session-trace]`
+to stderr:
+
+- `lifecycle`: `session_start` or `session_shutdown`; identity classified as `first`,
+  `same`, `different`, or `missing`, compared with the previous valid traced
+  lifecycle identity in this extension instance. Shutdown reason is allowlisted
+  as `reload`, `other`, or `missing`, never the raw host string. Reload shutdown
+  is observed before returning without persistence cleanup.
+- `context`: availability of `append_entry` and `get_branch`, and whether the
+  persisted mapping refers to the root or a continuation.
+- `dispatch`: root/continuation request classification and the actual `resume`
+  boolean after capability negotiation, for each transport dispatch attempt.
+- `acknowledgement`: root/continuation/invalid acknowledgement classification.
+- `adoption`: the validated effective identity was adopted.
+- `rejection`: HTTP status (or null) and the allowlisted reason
+  `session_already_ended` or `other`; raw errors are never included.
+
+Only these trace lines are intended for sharing. They contain no session IDs,
+project names, paths, URLs, request bodies, memory content, or raw server errors.
+Other stderr output may contain sensitive information; do not share the full log.
+Concurrent registration traces may interleave and are not individually correlated.
+Lifecycle comparisons reset on a new extension instance/process (including reload)
+and after an event observed with tracing disabled. A missing identity does not
+replace the last valid comparison identity. `other` does not identify the exact
+shutdown reason or prove a picker switch; describe the entrypoint separately.
+An absent trace does not prove no event/request occurred unless this extension and flag
+were confirmed active; independent `mem_session_start` and satellite registrations
+are outside this trace. Tracing does not change retry, adoption, or write rules.
+Unset the flag (or set any value other than `1`) for subsequent launches to disable
+it. No trace file is created automatically.
+
 ## Quick start
 
 ```bash
-pi install npm:gentle-engram@0.1.17
+pi install npm:gentle-engram@0.3.0
 pi-engram init
 ```
 
-Use this quick start if `gentle-engram@0.1.17` is available on npm; otherwise wait for its publication before running these commands for native-only setup. Published `0.1.16` still registers Engram MCP during `pi-engram init`, so do not use it for native-only setup. Go's `engram setup pi` remains pinned to `0.1.16` pending a separate pin update.
+This source version of Go's `engram setup pi` pins `0.3.0`. The released Engram core `3.2.1` still pins `0.2.0`; use the explicit install command above to select `0.3.0`. Earlier `0.1.16` still registers Engram MCP during `pi-engram init`, so do not use it for native-only setup.
 
 Restart Pi after installation, then ask Pi what it remembers about the current project or call `mem_context`.
 
@@ -153,6 +313,25 @@ Pi sends eligible non-Engram tool results to Engram for passive scanning after r
 - Prompt context tied to meaningful saved observations
 - Cross-machine/team memory once a project is enrolled in Engram Cloud
 
+### Automatic user-prompt capture
+
+Prompts with more than 10 trimmed characters are captured once at
+`before_agent_start`, after Pi's input expansion. The extension uses the `input`
+event's source to exclude extension-injected turns, including automatic subagent
+wake notifications. Sessions marked with `GENTLE_PI_AGENTS_CHILD` also skip
+automatic user-prompt capture; their memory tools and other lifecycle behavior
+remain available.
+
+Human-facing RPC prompts are still eligible: RPC alone does not identify a
+subagent. When input provenance is unavailable, the existing capture policy is
+preserved. Pending provenance is isolated by runtime session identity and cleared
+on session start (including switching), shutdown, and reload. Queued steering and
+follow-up inputs do not replace idle-input provenance: Pi delivers those through
+its queues without a new `before_agent_start` capture.
+
+This changes automatic capture only, not explicit `mem_save_prompt` calls, and
+does not remove previously stored synthetic prompts.
+
 ## Private blocks
 
 `gentle-engram` redacts explicit private blocks before sending captured prompts, passive observations, or compaction summaries to Engram:
@@ -214,9 +393,25 @@ Run it again when new chunks are published and you want to import them. Opening 
 
 If you only want HTTP session capture against an already running Engram server, set `ENGRAM_URL` and the extension will not auto-start a local `engram serve` process.
 
+Background session registration reports exhausted timeout or unknown transport outcomes with safe-retry guidance, separately from invalid acknowledgement identities. Both failures block passive observations until registration is confirmed.
+
 When `ENGRAM_URL` is unset, a confirmed local server that later refuses connections gets one bounded restart attempt per initialized runtime. Pi gives ordinary reads a bounded 10-second retry policy and `mem_doctor` a bounded 15-second retry policy. Session registration uses a separate bounded 5-second replay policy because Engram core implements that route as idempotent. Other writes are sent once with a short deadline: if their transport outcome is ambiguous, Pi reports it as **unknown** and tells you to verify before retrying rather than risking a duplicate mutation. Caller cancellation is propagated, not reported as a transport failure.
 
 A local `/health` response without `instance_id` is treated as legacy only when it reports a recognized version older than `2.0.0-rc.11`, the release that introduced instance identity. Current, unknown, absent, or malformed versions without identity fail closed with identity-verification guidance; Pi does not adopt, terminate, or replace that server automatically.
+
+### Local ownership mismatch
+
+When the local health probe observes a different instance ID, Pi fails closed: it neither adopts the foreign server nor spawns or kills a server. The error includes the expected local ID, observed remote ID, and available CLI/server versions (`unknown` when unavailable). WSL2 shared-loopback can cause a server in another environment to answer the local port, but this is a possible cause, not a diagnosis.
+
+`mem_doctor` returns a structured `LOCAL` error diagnostic with code `ownership_mismatch` and the retained evidence. It uses the initialization failure, without re-probing or sending `/doctor`, project, session, or memory requests to the foreign endpoint. Normal doctor calls still use the server and retain their project/session gates; other startup failures do not use this fallback. Startup retains its bounded retry cadence, so a later call can recheck after you fix the conflict.
+
+Stop the foreign server from its owning environment, or choose a free local port and relaunch:
+
+```bash
+ENGRAM_PORT=17437 pi
+```
+
+This local-port remedy requires `ENGRAM_URL` to be unset. `ENGRAM_PORT` alone never overrides an explicit `ENGRAM_URL`; an explicit URL opts into an externally managed server and skips local ownership checks.
 
 ## Configuration
 
@@ -255,7 +450,7 @@ The Pi extension treats absent, empty, and whitespace-only `ENGRAM_URL`, `ENGRAM
 
 With this Pi package version, `pi-engram init` updates Pi-owned config in the Pi agent directory:
 
-- `settings.json`: ensures `npm:gentle-engram@0.1.17` is declared, replacing affected `npm:gentle-engram@0.1.8`, `npm:gentle-engram@0.1.11`, `npm:gentle-engram@0.1.12`, `npm:gentle-engram@0.1.14`, `npm:gentle-engram@0.1.15`, and `npm:gentle-engram@0.1.16` pins when present. It does not add `npm:pi-mcp-adapter` and leaves an existing adapter entry untouched.
+- `settings.json`: ensures `npm:gentle-engram@0.3.0` is declared, replacing affected `npm:gentle-engram@0.1.8`, `npm:gentle-engram@0.1.11`, `npm:gentle-engram@0.1.12`, `npm:gentle-engram@0.1.14`, `npm:gentle-engram@0.1.15`, `npm:gentle-engram@0.1.16`, and `npm:gentle-engram@0.2.0` pins when present. It does not add `npm:pi-mcp-adapter` and leaves an existing adapter entry untouched.
 - `mcp.json`: never created or changed by init. Existing `mcpServers.engram` triggers a warning with its exact config path. Manually remove only that key and restart/reload Pi to guarantee native-only agent writes; preserve unrelated MCP servers.
 
 `engram setup pi` also auto-pins `npmCommand` in Pi's `settings.json` when [mise](https://mise.jdx.dev/) is detected in `PATH`. It sets `npmCommand` to `["mise", "exec", "node@<version>", "--", "npm"]` so Pi always uses the mise-managed Node version. Existing `npmCommand` values are never overwritten; if mise is not found, this step is a no-op.
@@ -282,18 +477,30 @@ MCP tool calls still use Engram core's canonical project resolver at call time. 
 }
 ```
 
+### Cross-project saves
+
+Each Pi runtime session is registered `project_owned` and keeps exactly one owning project: the project detected for Pi's working directory (or, when detection is unresolved, the first explicit project that registers it). Saving into another repository or worktree is explicit only:
+
+- `mem_save`, `mem_save_prompt`, and `mem_session_summary` accept `project: "name"` or `cwd: "/path/inside/other/repo"`.
+- `cwd` is resolved through the same server detection as `/project/current`. An ambiguous or unresolved `cwd` fails with the detection hint and available projects instead of guessing. When both `project` and `cwd` are set they must agree (case-insensitive), otherwise the call fails before anything is written.
+- When the target differs from the runtime session's owning project, Pi registers a derived satellite session `<runtimeID>@<project>` as `project_owned` under the target project with no directory and writes with it. `cwd` only resolves the target project; newly created satellites have an empty stored directory and are never implicit directory-matched runtime candidates for other MCP agents. The runtime session is never re-registered under the target, so no `session_project_conflict` occurs. The satellite renews its lease on every write, concurrent writes share one registration, and an ended satellite resumes through the normal `<id>:resume:N` continuation. Pi ends its satellites when the runtime session quits; after an extension reload they stay unended and only their local lease lapses.
+- Before every satellite registration dispatch (including transport retries and the single bounded recovery replay), Pi requires `GET /health` to advertise `capabilities.isolated_session_registration: true` (literal boolean). Missing, false, or malformed capabilities fail closed with upgrade guidance before any satellite POST; no version floor is guessed. Pi sends `isolated: true`, which makes the server validate the root and selected continuation atomically before lease renewal or ownership repair. A previously persisted nonblank directory or `shared` ownership mode (including a blank-directory `shared` row) returns `409 session_isolation_conflict` without mutation; the row is never silently cleared or converted. Same-project runtime registration does not require this capability.
+- Same-project writes, and writes without an explicit target, keep using the runtime session exactly as before.
+
+There is no automatic inference: editing files in another repository never changes where memories go. Prompt and passive capture always target the detected project.
+
 ## Troubleshooting
 
 | Symptom                                                      | Fix                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mem_*` tools are missing                                    | If `gentle-engram@0.1.17` is available on npm, install/verify `npm:gentle-engram@0.1.17`, run `pi-engram init`, then restart Pi. Published `0.1.16` init still registers Engram MCP; do not use it for native-only setup.                                                                                    |
+| `mem_*` tools are missing                                    | Install/verify `npm:gentle-engram@0.3.0`, run `pi-engram init`, then restart Pi. Earlier `0.1.16` init still registers Engram MCP; do not use it for native-only setup.                                                                                                 |
 | Pi cannot find `engram`                                      | Set `ENGRAM_BIN=/absolute/path/to/engram`.                                                                                                                                                                                                                              |
 | Session capture should use another server                    | Set `ENGRAM_URL=http://host:7437`.                                                                                                                                                                                                                                      |
 | Pi shows `error MCP: 0/N servers` but `mem_*` works          | That status covers Pi's MCP servers, not Engram's Pi-native HTTP tools. Check `~/.pi/agent/mcp.json` for stale/unreachable servers such as remote OAuth services. |
 | Existing Pi `mcpServers.engram` entry                         | Manually remove only that key from the warned `mcp.json` path and restart/reload Pi; setup never replaces user-owned MCP config.                                                                                                                                                                                                                                           |
 | `mem_current_project` reports `/project/current` unsupported | Restart or upgrade the running `engram serve`; check `ENGRAM_URL`/`ENGRAM_BIN`. If `.engram/config.json` exists, Pi uses it as a temporary fallback.                                                                                                                    |
 | `mem_session_summary` cannot detect a project                | Ask the user which project should receive the summary, then retry `mem_session_summary` with `project: "name"`.                                                                                                                                                         |
-| Pi warns that its runtime session belongs to another project | Pi registers runtime sessions as `project_owned`. If Engram already persists that session under another nonblank project, its structured `409 session_project_conflict` response suppresses prompt and passive capture even after Pi restarts. Start a fresh Pi session in the current project. |
+| Pi warns that its runtime session belongs to another project | Pi registers runtime sessions as `project_owned`. If Engram already persists that session under another nonblank project, its structured `409 session_project_conflict` response suppresses prompt and passive capture even after Pi restarts. Start a fresh Pi session in the current project. To save into another project from this session, pass `project` or `cwd` explicitly (see [Cross-project saves](#cross-project-saves)). |
 | Status bar shows `🧠 repos · ambiguous project`             | Pi was started from a parent directory that contains multiple git repos. Run Pi from inside a single repo, or add `.engram/config.json` with `"project_name": "my-project"` to the ambiguous directory.                                                                 |
 
 ## Next steps

@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -67,7 +69,7 @@ func runCodexUserPromptSubmit(input []byte, baseURL, stateDir string, now func()
 
 	ctx, cancel := context.WithTimeout(context.Background(), codexUserPromptDeadline)
 	defer cancel()
-	client := &http.Client{}
+	_, client := hookEndpointClient(baseURL)
 	var authority json.RawMessage
 	if !codexJSON(ctx, client, http.MethodGet, baseURL+"/project/current?cwd="+url.QueryEscape(in.CWD), nil, &authority) {
 		return fallback
@@ -76,15 +78,19 @@ func runCodexUserPromptSubmit(input []byte, baseURL, stateDir string, now func()
 	if !authorized {
 		return fallback
 	}
+	effective := codexRuntimeAt(ctx, client, baseURL, in.SessionID, in.CWD, project, "resolve")
+	if effective == "" {
+		return fallback
+	}
 	if in.Prompt != "" && in.SessionID != "" {
-		body, _ := json.Marshal(map[string]string{"session_id": in.SessionID, "project": project, "content": in.Prompt})
+		body, _ := json.Marshal(map[string]string{"session_id": effective, "project": project, "content": in.Prompt})
 		// Do not retry: a timeout cannot prove a dispatched persistence write failed.
 		_ = codexJSON(ctx, client, http.MethodPost, baseURL+"/prompts", body, nil)
 	}
 	if first {
 		return fallback
 	}
-	age, knownAge := codexSessionAge(ctx, client, baseURL, in.SessionID, now())
+	age, knownAge := codexSessionAge(ctx, client, baseURL, effective, now())
 	if knownAge && age < 5*time.Minute {
 		return []byte("{}")
 	}
@@ -102,7 +108,162 @@ func runCodexUserPromptSubmit(input []byte, baseURL, stateDir string, now func()
 	return codexMessage("MEMORY REMINDER: It's been at least 15 minutes since your last save. If you've made decisions, discoveries, or completed significant work, call mem_save now.")
 }
 
+// codexAcknowledgedID accepts only the server's exact host binding or a numeric
+// continuation of that host. Neither model arguments nor unrelated IDs qualify.
+func codexAcknowledgedID(fields map[string]json.RawMessage, host string, resume bool) string {
+	for _, key := range []string{"error", "error_code", "code"} {
+		if _, present := fields[key]; present {
+			return ""
+		}
+	}
+	var id, status, from string
+	if json.Unmarshal(fields["id"], &id) != nil || json.Unmarshal(fields["status"], &status) != nil || status != "created" || strings.TrimSpace(host) == "" {
+		return ""
+	}
+	if raw, present := fields["resumed_from"]; present {
+		if json.Unmarshal(raw, &from) != nil || from != host {
+			return ""
+		}
+	}
+	if id == host {
+		return id
+	}
+	if !resume || from != host || !codexContinuation(id, host) {
+		return ""
+	}
+	return id
+}
+
+func codexContinuation(id, host string) bool {
+	prefix := host + ":resume:"
+	if !strings.HasPrefix(id, prefix) {
+		return false
+	}
+	n := strings.TrimPrefix(id, prefix)
+	return n != "" && strings.IndexFunc(n, func(r rune) bool { return r < '0' || r > '9' }) < 0
+}
+
+func codexRegisterAt(ctx context.Context, client *http.Client, base, host, cwd, project string) string {
+	if strings.TrimSpace(host) == "" {
+		return ""
+	}
+	body, _ := json.Marshal(map[string]any{"id": host, "directory": cwd, "project": project, "resume": true})
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/sessions", strings.NewReader(string(body)))
+	if err != nil {
+		return ""
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = response.Body.Close() }()
+	var fields map[string]json.RawMessage
+	if response.StatusCode != http.StatusCreated || json.NewDecoder(response.Body).Decode(&fields) != nil {
+		return ""
+	}
+	return codexAcknowledgedID(fields, host, true)
+}
+
+func codexRuntimeAt(ctx context.Context, client *http.Client, base, host, cwd, project, operation string) string {
+	body, _ := json.Marshal(map[string]string{"id": host, "directory": cwd, "project": project})
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/runtime-sessions/"+operation, strings.NewReader(string(body)))
+	if err != nil {
+		return ""
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = response.Body.Close() }()
+	var fields map[string]json.RawMessage
+	if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&fields) != nil {
+		return ""
+	}
+	var status string
+	if json.Unmarshal(fields["status"], &status) != nil || (operation == "resolve" && status != "resolved") || (operation == "end" && status != "ended") {
+		return ""
+	}
+	fields["status"] = json.RawMessage(`"created"`)
+	return codexAcknowledgedID(fields, host, true)
+}
+
+func cmdCodexLifecycle(action string) {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return
+	}
+	result := runCodexLifecycle(action, data, codexHookURL())
+	if result != "" {
+		// Internal shell callers opt into JSON to retain opaque identity bytes.
+		// The default text output remains compatible with existing CLI callers.
+		if os.Getenv("ENGRAM_HOOK_OUTPUT") == "json" {
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"session_id": result})
+		} else {
+			_, _ = fmt.Fprintln(os.Stdout, result)
+		}
+	}
+}
+
+// Runtime identity belongs to the core, not a second platform-specific cache.
+func runCodexLifecycle(action string, data []byte, base string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), codexUserPromptDeadline)
+	defer cancel()
+	return runCodexLifecycleContext(ctx, action, data, base)
+}
+
+// The guard owns its context so a failed resolution can retain timeout evidence.
+func runCodexLifecycleContext(ctx context.Context, action string, data []byte, base string) string {
+	var in codexPromptInput
+	if json.Unmarshal(data, &in) != nil || strings.TrimSpace(in.SessionID) == "" || strings.TrimSpace(in.CWD) == "" || base == "" {
+		return ""
+	}
+	_, client := hookEndpointClient(base)
+	var authority json.RawMessage
+	if !codexJSON(ctx, client, http.MethodGet, base+"/project/current?cwd="+url.QueryEscape(in.CWD), nil, &authority) {
+		return ""
+	}
+	project, ok := codexProjectAuthority(authority)
+	if !ok {
+		return ""
+	}
+	switch action {
+	case "codex-register":
+		return codexRegisterAt(ctx, client, base, in.SessionID, in.CWD, project)
+	case "codex-resolve":
+		return codexRuntimeAt(ctx, client, base, in.SessionID, in.CWD, project, "resolve")
+	case "codex-session-end":
+		_ = codexRuntimeAt(ctx, client, base, in.SessionID, in.CWD, project, "end")
+	}
+	return ""
+}
+
+// hookEndpointClient shares endpoint selection across native hooks. Explicit TCP
+// callers retain their endpoint even when the environment selects a socket.
+func hookEndpointClient(base string) (string, *http.Client) {
+	client := &http.Client{}
+	configured := codexHookURL()
+	if base == "" {
+		base = configured
+	}
+	if strings.TrimSpace(os.Getenv("ENGRAM_URL")) == "" && base == "http://localhost" && base == configured {
+		if socket := strings.TrimSpace(os.Getenv("ENGRAM_SOCKET")); socket != "" {
+			client.Transport = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+			}}
+		}
+	}
+	return base, client
+}
+
 func codexHookURL() string {
+	if base := strings.TrimSpace(os.Getenv("ENGRAM_URL")); base != "" {
+		return strings.TrimRight(base, "/")
+	}
+	if strings.TrimSpace(os.Getenv("ENGRAM_SOCKET")) != "" {
+		return "http://localhost"
+	}
 	port := strings.TrimSpace(os.Getenv("ENGRAM_PORT"))
 	if port == "" {
 		port = "7437"

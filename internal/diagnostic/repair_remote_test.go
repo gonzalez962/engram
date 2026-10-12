@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloudconfig"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloudconfig"
 )
 
 func TestLiveCloudRemoteStateKeysListsEveryConfiguredOverride(t *testing.T) {

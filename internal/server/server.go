@@ -5,6 +5,7 @@
 package server
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/subtle"
 	"database/sql"
@@ -23,10 +24,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/diagnostic"
-	projectpkg "github.com/Gentleman-Programming/engram/v2/internal/project"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/diagnostic"
+	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
+
+var observedGenerationError = (*store.Store).GenerationError
 
 var loadServerStats = func(s *store.Store) (*store.Stats, error) {
 	return s.Stats()
@@ -66,18 +69,21 @@ type SemanticRunnerFactory func(name string) (store.SemanticRunner, error)
 type SemanticPromptBuilder func(a, b store.ObservationSnippet) string
 
 type Server struct {
-	store      *store.Store
-	mux        *http.ServeMux
-	port       int
-	listen     func(network, address string) (net.Listener, error)
-	serve      func(net.Listener, http.Handler) error
-	socketPath string
-	listener   net.Listener
-	socketInfo os.FileInfo
-	closeMu    sync.Mutex
-	closed     bool
-	onWrite    func() // called after successful local writes (for autosync notification)
-	syncStatus SyncStatusProvider
+	httpServer            *http.Server
+	generationInvalidated chan struct{}
+	generationOnce        sync.Once
+	store                 *store.Store
+	mux                   *http.ServeMux
+	port                  int
+	listen                func(network, address string) (net.Listener, error)
+	serve                 func(net.Listener, http.Handler) error
+	socketPath            string
+	listener              net.Listener
+	socketInfo            os.FileInfo
+	closeMu               sync.Mutex
+	closed                bool
+	onWrite               func() // called after successful local writes (for autosync notification)
+	syncStatus            SyncStatusProvider
 
 	// runnerFactory resolves a SemanticRunner by CLI name (read from ENGRAM_AGENT_CLI).
 	// When nil, semantic=true requests fail with 500.
@@ -91,7 +97,9 @@ type Server struct {
 }
 
 func New(s *store.Store, port int) *Server {
-	srv := &Server{store: s, port: port, listen: net.Listen, serve: http.Serve, version: "dev"}
+	srv := &Server{store: s, port: port, listen: net.Listen, version: "dev", generationInvalidated: make(chan struct{}, 1)}
+	srv.httpServer = &http.Server{Handler: srv.Handler()}
+	srv.serve = func(ln net.Listener, h http.Handler) error { return srv.httpServer.Serve(ln) }
 	if s != nil {
 		srv.instanceID = s.InstanceID()
 	}
@@ -249,7 +257,7 @@ func (s *Server) Start() error {
 	}
 	serveFn := s.serve
 	if serveFn == nil {
-		serveFn = http.Serve
+		serveFn = func(ln net.Listener, h http.Handler) error { return s.httpServer.Serve(ln) }
 	}
 
 	var (
@@ -287,8 +295,8 @@ func (s *Server) Start() error {
 	defer s.Close()
 
 	log.Printf("[engram] HTTP server listening on %s", addr)
-	err = serveFn(ln, s.mux)
-	if errors.Is(err, net.ErrClosed) {
+	err = serveFn(ln, s.Handler())
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
@@ -413,8 +421,33 @@ func removeOwnedUnixSocket(socketPath string, expected os.FileInfo) error {
 	return os.Remove(socketPath)
 }
 
+// GenerationInvalidated notifies the process owner once without blocking requests.
+func (s *Server) GenerationInvalidated() <-chan struct{} {
+	return s.generationInvalidated
+}
+
+// Shutdown drains active requests until ctx expires, then closes connections.
+// Call it from the process owner, never from a request handler.
+func (s *Server) Shutdown(ctx context.Context) error {
+	err := s.httpServer.Shutdown(ctx)
+	if err != nil {
+		_ = s.httpServer.Close()
+	}
+	return errors.Join(err, s.Close())
+}
+
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mux.ServeHTTP(w, r)
+		if errors.Is(observedGenerationError(s.store), store.ErrDatabaseGenerationChanged) {
+			s.generationOnce.Do(func() {
+				select {
+				case s.generationInvalidated <- struct{}{}:
+				default:
+				}
+			})
+		}
+	})
 }
 
 func (s *Server) routes() {
@@ -425,6 +458,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /sessions/{id}/end", s.handleEndSession)
 	s.mux.HandleFunc("GET /sessions/recent", s.handleRecentSessions)
 	s.mux.HandleFunc("GET /sessions/{id}", s.handleGetSession)
+	s.mux.HandleFunc("POST /runtime-sessions/resolve", s.handleRuntimeSession)
+	s.mux.HandleFunc("POST /runtime-sessions/end", s.handleRuntimeSession)
 	s.mux.HandleFunc("DELETE /sessions/{id}", requireAuth(s.handleDeleteSession))
 
 	// Observations
@@ -453,6 +488,7 @@ func (s *Server) routes() {
 
 	// Prompts
 	s.mux.HandleFunc("POST /prompts", s.handleAddPrompt)
+	s.mux.HandleFunc("POST /prompts/capture-decision", s.handlePromptCaptureDecision)
 	s.mux.HandleFunc("GET /prompts/recent", s.handleRecentPrompts)
 	s.mux.HandleFunc("GET /prompts/search", s.handleSearchPrompts)
 	s.mux.HandleFunc("DELETE /prompts/{id}", requireAuth(s.handleDeletePrompt))
@@ -471,6 +507,7 @@ func (s *Server) routes() {
 	// `engram projects list`, all backed by the same ListProjectsWithStats store query.
 	s.mux.HandleFunc("GET /projects", s.handleListProjects)
 	s.mux.HandleFunc("GET /doctor", s.handleDoctor)
+	s.mux.HandleFunc("POST /doctor/caller-binding", s.handleCallerBinding)
 
 	// Project detection / ownership rescue
 	s.mux.HandleFunc("GET /project/current", s.handleCurrentProject)
@@ -495,15 +532,16 @@ func (s *Server) routes() {
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.Stats(); err != nil {
+	if _, err := loadServerStats(s.store); err != nil {
 		jsonError(w, http.StatusInternalServerError, "health check failed")
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"status":      "ok",
-		"service":     "engram",
-		"version":     s.version,
-		"instance_id": s.instanceID,
+		"status":       "ok",
+		"service":      "engram",
+		"version":      s.version,
+		"instance_id":  s.instanceID,
+		"capabilities": map[string]bool{"isolated_session_registration": true, "root_session_resume": true},
 	})
 }
 
@@ -514,6 +552,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		Directory     string `json:"directory"`
 		OwnershipMode string `json:"ownership_mode"`
 		Resume        bool   `json:"resume"`
+		Isolated      bool   `json:"isolated"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -528,9 +567,15 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if mode == "" {
 		mode = store.SessionOwnershipShared
 	}
+	if body.Isolated && (mode != store.SessionOwnershipProjectOwned || strings.TrimSpace(body.Directory) != "") {
+		jsonError(w, http.StatusBadRequest, "isolated registration requires project_owned ownership and an empty directory")
+		return
+	}
 	effectiveID := body.ID
 	var err error
-	if body.Resume {
+	if body.Isolated {
+		effectiveID, err = s.store.RegisterIsolatedSession(body.ID, body.Project, body.Resume)
+	} else if body.Resume {
 		effectiveID, err = s.store.ResumeSessionWithOwnershipMode(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode)
 	} else {
 		err = s.store.StartSessionWithOwnershipMode(body.ID, body.Project, projectpkg.RuntimeWorktreeDirectory(body.Directory), mode)
@@ -538,6 +583,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var conflict *store.SessionProjectConflictError
 		switch {
+		case errors.Is(err, store.ErrSessionIsolationConflict):
+			jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{"code": "session_isolation_conflict"})
 		case errors.Is(err, store.ErrSessionAlreadyEnded):
 			jsonErrorWithFields(w, http.StatusConflict, err.Error(), map[string]any{
 				"code":       "session_already_ended",
@@ -617,8 +664,14 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, session)
 }
 
+var capturePromptForSave = (*store.Store).CapturePromptForSave
+
 func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
-	var body store.AddObservationParams
+	var body struct {
+		store.AddObservationParams
+		CapturePrompt *bool  `json:"capture_prompt,omitempty"`
+		CurrentPrompt string `json:"current_prompt,omitempty"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
@@ -638,7 +691,7 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := s.store.AddObservation(body)
+	id, err := s.store.AddObservation(body.AddObservationParams)
 	if err != nil {
 		// A titleless or contentless observation is a client mistake, not a
 		// server failure.
@@ -653,6 +706,13 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := capturePromptForSave(s.store, body.CapturePrompt, store.AddPromptParams{
+		SessionID: body.SessionID,
+		Project:   body.Project,
+		Content:   body.CurrentPrompt,
+	}); err != nil {
+		log.Printf("engram: auto prompt capture error (non-fatal): %v", err)
+	}
 	s.notifyWrite()
 	jsonResponse(w, http.StatusCreated, map[string]any{"id": id, "status": "saved"})
 }
@@ -1382,7 +1442,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		if !errors.Is(err, projectpkg.ErrInvalidProjectName) && !errors.Is(err, projectpkg.ErrAmbiguousProject) {
+		var transition *projectpkg.ProjectTransitionError
+		if !errors.Is(err, projectpkg.ErrInvalidProjectName) && !errors.Is(err, projectpkg.ErrAmbiguousProject) && !errors.As(err, &transition) {
 			jsonErrorWithFields(w, http.StatusInternalServerError, "project resolution failed", map[string]any{"code": "project_resolution_failed"})
 			return
 		}
@@ -1404,7 +1465,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
-	resolved, err := s.resolveRequestProject(r, projectpkg.ResolutionCurrent, true)
+	resolved, err := s.resolveRequestProjectWithDetector(r, projectpkg.ResolutionCurrent, true, s.store.InspectProject)
 	if err != nil {
 		s.writeProjectResolutionError(w, resolved, err)
 		return
@@ -1429,6 +1490,7 @@ func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
 
 // ─── Project Detection ───────────────────────────────────────────────────────
 
+// handleCurrentProject returns canonical current-project detection metadata.
 func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
 	if cwd == "" {
@@ -1442,11 +1504,17 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 	res, err := projectpkg.Resolve(projectpkg.ResolutionOptions{
 		Mode:      projectpkg.ResolutionCurrent,
 		Directory: cwd,
+		Detect:    s.store.DetectProject,
 	})
 	if err != nil && !errors.Is(err, projectpkg.ErrAmbiguousProject) {
 		s.writeProjectResolutionError(w, res, err)
 		return
 	}
+	jsonResponse(w, http.StatusOK, currentProjectPayload(cwd, res))
+}
+
+// currentProjectPayload builds the shared current-project response metadata.
+func currentProjectPayload(cwd string, res projectpkg.DetectionResult) map[string]any {
 	payload := map[string]any{
 		"project":            res.Project,
 		"project_source":     res.Source,
@@ -1461,13 +1529,17 @@ func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
 		payload["error_hint"] = res.Error.Error()
 	}
 
-	jsonResponse(w, http.StatusOK, payload)
+	return payload
 }
 
 // resolveRequestProject applies the shared resolution modes to HTTP operations.
 // Current-project reads require known explicit/process overrides, while cwd
 // detection remains usable before a project has any stored memories.
 func (s *Server) resolveRequestProject(r *http.Request, mode projectpkg.ResolutionMode, requireKnownOverrides bool) (projectpkg.DetectionResult, error) {
+	return s.resolveRequestProjectWithDetector(r, mode, requireKnownOverrides, s.store.DetectProject)
+}
+
+func (s *Server) resolveRequestProjectWithDetector(r *http.Request, mode projectpkg.ResolutionMode, requireKnownOverrides bool, detect func(string) projectpkg.DetectionResult) (projectpkg.DetectionResult, error) {
 	query := r.URL.Query()
 	projectValues, projectProvided := query["project"]
 	if projectProvided {
@@ -1495,6 +1567,7 @@ func (s *Server) resolveRequestProject(r *http.Request, mode projectpkg.Resoluti
 		Explicit:             query.Get("project"),
 		Directory:            query.Get("cwd"),
 		ProjectExists:        s.store.ProjectExists,
+		Detect:               detect,
 		RequireKnownExplicit: requireKnownOverrides,
 		RequireKnownProcess:  requireKnownOverrides,
 	})
@@ -1526,7 +1599,16 @@ func (s *Server) writeProjectResolutionError(w http.ResponseWriter, res projectp
 		code = "ambiguous_project"
 		status = http.StatusConflict
 	}
+	var transition *projectpkg.ProjectTransitionError
+	if errors.As(err, &transition) {
+		code = "project_transition_conflict"
+		status = http.StatusConflict
+	}
 	fields := map[string]any{"code": code}
+	if transition != nil {
+		fields["candidate_project"] = transition.Candidate
+		fields["available_projects"] = res.AvailableProjects
+	}
 	if errors.Is(err, projectpkg.ErrAmbiguousProject) {
 		fields["available_projects"] = res.AvailableProjects
 		fields["project_source"] = res.Source
@@ -1820,6 +1902,7 @@ func (s *Server) handleScanConflicts(w http.ResponseWriter, r *http.Request) {
 		Explicit:             body.Project,
 		Directory:            r.URL.Query().Get("cwd"),
 		ProjectExists:        s.store.ProjectExists,
+		Detect:               s.store.DetectProject,
 		RequireKnownExplicit: true,
 		RequireKnownProcess:  true,
 	})

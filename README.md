@@ -76,6 +76,29 @@ Treat Engram as a curated project memory, not a transcript sink. Use this operat
 6. **Leave a handoff.** Before ending a session, save a `mem_session_summary` with the goal, instructions, discoveries, accomplished work, next steps, and relevant files.
 7. **Recover after compaction.** Persist the compacted handoff with `mem_session_summary` first. Then call `mem_context` to recover recent session history before continuing.
 
+### When Git initialization changes the detected project
+
+Before creating a repository's first private Git identity, Engram checks local
+session history for the exact working directory. If Git suggests `remote-app`
+but that directory has history under `local-app`, implicit project selection
+stops with `project_transition_conflict` instead of silently changing scope.
+History is only a precaution: explicit or imported sessions can also trigger it.
+
+Choose the intended scope deliberately. For a persistent choice, run
+`engram init local-app` in the project directory; existing explicit project
+filters and valid registered-session writes remain available. Do not overwrite
+an existing configuration without reviewing it. This choice changes future
+resolution; it does **not** merge or move previously split memories.
+
+Historical directories are matched as absolute, lexically normalized paths;
+Engram does not access their filesystems. Relative history without a recorded
+base is ignored. Only the selected working directory is filesystem-canonicalized,
+so legacy history stored under a symlink alias may require an explicit project
+choice (`engram init local-app`) rather than automatic recognition.
+
+Existing Git bindings stay stable. This check cannot reconstruct history without
+a usable absolute directory, across relocated paths, or in another local store.
+
 ### A useful memory is structured
 
 ```markdown
@@ -124,7 +147,7 @@ Run the setup command for the agent you use, then restart that agent. `engram se
 
 | Agent | Setup |
 | --- | --- |
-| Claude Code | `claude plugin marketplace add Gentleman-Programming/engram && claude plugin install engram` |
+| Claude Code | `engram setup claude-code` |
 | Pi | `engram setup pi` |
 | OpenCode | `engram setup opencode` |
 | Gemini CLI | `engram setup gemini-cli` |
@@ -139,6 +162,8 @@ Run the setup command for the agent you use, then restart that agent. `engram se
 | Kimi Code | `engram setup kimi` |
 | CommandCode | `engram setup commandcode` |
 | Another MCP-compatible agent | [Manual MCP setup](docs/AGENT-SETUP.md#any-other-mcp-agent) |
+
+For Claude Code, rerunning setup updates the marketplace and the user-scope `engram@engram` plugin when it is already installed; existing project- or local-scope copies are not updated. An update failure fails setup; restart Claude Code after a successful update to load the new hooks.
 
 See [Agent Setup](docs/AGENT-SETUP.md) for per-agent configuration, plugin behavior, manual MCP setup, compaction resilience, and troubleshooting. Pi users can also find the package at [`gentle-engram`](plugin/pi/README.md).
 

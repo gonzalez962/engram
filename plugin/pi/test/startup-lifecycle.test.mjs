@@ -3,7 +3,7 @@
 // re-implementing it with stubs.
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { createServer as createHTTPServer } from "node:http";
+import { createServer as createHTTPServer, get } from "node:http";
 import { createServer } from "node:net";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -140,7 +140,7 @@ async function withFixture(options, run) {
         response.end(JSON.stringify({ id: JSON.parse(body).id, status: "created" }));
         return;
       }
-      response.writeHead(200, { "content-type": "application/json" });
+      response.writeHead(request.url === "/health" ? (options.healthStatus ?? 200) : 200, { "content-type": "application/json" });
       response.end(JSON.stringify(request.url.startsWith("/project/current") ? { project: "fake-project" } : (options.healthBody ?? { instance_id: "00000000000000000000000000000000" })));
     });
     if (readyServer) await new Promise((resolve, reject) => {
@@ -167,6 +167,71 @@ async function withFixture(options, run) {
     if (readyServer?.listening) await new Promise((resolve) => readyServer.close(resolve));
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+for (const replacement of ["retry", "recovery"]) {
+  test(`satellite transport validates replacement capability on ${replacement}`, async () => {
+    await withFixture({ readyServer: true }, async ({ hooks, tools, ctx }) => {
+      await hooks.get("session_start")({}, ctx);
+      const originalFetch = globalThis.fetch;
+      let attempts = 0;
+      let unsafePosts = 0;
+      let recoveryProbes = 0;
+      globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        if (path === "/health") {
+          if (attempts >= 2) recoveryProbes++;
+          return new Response(JSON.stringify({ instance_id: "00000000000000000000000000000000",
+            capabilities: { isolated_session_registration: attempts < (replacement === "retry" ? 1 : 2) } }));
+        }
+        if (path === "/sessions") {
+          attempts++;
+          if (replacement === "retry" ? attempts === 1 : attempts <= 2) {
+            throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+          }
+          unsafePosts++;
+          return new Response(JSON.stringify({ id: JSON.parse(init.body).id, status: "created" }), { status: 201 });
+        }
+        if (path === "/observations") return new Response('{"id":1}', { status: 201 });
+        return originalFetch(url, init);
+      };
+      try {
+        const result = await tools.get("mem_save").execute("replacement", { title: "t", content: "c", project: "foreign-project" }, undefined, undefined, ctx);
+        assert.equal(result.isError, true, JSON.stringify(result));
+        assert.match(result.content[0].text, /upgrade[\s\S]*isolated_session_registration/i);
+        assert.equal(unsafePosts, 0, "replacement must never receive satellite POST");
+        if (replacement === "recovery") assert.ok(recoveryProbes > 0, "fixture must exercise the recovery probe");
+      } finally { globalThis.fetch = originalFetch; }
+    });
+  });
+}
+
+for (const staysOffline of [false, true]) {
+  test(`capable satellite recovery is bounded (offline=${staysOffline})`, async () => {
+    await withFixture({ readyServer: true }, async ({ hooks, tools, ctx }) => {
+      await hooks.get("session_start")({}, ctx);
+      const originalFetch = globalThis.fetch;
+      let posts = 0;
+      let writes = 0;
+      globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        if (path === "/health") return new Response(JSON.stringify({ instance_id: "00000000000000000000000000000000", capabilities: { isolated_session_registration: true } }));
+        if (path === "/sessions") {
+          posts++;
+          if (staysOffline || posts <= 2) throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+          return new Response(JSON.stringify({ id: JSON.parse(init.body).id, status: "created" }), { status: 201 });
+        }
+        if (path === "/observations") { writes++; return new Response('{"id":1}', { status: 201 }); }
+        return originalFetch(url, init);
+      };
+      try {
+        const result = await tools.get("mem_save").execute("recovery", { title: "t", content: "c", project: "foreign-project" }, undefined, undefined, ctx);
+        assert.equal(result.isError, staysOffline ? true : undefined, JSON.stringify(result));
+        assert.equal(posts, staysOffline ? 4 : 3, "only one bounded recovery replay");
+        assert.equal(writes, staysOffline ? 0 : 1);
+      } finally { globalThis.fetch = originalFetch; }
+    });
+  });
 }
 
 test("manifest presence never triggers import while startup still detects the project", async () => {
@@ -242,6 +307,35 @@ test("an initially unavailable Engram provider publishes offline status", async 
     await hooks.get("session_start")({}, ctx);
 
     assert.deepEqual(statusCalls, [["engram", `🧠 ${dir.split(/[\\/]/).at(-1).toLowerCase()} · offline`]]);
+  });
+});
+
+test("an unhealthy external listener stays offline with bounded startup attempts and retains its port", { timeout: 60_000, concurrency: false }, async () => {
+  await withFixture({ readyServer: true, healthStatus: 500 }, async ({ hooks, tools, ctx, statusCalls, dir, spawnLog, port }) => {
+    // Use HTTP directly so fetch stubs cannot fabricate evidence that the listener survived.
+    const listenerStatus = () => new Promise((resolve, reject) => {
+      const request = get(`http://127.0.0.1:${port}/health`, (response) => {
+        response.resume();
+        response.once("end", () => resolve(response.statusCode));
+        response.once("error", reject);
+      });
+      request.once("error", reject);
+      request.setTimeout(2_000, () => request.destroy(new Error("fixture health request timed out")));
+    });
+    assert.equal(await listenerStatus(), 500, "the external listener occupies the port before startup");
+
+    await hooks.get("session_start")({}, ctx);
+    assert.deepEqual(statusCalls, [["engram", `🧠 ${dir.split(/[\\/]/).at(-1).toLowerCase()} · offline`]]);
+    assert.equal(await countSpawns(spawnLog), 1, "HTTP 500 currently triggers a real startup attempt");
+
+    for (let call = 0; call < 50; call += 1) {
+      const result = await tools.get("mem_search").execute(`unhealthy-${call}`, { query: "startup" }, undefined, undefined, ctx);
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /could not initialize the Engram memory provider/);
+    }
+    const spawns = await countSpawns(spawnLog);
+    assert.ok(spawns >= 1 && spawns <= 2, `50 failing tool calls produced ${spawns} startup attempts, not a bounded retry`);
+    assert.equal(await listenerStatus(), 500, "startup and repeated operations leave the external listener alive on the same port");
   });
 });
 
@@ -441,18 +535,78 @@ test("a missing binary is reported as not found, not as an outdated version", as
   });
 });
 
-test("a foreign server keeps the byte-identical ownership mismatch message", async () => {
+test("a foreign server retains actionable evidence and doctor diagnoses locally", async () => {
+  const requests = [];
   await withFixture({
     readyServer: true,
     healthBody: { status: "ok", service: "engram", version: "2.0.0", instance_id: "ffffffffffffffffffffffffffffffff" },
     cliVersion: "2.0.0",
+    requests,
   }, async ({ tools, ctx, spawnLog }) => {
     const result = await tools.get("mem_search").execute("call-foreign", { query: "startup" }, undefined, undefined, ctx);
 
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /: Engram server ownership mismatch at http:\/\/127\.0\.0\.1:\d+\. Run mem_doctor/);
+    assert.match(result.content[0].text, /ownership mismatch/);
+    assert.match(result.content[0].text, /local ID 00000000000000000000000000000000/);
+    assert.match(result.content[0].text, /remote ID ffffffffffffffffffffffffffffffff/);
+    assert.match(result.content[0].text, /local version 2\.0\.0, remote version 2\.0\.0/);
+    assert.match(result.content[0].text, /WSL2.*possible cause/);
+    assert.match(result.content[0].text, /ENGRAM_PORT=<port>/);
+    const beforeDoctor = requests.length;
+    const doctor = await tools.get("mem_doctor").execute("doctor", {}, undefined, undefined, ctx);
+    assert.equal(doctor.isError, true);
+    assert.equal(doctor.details.data.source, "LOCAL");
+    assert.equal(doctor.details.data.code, "ownership_mismatch");
+    assert.deepEqual(doctor.details.data.evidence, {
+      localInstanceID: "00000000000000000000000000000000",
+      remoteInstanceID: "ffffffffffffffffffffffffffffffff",
+      localVersion: "2.0.0", remoteVersion: "2.0.0",
+    });
+    assert.equal(requests.length, beforeDoctor, "doctor uses cached failure, not a new probe");
+    assert.ok(requests.every(({ url }) => url === "/health"), "foreign endpoint receives no project, session, doctor or memory requests");
     assert.equal(await countSpawns(spawnLog), 0, "a foreign server is never adopted, terminated, or replaced");
   });
+});
+
+test("foreign doctor reports unavailable versions as unknown and honors cancellation", async () => {
+  const requests = [];
+  await withFixture({ readyServer: true, requests,
+    healthBody: { instance_id: "ffffffffffffffffffffffffffffffff" },
+  }, async ({ tools, ctx, spawnLog }) => {
+    const doctor = tools.get("mem_doctor");
+    const result = await doctor.execute("unknown", {}, undefined, undefined, ctx);
+    assert.equal(result.details.data.evidence.localVersion, "unknown");
+    assert.equal(result.details.data.evidence.remoteVersion, "unknown");
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(doctor.execute("cancelled", {}, controller.signal, undefined, ctx), /cancelled/);
+    assert.deepEqual(requests.map(({ url }) => url), ["/health"]);
+    assert.equal(await countSpawns(spawnLog), 0);
+  });
+});
+
+test("normal doctor still calls the server after project detection", async () => {
+  const requests = [];
+  await withFixture({ readyServer: true, requests }, async ({ tools, ctx }) => {
+    const result = await tools.get("mem_doctor").execute("normal", {}, undefined, undefined, ctx);
+    assert.equal(result.isError, undefined);
+    assert.ok(requests.some(({ url }) => url.startsWith("/project/current")));
+    assert.ok(requests.some(({ url }) => url.startsWith("/doctor?project=fake-project")));
+    assert.notEqual(result.details.data.source, "LOCAL");
+  });
+});
+
+test("doctor does not bypass unrelated deterministic initialization failures", async () => {
+  for (const healthBody of [{ version: "1.20.0" }, { version: "2.0.0" }, { version: "malformed", instance_id: null }]) {
+    const requests = [];
+    await withFixture({ readyServer: true, healthBody, requests }, async ({ tools, ctx, spawnLog }) => {
+      const result = await tools.get("mem_doctor").execute("unrelated", {}, undefined, undefined, ctx);
+      assert.equal(result.isError, true);
+      assert.equal(result.details.data, undefined, "no local ownership fallback for legacy/missing identity");
+      assert.deepEqual(requests.map(({ url }) => url), ["/health"]);
+      assert.equal(await countSpawns(spawnLog), 0);
+    });
+  }
 });
 
 test("loading the plugin leaves the checkout's node_modules untouched", async () => {

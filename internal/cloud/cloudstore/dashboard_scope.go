@@ -89,14 +89,25 @@ func (cs *CloudStore) loadRegisteredDashboardProjects() ([]string, error) {
 	return projects, nil
 }
 
-// withRegisteredProjects adds a zero-count project row and an empty detail for
-// every registered project that has no synced data yet, so admin-created
-// projects are listed before their first push. Projects that already have
-// rows are left untouched. Callers apply the deployment scope afterwards.
-func (m dashboardReadModel) withRegisteredProjects(registered []string) dashboardReadModel {
+// projectSyncControlsFromNames converts project names to ProjectSyncControl records.
+func projectSyncControlsFromNames(names []string) []ProjectSyncControl {
+	controls := make([]ProjectSyncControl, 0, len(names))
+	for _, name := range names {
+		controls = append(controls, ProjectSyncControl{Project: name})
+	}
+	return controls
+}
+
+// withRegisteredProjectNames adapts a slice of project names to withRegisteredProjects.
+func (m dashboardReadModel) withRegisteredProjectNames(registered []string) dashboardReadModel {
+	return m.withRegisteredProjects(projectSyncControlsFromNames(registered))
+}
+
+// withRegisteredProjects preserves content-derived inventory and adds empty registrations.
+func (m dashboardReadModel) withRegisteredProjects(controls []ProjectSyncControl) dashboardReadModel {
 	added := false
-	for _, project := range registered {
-		project = strings.TrimSpace(project)
+	for _, control := range controls {
+		project := strings.TrimSpace(control.Project)
 		if project == "" {
 			continue
 		}
@@ -105,7 +116,7 @@ func (m dashboardReadModel) withRegisteredProjects(registered []string) dashboar
 		}
 		if !added {
 			m.projects = append([]DashboardProjectRow(nil), m.projects...)
-			details := make(map[string]DashboardProjectDetail, len(m.projectDetails)+len(registered))
+			details := make(map[string]DashboardProjectDetail, len(m.projectDetails)+len(controls))
 			for name, detail := range m.projectDetails {
 				details[name] = detail
 			}
