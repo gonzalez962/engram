@@ -196,7 +196,7 @@ async function engramFetchResult(
 }
 
 function localInstanceID(): string {
-  const result = spawnSync(ENGRAM_BIN, ["instance-id"], { encoding: "utf8" })
+  const result = spawnSync(ENGRAM_BIN, ["instance-id"], { encoding: "utf8", windowsHide: true })
   const id = (result.stdout ?? "").toString().trim()
   if (result.status !== 0 || !/^[a-f0-9]{32}$/.test(id)) throw new Error("gentle-engram could not resolve its local server identity")
   return id
@@ -691,6 +691,7 @@ export const Engram: Plugin = async (ctx) => {
       const serverChild = spawn(ENGRAM_BIN, ["serve"], {
         detached: true,
         stdio: "ignore",
+        windowsHide: true,
       })
       serverChild.on("error", () => warn("startup"))
       serverChild.on("exit", (code, signal) => { if (code !== null && code !== 0 || signal) warn("startup") })
@@ -713,6 +714,7 @@ export const Engram: Plugin = async (ctx) => {
           cwd: ctx.directory,
           detached: true,
           stdio: "ignore",
+          windowsHide: true,
         })
         importChild.on("error", () => warn("import"))
         importChild.on("exit", (code, signal) => { if (code !== null && code !== 0 || signal) warn("import") })
@@ -855,9 +857,13 @@ export const Engram: Plugin = async (ctx) => {
       if (!registered || confirmedSessionID !== sessionId) return
       toolCounts.set(sessionId, (toolCounts.get(sessionId) ?? 0) + 1)
 
-      // Passive capture: extract learnings from Task tool output
-      if (input.tool === "Task" && output) {
-        const text = typeof output === "string" ? output : JSON.stringify(output)
+      // V1 emits `task`; the V2 adapter normalizes `subagent` to `Task`.
+      if ((input.tool === "task" || input.tool === "Task") && output) {
+        const text = typeof output === "string"
+          ? output
+          : typeof output?.output === "string"
+            ? output.output
+            : JSON.stringify(output)
         if (text.length > 50) {
           await engramFetch("/observations/passive", {
             method: "POST",
@@ -1161,7 +1167,7 @@ async function setupEngramV2(ctx: V2Context): Promise<() => Promise<void>> {
     }))
 
     registrations.push(await ctx.tool.hook("execute.after", async (call) => {
-      // V2 renamed the V1 `Task` delegation tool to `subagent`.
+      // Normalize V2 `subagent` to the shared handler’s legacy `Task` alias.
       const tool = call.tool === "subagent" ? "Task" : call.tool
       const output = call.status === "completed" ? v2ToolResultText(call.result) : ""
       await hooks["tool.execute.after"]({ tool, sessionID: call.sessionID, callID: call.id }, output)

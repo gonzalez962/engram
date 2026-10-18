@@ -336,9 +336,21 @@ For an accepted `POST /sync/mutations/push`, each future materialized cloud chun
 
 ### Observations
 
-- `POST /observations` — Add observation. Body: `{session_id, type, title, content, tool_name?, project?, scope?, topic_key?, capture_prompt?, current_prompt?}`
+- `POST /observations` — Add observation. Body: `{session_id, type, title, content, tool_name?, project?, scope?, topic_key?, operation_id?, capture_prompt?, current_prompt?}`
   - `capture_prompt` is an optional boolean (default `true`); after a successful observation save, `current_prompt` (optional string) is best-effort saved for the same session/project using exact stored-content dedupe. `false` skips this attempt. Missing prompt context or a capture error does not fail the observation save. No current prompt is inferred from persisted history and no observation-ID link is created.
   - `400` when `title` or `content` is missing, empty, or whitespace-only. The observation-create paths (`engram save`, `mem_save`, `POST /observations`) enforce the same title rule because cloud sync rejects observation upserts without a title, and one rejected mutation blocks every later mutation for the project
+  - Omit `operation_id` to retain legacy save behavior. With one, an exact replay returns the original `201` result without another observation or sync mutation; a changed payload returns `409`, and a deleted result returns `410`.
+  - Use a stable client-generated `operation_id` for one logical save and preserve the original request while recovering an uncertain acknowledgement.
+  - Replay identity is the Store's normalized request fingerprint, including the requested project before session ownership resolution; a later ownership change does not change an exact replay result.
+  - The local operation ledger retains receipts indefinitely. Sync, logical export, and logical import do not carry those receipts to another database history.
+  - Unknown fingerprint versions fail closed with `410`; clients must not replace an expired or uncertain operation ID with a new save automatically.
+  - An absent lookup result is intentionally not evidence that an operation never committed or cannot commit later; the ledger has no pending state.
+  - A soft-deleted observation retains its ledger binding but has no lookup result. Its exact replay returns `410`; a changed payload returns `409`.
+  - A hard delete retains a ledger tombstone with the same exact-replay and changed-payload responses as a soft deletion.
+  - Exact keyed replays do not repeat prompt capture or write notification side effects. The first keyed save and every unkeyed save retain those behaviors.
+- `GET /observations/save-result?operation_id=ID` — Read the committed `{id, status:"committed"}` result for a replay-safe save.
+  - Missing `operation_id` returns `400`; a never-recorded operation returns `404` with `{error:"no committed result found for operation_id", code:"observation_save_result_not_found"}`. A soft-deleted or hard-deleted operation returns `410`.
+  - Only this typed `404` for a never-recorded operation authorizes the documented exact replay. A `410`, generic legacy `400`, or untyped `404` is not proof that a keyed save can be replayed safely.
 - `GET /observations` — Recent observations compatibility endpoint. Query: `?project=X&all_projects=true&scope=project|personal|global&limit=N&sort=created_at:desc`
 - `GET /observations/recent` — Recent observations. Query: `?project=X&all_projects=true&scope=project|personal|global&limit=N`
   - No-result responses from both observation collection endpoints return `200` with `[]` (never `null`)
@@ -364,7 +376,7 @@ For an accepted `POST /sync/mutations/push`, each future materialized cloud chun
   - `200` with the refreshed observation payload when marked reviewed
   - `400` when `observation_id`/`id` is missing or the JSON body is invalid
   - `404` when the observation does not exist
-  - Local-only: updating `review_after` does not enqueue a sync mutation or propagate to other machines.
+  - Updating `review_after` atomically enqueues an observation sync mutation; the date propagates through git sync and enrolled cloud sync.
 
 ### Search
 
@@ -708,6 +720,7 @@ Release update checks are skipped for `version`, `--version`, `-v`, `help`, `--h
 | Variable                        | Description                                                                                                                                                                                                                                               | Default              |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
 | `ENGRAM_MEM_SAVE_TIMING`        | Set to exactly `1` in the MCP server environment to log one privacy-safe stage timing record per `mem_save` invocation to stderr. See [mem_save timing diagnostics](#mem_save-timing-diagnostics). | (unset — disabled) |
+| `ENGRAM_HTTP_WRITE_TIMING`      | Set to exactly `1` in the local HTTP server environment to log one privacy-safe timing record for each session registration, observation save, or passive capture. See [HTTP write timing diagnostics](#http-write-timing-diagnostics). | (unset — disabled) |
 | `ENGRAM_DATA_DIR`               | Engram CLI data directory. Empty or whitespace-only values use the platform default; nonblank values are used as provided.                                                                                                                               | `~/.engram`          |
 | `ENGRAM_PORT`                   | Override HTTP server port. Use an unsigned decimal value from `1` through `65535`; invalid values fall back to `7437` in `engram serve` and Claude Bash hooks.                                                                                         | `7437`               |
 | `ENGRAM_SOCKET`                 | POSIX-only Unix-domain socket path for `engram serve` and Claude Bash hooks. Socket mode listens exclusively on this path; it cannot be combined with an explicit `ENGRAM_PORT` or positional port. The default TCP listener remains unchanged when unset. PowerShell stays TCP-only. Bash hooks warn on stderr if socket transport cannot preserve memory capture. | (unset) |
@@ -756,6 +769,94 @@ engram: mem_save_timing {"status":"saved","total_ms":563.2,"save_ms":12.1,"candi
 Stage times include database waits; they do **not** separately measure SQLite lock waits or connection-pool waits, and are not CPU times. Stages do not sum to `total_ms`: project/session resolution, prompt capture, and response construction also take time. A still-running or killed invocation has no completed timing record. Requests rejected because the MCP write queue is full, or canceled before `handleSave` starts, also produce no timing record; queue wait is excluded from `total_ms`. Logging itself can block if the host does not drain stderr.
 
 The new diagnostic records contain only durations and status: no titles, content, project names, paths, IDs, or error details. Existing unrelated error logs are unchanged; inspect them before sharing a trace. Compare these records with client elapsed times from a sequential reproduction before choosing an optimization. Saving, ranking, and candidate insertion behavior are unchanged.
+
+#### Candidate-query performance benchmark (contributors)
+
+Run the synthetic candidate-query comparison from the repository root:
+
+```sh
+go test ./internal/store -run '^$' -bench '^BenchmarkCandidateRankComparison' -benchtime=1x -count=5 -benchmem
+```
+
+The benchmark creates isolated 15,000-observation databases with repeated title terms in indexed content. It compares the original query with filtered rank materialization, in both execution orders, with candidates spread across one or multiple projects. Setup is excluded from timing. It measures candidate SQL and result consumption, **not** full `mem_save`, pending-relation inserts, MCP queueing, or transport. Compare repeated samples on the same host; timings are not unit-test assertions or a production latency guarantee. `TestFindCandidatesOriginalQueryParity` checks candidate fields, raw scores, and ordering against the original query.
+
+Rank materialization uses temporary SQLite storage and adds allocations; `-benchmem` does not measure peak SQLite temporary-table memory. These benchmarks do not establish latency or memory bounds for other database sizes and distributions.
+
+##### SQLite allocator-memory comparison
+
+Run only against synthetic fixtures (1k/15k rows, 20 repeated term lists,
+single/selective project). In Git Bash or a POSIX shell, scope the test-only
+opt-in to this command:
+
+```sh
+ENGRAM_TEST_SQLITE_MEMORY_COUNTERS=1 go test ./internal/store -run '^$' -bench '^BenchmarkCandidateQuerySQLiteMemory$' -benchtime=1x -count=3
+```
+
+The test binary enables `SQLITE_CONFIG_MEMSTATUS` in `TestMain`, before opening
+any fixture. Only the exact selectors above are accepted; an invalid opt-in
+value or selecting ordinary tests/other benchmarks exits with status 2 before
+SQLite configuration. The default unset variable leaves normal test startup
+unchanged. This variable is not an Engram runtime setting and does not enable
+counters in production or persist an environment change in the parent shell.
+Without the opt-in, the allocator benchmark skips before creating fixtures and
+prints the required variable; ordinary all-benchmark runs remain supported.
+Startup subprocess checks also accept the successful coverage summary from `go test -cover`.
+
+The benchmark compares the frozen baseline with actual production SQL, verifies
+five identical candidates, and reports mean SQLite allocator current-before,
+peak, current-after, and incremental-peak (peak minus current-before) in bytes,
+separately for each query. Fixture setup and bounded parity checks are excluded;
+the highwater counter is reset immediately before each fully consumed query.
+Cases are serial, use fresh fixtures, and exercise both execution orders.
+
+These are library-wide `sqlite3_memory_used`/`sqlite3_memory_highwater` counters,
+not temporary-only memory, Go heap, RSS, or disk usage; configured auxiliary
+PAGECACHE memory is excluded. Warm-up, allocator globals, and cache history can
+still affect comparisons even across fresh fixtures. No hard memory bound is
+asserted; with the opt-in enabled, unavailable or inconsistent counters fail explicitly. The standard
+`ns/op` covers both queries together, not individual query latency. Measurement
+results must be collected on the target host; no results are implied here.
+
+Without the opt-in, the Windows/amd64 validation returned zero for all allocator
+counters because this dependency defaults to `DEFAULT_MEMSTATUS=0`. That earlier
+run failed explicitly and produced no valid memory measurements. Do not treat
+zero as zero memory use or substitute Go heap/RSS for this metric; allocator
+counter consistency is checked on every measured query.
+
+Observed synthetic validation on Windows/amd64 with Go 1.26.4 (20 repetitions,
+three samples per execution order) gave these median library allocator peaks:
+
+| Observations | Project distribution | Original query | Materialized query |
+| --- | --- | --- | --- |
+| 1,000 | Single project | 5.23 MiB | 5.26 MiB |
+| 1,000 | 10% eligible project | 5.23 MiB | 5.26 MiB |
+| 15,000 | Single project | 7.34 MiB | 7.01 MiB |
+| 15,000 | 10% eligible project | 7.33 MiB | 5.72 MiB |
+
+These include the fixture's retained allocator baseline. At 1,000 rows the
+materialized query added about 30 KiB; at 15,000 rows it reduced allocator peak
+in these fixtures. This is neither a temporary-table-only measurement nor a
+production memory guarantee, and does not reproduce the reported latency tail.
+
+An isolated enablement probe can check the disabled control and enabled modes:
+
+```sh
+go test ./internal/store -run '^TestCandidateSQLiteCounterProbe$' -count=1 -v
+```
+
+Probe startup requires the effective `-test.run=^TestCandidateSQLiteCounterProbe$`
+selector and no benchmark selector; overwritten or mixed selectors exit 2 before any tests or SQLite configuration.
+Each mode starts a fresh test subprocess, configures `SQLITE_CONFIG_MEMSTATUS`
+before opening its temporary fixture, and checks the configuration result and
+allocator counters. This probe does not enable counters in production or in the
+parent test runner. The probe and opt-in benchmark startup share the generated
+C-style argument adapter, confined to test files.
+
+### HTTP write timing diagnostics
+
+Set `ENGRAM_HTTP_WRITE_TIMING=1` before starting `engram serve`. The local server writes one `engram: http_write_timing` JSON record to stderr after each `POST /sessions`, `POST /observations`, and `POST /observations/passive` handler returns. Records contain only the enumerated operation/outcome, transaction attempt count, and request, connection-wait, transaction, commit, and response-write durations. For passive_capture, attempts and database-stage durations are totals across every learning saved by the request. `connection_wait_ms` is the store's `Begin` stage, including connection-pool or SQLite lock waiting; `transaction_ms` excludes that stage and commit.
+
+`response_write` describes the server's write attempt, not client acknowledgement. A completed server response write is never proof that a client received it. Records omit request URLs, identifiers, payloads, projects, paths, credentials, and errors; diagnostic-write failures are ignored and do not alter the request.
 
 ### Conflict Audit CLI (admin)
 
@@ -1152,7 +1253,7 @@ Exceptions:
 
 `mem_session_start` resolves from its explicit `directory` argument when supplied; otherwise it auto-detects from cwd. `mem_session_end` and `mem_capture_passive` auto-detect project from cwd; any `project` argument the LLM sends to them is ignored. `mem_session_summary` supports explicit project override (`project`, `project_choice_reason`, `recovery_token`) matching `mem_save`'s project resolution.
 
-`mem_update` requires `id` and caller-supplied `expected_project`. Native MCP also checks ownership against the known current/process project; the assertion does not bypass those checks, malformed/unknown process overrides, or ambiguous-project recovery protections. It no longer falls back to the stored owner for writes when cwd is ambiguous. `mem_get_observation` retains its read-only stored-owner fallback.
+`mem_update` requires `id` and caller-supplied `expected_project`. Like REST PATCH and `mem_delete`, it checks normalized stored ownership atomically with the mutation, independently of server cwd, process overrides, or cwd ambiguity. Its success envelope identifies the matched owner with `project_source: "explicit_override"` and `project_path: ""`; it does not claim a verified repository path. The assertion is not authentication or a permission grant. Save/session project resolution remains unchanged. `mem_get_observation` retains its read-only stored-owner fallback.
 
 `mem_save` resolves writes by precedence: validated explicit `project`, project already associated with `session_id`, repo/cwd detection (nearest `.engram/config.json` within the enclosing git root, git remote/root/child), then directory-basename fallback.
 
@@ -1259,7 +1360,7 @@ Actions:
 - `action: "list"` — returns observations whose `review_after` has passed. Optional parameters: `project` and `limit` (default 10).
 - `action: "mark_reviewed"` — requires `observation_id`; resets that observation's local review cycle using its type decay policy. The legacy `id` alias is accepted for compatibility.
 
-`mark_reviewed` is local-only for now: `review_after` is intentionally not part of sync payloads in this phase, so resetting the review cycle does not enqueue a sync mutation or propagate to other machines.
+`review_after` is replicated with observation sync mutations, including `mark_reviewed` resets. Sync preserves the original date instead of restarting the clock on import. Legacy payloads without this field preserve an existing local date; new observations derive it from `created_at` using the type's decay policy (the normal insertion time is used if `created_at` is absent). Explicit `null` clears the date. Concurrent changes follow the existing sync mutation application order; the last applied upsert wins. Previously imported observations with missing dates are not automatically backfilled.
 
 ### mem_pin
 

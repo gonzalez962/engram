@@ -31,6 +31,19 @@ function extractFunctionBody(name, marker) {
   throw new Error(`${name} body not found`);
 }
 
+function extractClassDefinition(name) {
+  const start = source.indexOf(`class ${name} `);
+  assert.notEqual(start, -1, `${name} class not found`);
+  const bodyStart = source.indexOf("{", start);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") depth -= 1;
+    if (depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`${name} class body not found`);
+}
+
 function buildOptionalEnvironmentValueForTest() {
   const body = extractFunctionBody("optionalEnvironmentValue", "{\n  return");
   return new Function(`
@@ -71,7 +84,11 @@ function buildExecuteMemoryToolForTest({ awaitWithAbort, initOnce, refreshProjec
     `
     let project = "engram";
     class EngramHttpError extends Error {}
+    class EngramUnavailableError extends Error {}
     class ForeignOwnershipError extends Error {}
+    function shouldScheduleEngramSelfHeal(error, failure) {
+      ${extractFunctionBody("shouldScheduleEngramSelfHeal", "{\n  return")}
+    }
     const humanToolName = (toolName) => toolName;
     const createMemoryToolTransport = () => ({
       fetch: async () => null,
@@ -85,6 +102,7 @@ function buildExecuteMemoryToolForTest({ awaitWithAbort, initOnce, refreshProjec
     async function executeMemoryTool(toolName, params, ctx, signal) {
       ${body}
     }
+    executeMemoryTool.reachabilityError = () => new EngramUnavailableError();
     return executeMemoryTool;
     `,
   );
@@ -121,6 +139,7 @@ function buildEngramFetchForTest({
         this.data = data;
       }
     }
+    ${extractClassDefinition("EngramUnavailableError")}
     function isTimeoutError(error) {
       ${extractFunctionBody("isTimeoutError", "{\n  return error instanceof Error")}
     }
@@ -207,8 +226,12 @@ function buildInitializeEngramServerForTest({
   instanceID = "00000000000000000000000000000000",
   engramUrl = "http://127.0.0.1:7437",
   legacyMessage = "legacy server message",
+  startupAllowed = true,
+  resolveInstanceID = () => instanceID,
 }) {
-  const body = extractFunctionBody("initializeEngramServer", "{\n  if (CONFIGURED_ENGRAM_URL");
+  // Extract from the opening brace, retaining the policy gate rather than
+  // skipping to the old URL early return.
+  const body = extractFunctionBody("initializeEngramServer", "{\n");
   class DeterministicStartupError extends Error {}
   const factory = new Function(
     "CONFIGURED_ENGRAM_URL",
@@ -220,14 +243,17 @@ function buildInitializeEngramServerForTest({
     "ENGRAM_URL",
     "legacyEngramServerMessage",
     "DeterministicStartupError",
+    "ENGRAM_STARTUP_ALLOWED",
+    "resolveInstanceID",
     `
+    const ENGRAM_DISABLED_NOTICE = "Engram memory is disabled by startup policy";
     let localEngramInstanceID = "";
     class ForeignOwnershipError extends DeterministicStartupError {
       constructor(evidence) { super("Engram server ownership mismatch at " + ENGRAM_URL); this.evidence = evidence; }
     }
     const localEngramVersion = () => "unknown";
     const missingInstanceIdentityMessage = () => "missing identity";
-    const localInstanceID = () => instanceID;
+    const localInstanceID = resolveInstanceID;
     async function initializeEngramServer() {
       ${body}
     }
@@ -248,7 +274,24 @@ function buildInitializeEngramServerForTest({
     engramUrl,
     () => legacyMessage,
     DeterministicStartupError,
+    startupAllowed,
+    resolveInstanceID,
   );
+}
+
+for (const configuredUrl of [false, true]) {
+  test(`initialization policy gate precedes identity and URL early return (configured URL=${configuredUrl})`, async () => {
+    const effects = [];
+    const initialize = buildInitializeEngramServerForTest({
+      configuredUrl, startupAllowed: false,
+      resolveInstanceID: () => { effects.push("identity"); return "unused"; },
+      probeEngramHealth: async () => { effects.push("health"); return "ready"; },
+      spawnAndWaitForEngram: async () => { effects.push("spawn"); },
+      waitForEngramReadiness: async () => { effects.push("wait"); },
+    });
+    await assert.rejects(initialize(), /memory is disabled by startup policy/);
+    assert.deepEqual(effects, [], "disabled initialization has no identity, HTTP, spawn or readiness effects");
+  });
 }
 
 function buildLocalInstanceIDForTest({ spawnSync, DeterministicStartupError = class extends Error {}, instanceIDFailureMessage = buildInstanceIDFailureMessageForTest() }) {
@@ -1579,22 +1622,41 @@ test("cancelling initialization, project detection, or active memory work propag
   assert.match(source, /catch \(error\) \{\s*if \(signal\?\.aborted\) throw error;/);
 });
 
-test("a non-cancellation initialization failure still reports an outage and schedules recovery", async () => {
+test("a rejected compatibility flow reports its error without scheduling a health probe", async () => {
   const statuses = [];
   let recoveries = 0;
   const executeMemoryTool = buildExecuteMemoryToolForTest({
     awaitWithAbort: buildAwaitWithAbortForTest(),
-    initOnce: async () => { throw new Error("startup failed"); },
-    refreshProjectDetection: async () => assert.fail("failed initialization must not reach project detection"),
-    callMemoryTool: async () => assert.fail("failed initialization must not call memory"),
+    initOnce: async () => {},
+    refreshProjectDetection: async () => {},
+    callMemoryTool: async () => { throw new Error("root resume compatibility rejected"); },
     scheduleEngramSelfHeal: () => { recoveries += 1; },
   });
 
   const result = await executeMemoryTool("mem_search", {}, { ...sessionCtx("session", statuses), cwd: "/work" });
 
   assert.equal(result.isError, true);
-  assert.equal(result.details.error, "startup failed");
-  assert.deepEqual(statuses, [["engram", "🧠 engram · error"]]);
+  assert.equal(result.details.error, "root resume compatibility rejected");
+  assert.deepEqual(statuses, [["engram", "🧠 engram · mem_search…"], ["engram", "🧠 engram · error"]]);
+  assert.equal(recoveries, 0);
+});
+
+test("a typed reachability failure still schedules self-heal", async () => {
+  const statuses = [];
+  let recoveries = 0;
+  let unreachable;
+  const executeMemoryTool = buildExecuteMemoryToolForTest({
+    awaitWithAbort: buildAwaitWithAbortForTest(),
+    initOnce: async () => {},
+    refreshProjectDetection: async () => {},
+    callMemoryTool: async () => { throw unreachable; },
+    scheduleEngramSelfHeal: () => { recoveries += 1; },
+  });
+  unreachable = executeMemoryTool.reachabilityError();
+
+  const result = await executeMemoryTool("mem_search", {}, { ...sessionCtx("session", statuses), cwd: "/work" });
+
+  assert.equal(result.isError, true);
   assert.equal(recoveries, 1);
 });
 
@@ -2139,8 +2201,9 @@ test("self-heal gives up after exhausting its attempt budget without clearing th
   assert.equal(isInFlight(), false);
 });
 
-test("only reachability failures schedule self-heal, HTTP errors from a live server do not", () => {
-  assert.match(source, /if \(!\(error instanceof EngramHttpError\)\) scheduleEngramSelfHeal\(ctx\);/);
+test("only typed reachability failures schedule self-heal", () => {
+  assert.match(source, /return failure !== undefined \|\| error instanceof EngramUnavailableError;/);
+  assert.match(source, /if \(shouldScheduleEngramSelfHeal\(error, failure\)\) scheduleEngramSelfHeal\(ctx\);/);
 });
 
 test("waitUnref schedules a background timer that does not keep the process alive", async () => {

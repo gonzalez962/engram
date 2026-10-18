@@ -8,7 +8,7 @@
 
 import { spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, readFileSync, writeSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, resolve } from "node:path";
 import type { ExtensionAPI, InputEvent } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -25,6 +25,12 @@ const ENGRAM_PORT = Number.parseInt(optionalEnvironmentValue(process.env.ENGRAM_
 const CONFIGURED_ENGRAM_URL = optionalEnvironmentValue(process.env.ENGRAM_URL);
 const ENGRAM_URL = CONFIGURED_ENGRAM_URL || `http://127.0.0.1:${ENGRAM_PORT}`;
 const ENGRAM_BIN = optionalEnvironmentValue(process.env.ENGRAM_BIN) ?? "engram";
+// Only absence preserves standalone behavior; every supplied value except literal
+// "allow" fails closed, including empty or whitespace values. Never execute notice text.
+const ENGRAM_STARTUP_ALLOWED = process.env.ENGRAM_STARTUP_POLICY === undefined
+  || process.env.ENGRAM_STARTUP_POLICY === "allow";
+const ENGRAM_DISABLED_NOTICE = "Engram memory is disabled by startup policy. Back up your existing Engram data, update Engram, restart its server and Pi, then recheck memory safety."
+  + (process.env.ENGRAM_STARTUP_NOTICE ? ` ${process.env.ENGRAM_STARTUP_NOTICE}` : "");
 
 // Only allowlisted metadata is logged; never pass request bodies, identities, or errors.
 type SessionTraceEvent =
@@ -45,6 +51,8 @@ function traceSessionRegistration(event: SessionTraceEvent): void {
 // Writes are single-attempt: once dispatched, their server-side outcome may be unknown.
 const ENGRAM_WRITE_TIMEOUT_MS = 3000;
 const ENGRAM_READ_TIMEOUT_MS = 10000;
+const ENGRAM_OBSERVATION_RECOVERY_TIMEOUT_MS = 7500;
+const ENGRAM_RECOVERY_LOOKUP_TIMEOUT_MS = 1000;
 const ENGRAM_DOCTOR_TIMEOUT_MS = 15000;
 const ENGRAM_SESSION_REGISTRATION_TIMEOUT_MS = 5000;
 const ENGRAM_READ_MAX_ATTEMPTS = 3;
@@ -129,8 +137,9 @@ When the user asks to recall past work:
 
 ### SESSION CLOSE PROTOCOL
 
-Before ending a session or saying "done", call \`mem_session_summary\`
+Before explicitly closing or handing off the session, call \`mem_session_summary\`
 with Goal, Instructions, Discoveries, Accomplished, Next Steps, and Relevant Files.
+Ordinary task completion or merely saying "done" does not require a session summary.
 If \`mem_session_summary\` fails because Engram cannot detect a project, ask the user
 which project should receive the summary, then retry with \`project: "<name>"\`.
 
@@ -145,6 +154,7 @@ interface FetchOptions {
   method?: string;
   body?: unknown;
   signal?: AbortSignal;
+  observationSave?: boolean;
   // Capability validation before dispatch, including transport retries/reconnects.
   beforeDispatch?: () => Promise<void>;
   // Observational hook, separate from capability validation and recovery guards.
@@ -158,6 +168,7 @@ interface EngramTransportFailure {
   operation: EngramOperation;
   outcome: EngramTransportOutcome;
   timeoutMs: number;
+  operationID?: string;
 }
 
 interface EngramFetchResult<TResponse> {
@@ -273,6 +284,17 @@ class EngramHttpError extends Error {
     this.status = status;
     this.data = data;
   }
+}
+
+class EngramUnavailableError extends Error {
+  constructor() {
+    super(unreachableMessage(undefined));
+    this.name = "EngramUnavailableError";
+  }
+}
+
+function shouldScheduleEngramSelfHeal(error: unknown, failure: EngramTransportFailure | undefined): boolean {
+  return failure !== undefined || error instanceof EngramUnavailableError;
 }
 
 class SessionProjectConflictError extends Error {
@@ -408,7 +430,7 @@ async function engramFetchResult<TResponse = unknown>(path: string, opts: FetchO
   if (refused && (!opts.beforeDispatch || allowGuardedRecovery) && await recoverImplicitEngramServer() && isSafeToReplay(path, method)) {
     return engramFetchResult<TResponse>(path, opts, false);
   }
-  throw new Error(unreachableMessage(undefined));
+  throw new EngramUnavailableError();
 }
 
 async function engramFetch<TResponse = unknown>(path: string, opts: FetchOptions = {}): Promise<TResponse | null> {
@@ -420,11 +442,139 @@ async function engramFetch<TResponse = unknown>(path: string, opts: FetchOptions
   return result.data;
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason ?? new DOMException("Engram tool execution was cancelled", "AbortError");
+}
+
+function hasPositiveObservationID(data: unknown, status: "saved" | "committed"): boolean {
+  if (!data || typeof data !== "object") return false;
+  const receipt = data as Record<string, unknown>;
+  if (!Number.isSafeInteger(receipt.id) || Number(receipt.id) <= 0) return false;
+  // Older successful observation responses had only the numeric ID. Keep that established
+  // POST acknowledgement shape, while lookup receipts require the new committed marker.
+  return status === "saved" ? (receipt.status === undefined || receipt.status === "saved") : receipt.status === "committed";
+}
+
+function isObservationSaveResultMiss(response: Response, data: unknown): boolean {
+  return response.status === 404
+    && !!data && typeof data === "object"
+    && (data as Record<string, unknown>).code === "observation_save_result_not_found"
+    && (data as Record<string, unknown>).error === "no committed result found for operation_id";
+}
+
+function isAmbiguousObservationSaveReplayStatus(status: number): boolean {
+  // The ledger reports a changed replay as 409 and an expired/deleted replay as 410.
+  // Either can race an original write acknowledgement, so only these documented ledger
+  // outcomes warrant the one final authoritative lookup.
+  return status === 409 || status === 410;
+}
+
+// Only native mem_save opts in. Its request bytes and both destinations are frozen before
+// the first dispatch, so recovery cannot pick up a changed server configuration or payload.
+async function postObservationWithReplayRecovery<TResponse>(body: Record<string, unknown>, signal?: AbortSignal): Promise<EngramFetchResult<TResponse>> {
+  const operationID = randomUUID();
+  const destination = `${ENGRAM_URL}/observations`;
+  const lookupDestination = `${ENGRAM_URL}/observations/save-result?${new URLSearchParams({ operation_id: operationID })}`;
+  const serialized = JSON.stringify({ ...(redactValue(body) as Record<string, unknown>), operation_id: operationID });
+  const deadline = performance.now() + ENGRAM_OBSERVATION_RECOVERY_TIMEOUT_MS;
+  const unknown = (): EngramFetchResult<TResponse> => ({
+    data: null,
+    transportFailure: { operation: "write", outcome: "unknown", timeoutMs: ENGRAM_OBSERVATION_RECOVERY_TIMEOUT_MS, operationID },
+  });
+
+  type Attempt = { response?: Response; data?: unknown };
+  async function attempt(method: "POST" | "GET"): Promise<Attempt> {
+    throwIfAborted(signal);
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return {};
+    const timeoutMs = Math.min(
+      remaining,
+      method === "GET" ? ENGRAM_RECOVERY_LOOKUP_TIMEOUT_MS : ENGRAM_WRITE_TIMEOUT_MS,
+    );
+    const controller = new AbortController();
+    let rejectStop: (reason: unknown) => void = () => {};
+    const stopped = new Promise<never>((_resolve, reject) => { rejectStop = reject; });
+    const onCallerAbort = () => {
+      const reason = signal?.reason ?? new DOMException("Engram tool execution was cancelled", "AbortError");
+      controller.abort(reason);
+      rejectStop(reason);
+    };
+    const timer = setTimeout(() => {
+      const reason = new DOMException("Observation recovery request timed out", "TimeoutError");
+      controller.abort(reason);
+      rejectStop(reason);
+    }, timeoutMs);
+    signal?.addEventListener("abort", onCallerAbort, { once: true });
+    try {
+      const exchange = (async () => {
+        const response = await fetch(method === "POST" ? destination : lookupDestination, {
+          method,
+          headers: method === "POST" ? { "Content-Type": "application/json" } : undefined,
+          body: method === "POST" ? serialized : undefined,
+          signal: controller.signal,
+        });
+        if (response.status === 204) return { response, data: null };
+        try {
+          return { response, data: await response.json() };
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          return { response };
+        }
+      })();
+      return await Promise.race([exchange, stopped]);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return {};
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onCallerAbort);
+      controller.abort();
+    }
+  }
+
+  const initial = await attempt("POST");
+  if (initial.response?.ok && hasPositiveObservationID(initial.data, "saved")) return { data: initial.data as TResponse };
+  if (initial.response && !initial.response.ok) {
+    const record = initial.data && typeof initial.data === "object" ? initial.data as Record<string, unknown> : {};
+    throw new EngramHttpError(typeof record.error === "string" ? record.error : `Engram request failed with HTTP ${initial.response.status}`, initial.response.status, initial.data);
+  }
+
+  const recovered = await attempt("GET");
+  if (recovered.response?.ok && hasPositiveObservationID(recovered.data, "committed")) return { data: recovered.data as TResponse };
+  if (!recovered.response || !isObservationSaveResultMiss(recovered.response, recovered.data)) return unknown();
+
+  throwIfAborted(signal);
+  const backoff = new AbortController();
+  const cancelBackoff = () => backoff.abort(signal?.reason);
+  signal?.addEventListener("abort", cancelBackoff, { once: true });
+  try {
+    await waitCancellable(ENGRAM_FETCH_BACKOFF_BASE_MS, backoff.signal);
+  } finally {
+    signal?.removeEventListener("abort", cancelBackoff);
+  }
+  throwIfAborted(signal);
+
+  // The typed miss authorizes exactly one byte-identical replay. Only the documented
+  // ledger outcomes 409 and 410 remain ambiguous enough to warrant one final lookup.
+  const replay = await attempt("POST");
+  if (replay.response?.ok && hasPositiveObservationID(replay.data, "saved")) return { data: replay.data as TResponse };
+  if (replay.response && !replay.response.ok && !isAmbiguousObservationSaveReplayStatus(replay.response.status)) {
+    const record = replay.data && typeof replay.data === "object" ? replay.data as Record<string, unknown> : {};
+    throw new EngramHttpError(typeof record.error === "string" ? record.error : `Engram request failed with HTTP ${replay.response.status}`, replay.response.status, replay.data);
+  }
+  const final = await attempt("GET");
+  if (final.response?.ok && hasPositiveObservationID(final.data, "committed")) return { data: final.data as TResponse };
+  return unknown();
+}
+
 function createMemoryToolTransport(signal?: AbortSignal): { fetch: EngramFetcher; transportFailure: () => EngramTransportFailure | undefined } {
   let failure: EngramTransportFailure | undefined;
   return {
     async fetch<TResponse = unknown>(path: string, opts: FetchOptions = {}): Promise<TResponse | null> {
-      const result = await engramFetchResult<TResponse>(path, { ...opts, signal });
+      const result = opts.observationSave
+        ? await postObservationWithReplayRecovery<TResponse>(opts.body as Record<string, unknown>, signal)
+        : await engramFetchResult<TResponse>(path, { ...opts, signal });
       if (result.transportFailure) failure = result.transportFailure;
       return result.data;
     },
@@ -744,7 +894,13 @@ function wait(ms: number): Promise<void> {
 // A tool call may stop awaiting shared startup work, but must not cancel it for other callers.
 function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
-  const cancelled = () => new Error("Engram tool execution was cancelled");
+  const cancelled = () => {
+    // Preserve an explicit caller abort reason through the outer tool wrapper. A bare
+    // AbortController supplies only Node's generic DOMException, so retain the existing
+    // stable message while still reporting it as an AbortError.
+    if (signal.reason instanceof Error && signal.reason.message !== "This operation was aborted") return signal.reason;
+    return new DOMException("Engram tool execution was cancelled", "AbortError");
+  };
   if (signal.aborted) {
     void promise.then(
       () => undefined,
@@ -903,6 +1059,9 @@ function spawnAndWaitForEngram(deadline: number, expectedID = ""): Promise<void>
 }
 
 async function initializeEngramServer(): Promise<void> {
+  // Defense in depth: a future caller must not bypass policy via an explicit URL
+  // or reach the potentially state-writing instance-id command.
+  if (!ENGRAM_STARTUP_ALLOWED) throw new Error(ENGRAM_DISABLED_NOTICE);
   if (CONFIGURED_ENGRAM_URL !== undefined) return;
   const deadline = Date.now() + ENGRAM_STARTUP_TIMEOUT_MS;
   const instanceID = localEngramInstanceID = localInstanceID(Math.max(1, deadline - Date.now()));
@@ -1143,7 +1302,7 @@ function supportsRootSessionResume(health: unknown): boolean {
 function rootResumeCompatibilityError(health: unknown): Error {
   const version = health && typeof health === "object" && typeof (health as { version?: unknown }).version === "string"
     ? (health as { version: string }).version : "unknown";
-  return new Error(`gentle-engram 0.3.0 cannot resume this Pi session with Engram core ${version}. Requires capabilities.root_session_resume: true or a supported release >= 3.0.0 without an explicit negative or malformed capability. Upgrade the Engram core and restart its server, then retry. No resumed identity was adopted.`);
+  return new Error(`gentle-engram 0.4.2 cannot resume this Pi session with Engram core ${version}. Requires capabilities.root_session_resume: true or a supported release >= 3.0.0 without an explicit negative or malformed capability. Upgrade the Engram core and restart its server, then retry. No resumed identity was adopted.`);
 }
 
 async function registerEffectiveSession(ctx: SessionContext, sessionProject: string, appendEntry: ExtensionAPI["appendEntry"] | undefined, fetch: EngramFetcher = engramFetch): Promise<string> {
@@ -1907,6 +2066,7 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
       if (writeState) assertOpen(writeState, writeEpoch!);
       return fetch("/observations", {
         method: "POST",
+        observationSave: true,
         body: {
           session_id: activeSessionId,
           title: params.title,
@@ -2122,6 +2282,7 @@ function unreachableMessage(failure: EngramTransportFailure | undefined): string
     return `gentle-engram could not confirm session registration after ${failure.timeoutMs}ms. Registration is idempotent and was retried within its bounded policy, but its final outcome is unknown. No memory write was sent; retrying the memory operation is safe.`;
   }
   if (failure?.operation === "write" && failure.outcome === "unknown") {
+    if (failure.operationID) return `gentle-engram could not confirm the observation save. Its outcome is unknown — do NOT blindly retry with a new operation. Operation ID: ${failure.operationID}. Read-only recovery: GET /observations/save-result?operation_id=${failure.operationID} on the original Engram server.`;
     return `gentle-engram could not confirm the write after ${failure.timeoutMs}ms. Its outcome is unknown because the server may already have applied it — do NOT blindly retry it, or you may duplicate the write. Verify with mem_search or mem_doctor first.`;
   }
   if (failure?.outcome === "timed_out") {
@@ -2166,9 +2327,9 @@ async function executeMemoryTool(toolName: string, params: Record<string, unknow
     const message = failure ? unreachableMessage(failure) : error instanceof Error ? error.message : String(error);
     const details = error instanceof EngramHttpError
       ? { error: message, http_status: error.status, data: error.data }
-      : failure ? { error: message, outcome: failure.outcome, operation: failure.operation } : { error: message };
+      : failure ? { error: message, outcome: failure.outcome, operation: failure.operation, ...(failure.operationID ? { operation_id: failure.operationID } : {}) } : { error: message };
     ctx.ui?.setStatus?.("engram", `🧠 ${project} · ${errorStatusLabel(message)}`);
-    if (!(error instanceof EngramHttpError)) scheduleEngramSelfHeal(ctx);
+    if (shouldScheduleEngramSelfHeal(error, failure)) scheduleEngramSelfHeal(ctx);
     return { content: [{ type: "text" as const, text: message }], details, isError: true };
   }
 }
@@ -2283,6 +2444,17 @@ function installBridgeResponder(pi: ExtensionAPI, ctx: SessionContext, runtimeID
 }
 
 export default function registerEngram(pi: ExtensionAPI) {
+  if (!ENGRAM_STARTUP_ALLOWED) {
+    // No normal tools, protocol, bridge responder, capture or shutdown hooks.
+    pi.on("session_start", (_event: unknown, ctx: SessionContext) => {
+      try { ctx.ui?.setStatus?.("engram", "🧠 memory disabled"); } catch {}
+      try {
+        if (ctx.hasUI) ctx.ui?.notify?.(ENGRAM_DISABLED_NOTICE, "warning");
+        else process.stderr.write(`${ENGRAM_DISABLED_NOTICE}\n`);
+      } catch { /* A disposed UI must not interrupt a usable memory-free session. */ }
+    });
+    return;
+  }
   // Trace-only comparison is local to this factory, never persistence or ownership state.
   let previousTraceIdentity: string | undefined;
   const traceLifecycle = (event: "session_start" | "session_shutdown", id: string | undefined | (() => string), reason?: unknown) => {

@@ -62,7 +62,7 @@ Install Engram's Pi-native package:
 engram setup pi
 ```
 
-`engram setup pi` runs `pi install npm:gentle-engram@0.2.0`, then ensures Pi settings contain that package, replacing earlier `0.1.8`, `0.1.11`, `0.1.12`, `0.1.14`, `0.1.15`, and `0.1.16` pins when present. Pi agent writes use native `mem_*` tools, not Engram MCP registration. `engram setup pi` does not create or change `mcpServers.engram`. Earlier `0.1.16` `pi-engram init` still registers Engram MCP and must not be used for native-only setup; version `0.2.0` init does not create or change `mcp.json` and warns about an existing `mcpServers.engram` entry. If the Pi agent directory's `mcp.json` already contains `mcpServers.engram`, Go setup warns with its exact path and key; manually remove only that key and restart/reload Pi for the native-only guarantee. Until then native-only agent writes are **not guaranteed**. Other MCP servers are preserved.
+This source version of `engram setup pi` runs `pi install npm:gentle-engram@0.4.1`, then ensures Pi settings contain that package, replacing earlier `0.1.8`, `0.1.11`, `0.1.12`, `0.1.14`, `0.1.15`, `0.1.16`, `0.2.0`, `0.3.0`, and `0.4.0` pins when present. Engram core `3.3.1` uses the same `0.4.1` pin; older core `3.3.0` binaries pin `0.3.0`, so use the explicit manual install below to select `0.4.1` with an older core. Pi agent writes use native `mem_*` tools, not Engram MCP registration. `engram setup pi` does not create or change `mcpServers.engram`. Earlier `0.1.16` `pi-engram init` still registers Engram MCP and must not be used for native-only setup; version `0.2.0` init does not create or change `mcp.json` and warns about an existing `mcpServers.engram` entry. If the Pi agent directory's `mcp.json` already contains `mcpServers.engram`, Go setup warns with its exact path and key; manually remove only that key and restart/reload Pi for the native-only guarantee. Until then native-only agent writes are **not guaranteed**. Other MCP servers are preserved.
 
 Pi 0.99.0 and later ship built-in MCP (`mcp.json`, `/mcp`, `pi mcp add`); an installed `pi-mcp-adapter` replaces that built-in support, so neither `engram setup pi` nor `pi-engram init` adds it. An existing adapter entry in `settings.json` is left untouched.
 
@@ -73,7 +73,7 @@ When [mise](https://mise.jdx.dev/) is detected in `PATH`, `engram setup pi` also
 Manual equivalent:
 
 ```bash
-pi install npm:gentle-engram@0.2.0
+pi install npm:gentle-engram@0.4.1
 ```
 
 Restart Pi after installation.
@@ -231,7 +231,7 @@ Alternatives: `cd` into the target repo before starting the MCP server, or add r
 
 `mem_get_observation` retains its read-only stored-owner fallback: only when cwd detection is ambiguous and the observation has a nonblank stored project does it use that project (`project_source: "stored_project"`, `project_path: ""`). This identifies the record's owner, not a verified repository path, and does not bypass malformed or unknown explicit/process overrides.
 
-`mem_update` and `mem_delete` require caller-supplied `expected_project`, including for personal/global scopes. Never fetch the target to fill a missing assertion. The normalized stored owner is checked atomically with the mutation. Native `mem_update` also retains known-current/process ownership checks and rejects ambiguous cwd rather than using a stored-owner write fallback. The assertion is not a recovery token or permission to bypass context rules; existing recovery and session ownership protections remain unchanged.
+`mem_update` and `mem_delete` require caller-supplied `expected_project`, including for personal/global scopes. Never fetch the target to fill a missing assertion. The normalized stored owner is checked atomically with the mutation. ID-addressed updates/deletes do not resolve server cwd or process overrides: a matching assertion works on shared multi-project servers, while an incorrect assertion is rejected without mutation. Update responses report the matched owner with `project_source: "explicit_override"` and an empty `project_path`. The assertion is not authentication, a permission grant, or a recovery token; save/recovery and session ownership protections remain unchanged.
 
 This is an intentional compatibility break for clients omitting `expected_project`. The in-repository Pi schema and forwarding require it; external gentle-engram relays need separate adaptation.
 
@@ -253,9 +253,9 @@ This does three things:
 2. Adds the `engram` MCP server entry to your global OpenCode configuration with `--tools=agent` (19 agent-facing tools)
 3. Adds `opencode-subagent-statusline` to your `tui.json` or `tui.jsonc` so OpenCode shows sub-agent activity in the sidebar/home footer
 
-MCP registration edits only the missing `mcp.engram` member, preserving all existing configuration bytes, including comments, trailing commas, formatting, and key order. An existing `mcp.engram` entry is left untouched. Setup uses `opencode.jsonc` when it exists, otherwise `opencode.json`; OpenCode loads both global files and merges `.jsonc` last. The directory is `$XDG_CONFIG_HOME/opencode` when set, otherwise `~/.config/opencode` on all platforms. Project and environment overrides may take precedence over this global entry.
+MCP registration adds a missing local Engram entry and refreshes only `command[0]` for an existing local entry, preserving all other configuration bytes, including comments, trailing commas, formatting, key order, flags, options, and other servers. It supports both V1 `mcp.engram` and V2 `mcp.servers.engram`; remote entries are left untouched. Setup uses `opencode.jsonc` when it exists, otherwise `opencode.json`; OpenCode loads both global files and merges `.jsonc` last. The directory is `$XDG_CONFIG_HOME/opencode` when set, otherwise `~/.config/opencode` on all platforms. Project and environment overrides may take precedence over this global entry.
 
-Malformed or ambiguous MCP configuration (including duplicate keys, a non-object root, or a non-object `mcp` block) is refused without changing that file. Setup still installs the plugin and attempts TUI registration, but prints the existing manual-MCP warning. This byte-preservation guarantee applies to MCP registration, not the separate `tui.json(c)` writer.
+Malformed or ambiguous MCP configuration (including duplicate keys, a non-object root, or a non-object `mcp` or `mcp.servers` block) is refused without changing that file. Setup still installs the plugin and attempts TUI registration, but prints the existing manual-MCP warning. This byte-preservation guarantee applies to MCP registration, not the separate `tui.json(c)` writer.
 
 ### Verify each layer after setup
 

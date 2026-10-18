@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -78,6 +79,8 @@ var (
 	ErrObservationProjectImmutable              = errors.New("observation project cannot be reassigned")
 	ErrObservationTitleRequired                 = errors.New("observation title is required")
 	ErrObservationContentRequired               = errors.New("observation content is required")
+	ErrObservationOperationConflict             = errors.New("observation operation id conflicts with a different payload")
+	ErrObservationOperationExpired              = errors.New("observation operation id is outside the replay horizon")
 	ErrObservationFindReplacePairRequired       = errors.New("find and replace must be provided together")
 	ErrObservationFindReplaceContentConflict    = errors.New("find and replace cannot be combined with content")
 	ErrObservationFindReplaceInputTooLarge      = errors.New("find and replace inputs exceed maximum observation length")
@@ -294,14 +297,32 @@ type SearchOptions struct {
 }
 
 type AddObservationParams struct {
-	SessionID string `json:"session_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	ToolName  string `json:"tool_name,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	TopicKey  string `json:"topic_key,omitempty"`
+	SessionID   string        `json:"session_id"`
+	Type        string        `json:"type"`
+	Title       string        `json:"title"`
+	Content     string        `json:"content"`
+	ToolName    string        `json:"tool_name,omitempty"`
+	Project     string        `json:"project,omitempty"`
+	Scope       string        `json:"scope,omitempty"`
+	TopicKey    string        `json:"topic_key,omitempty"`
+	OperationID string        `json:"operation_id,omitempty"`
+	Timings     *WriteTimings `json:"-"`
+}
+
+// WriteTimings collects one write operation's local database stages. It holds
+// durations only; callers must not add request values or identifiers.
+type WriteTimings struct {
+	ConnectionWait time.Duration
+	Transaction    time.Duration
+	Commit         time.Duration
+	Attempts       int
+}
+
+// AddObservationResult reports whether an observation save created a new
+// logical result or returned an exact replay from the operation ledger.
+type AddObservationResult struct {
+	ID       int64
+	Replayed bool
 }
 
 type UpdateObservationParams struct {
@@ -641,11 +662,13 @@ type syncObservationPayload struct {
 	RevisionCount  int     `json:"revision_count"`
 	DuplicateCount int     `json:"duplicate_count"`
 	LastSeenAt     *string `json:"last_seen_at,omitempty"`
-	CreatedAt      string  `json:"created_at,omitempty"`
-	UpdatedAt      string  `json:"updated_at,omitempty"`
-	Deleted        bool    `json:"deleted,omitempty"`
-	DeletedAt      *string `json:"deleted_at,omitempty"`
-	HardDelete     bool    `json:"hard_delete,omitempty"`
+	// Raw JSON distinguishes an absent legacy field from an explicit null reset.
+	ReviewAfter json.RawMessage `json:"review_after,omitempty"`
+	CreatedAt   string          `json:"created_at,omitempty"`
+	UpdatedAt   string          `json:"updated_at,omitempty"`
+	Deleted     bool            `json:"deleted,omitempty"`
+	DeletedAt   *string         `json:"deleted_at,omitempty"`
+	HardDelete  bool            `json:"hard_delete,omitempty"`
 }
 
 type syncPromptPayload struct {
@@ -875,11 +898,14 @@ func (s *Store) DataDir() string {
 // ─── Store ───────────────────────────────────────────────────────────────────
 
 type Store struct {
-	db         *sql.DB
-	cfg        Config
-	instanceID string
-	generation *databaseGeneration
-	hooks      storeHooks
+	compatibilityClosed    atomic.Bool
+	compatibilityReady     bool
+	compatibilityRuntimeID string
+	db                     *sql.DB
+	cfg                    Config
+	instanceID             string
+	generation             *databaseGeneration
+	hooks                  storeHooks
 
 	repairMu        sync.Mutex
 	repairDone      bool
@@ -1085,11 +1111,19 @@ func newStore(cfg Config) (*Store, error) {
 		return nil, err
 	}
 
+	if s.compatibilityReady {
+		var runtimeID [16]byte
+		if _, err := rand.Read(runtimeID[:]); err != nil {
+			return nil, fmt.Errorf("engram: runtime identity: %w", err)
+		}
+		s.compatibilityRuntimeID = hex.EncodeToString(runtimeID[:])
+	}
 	succeeded = true
 	return s, nil
 }
 
 func (s *Store) Close() error {
+	s.compatibilityClosed.Store(true)
 	return s.db.Close()
 }
 
@@ -1212,6 +1246,7 @@ func (s *Store) runStartupMigrations() error {
 				return fmt.Errorf("engram: set user_version: %w", err)
 			}
 		}
+		s.compatibilityReady = true
 		return nil
 	})
 }
@@ -1444,6 +1479,14 @@ func (s *Store) migrate() error {
 			content='user_prompts',
 			content_rowid='id'
 		);
+
+			-- Local Git clear intent is independent of enrollment and cloud acks.
+			-- Retain events; manifest history owns export deduplication.
+			CREATE TABLE IF NOT EXISTS review_clear_events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				event_key TEXT NOT NULL UNIQUE,
+				sync_id TEXT NOT NULL
+			);
 
 			CREATE TABLE IF NOT EXISTS sync_chunks (
 				target_key  TEXT NOT NULL DEFAULT 'local',
@@ -1869,6 +1912,29 @@ func (s *Store) migrate() error {
 	if _, err := s.execHook(s.db, `
 		CREATE INDEX IF NOT EXISTS idx_memrel_status_created
 			ON memory_relations(judgment_status, created_at DESC);
+	`); err != nil {
+		return err
+	}
+
+	// ── Phase: replay-safe observation saves ────────────────────────────────
+	// Durable idempotency ledger for observation writes. Each row binds an
+	// operation ID (generated by the client) to the canonical fingerprint of
+	// the save and the committed observation ID. Replays with the same ID and
+	// equivalent fingerprint return the original result; mismatched payloads
+	// are rejected as conflicts. observation_id is nullable and the foreign
+	// key uses ON DELETE SET NULL so that deleting an observation turns the
+	// ledger row into a tombstone instead of silently allowing the same
+	// operation ID to be replayed against a different payload later.
+	if _, err := s.execHook(s.db, `
+		CREATE TABLE IF NOT EXISTS observation_save_operations (
+			operation_id     TEXT    NOT NULL PRIMARY KEY,
+			fingerprint      TEXT    NOT NULL,
+			observation_id   INTEGER,
+			created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+			FOREIGN KEY (observation_id) REFERENCES observations(id) ON DELETE SET NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_obs_save_op_created
+			ON observation_save_operations(created_at);
 	`); err != nil {
 		return err
 	}
@@ -3242,6 +3308,29 @@ func (s *Store) CreateSessionWithOwnershipMode(id, project, directory, mode stri
 	})
 }
 
+// ResolveManualSession registers an independent project-owned fallback session.
+// Keep the legacy ID when possible, but never claim a session owned by another
+// project. A separate deterministic namespace avoids interpreting the hash as
+// a legacy manual-save project suffix in diagnostics and ownership backfills.
+func (s *Store) ResolveManualSession(project, directory string) (string, error) {
+	project, _ = NormalizeProject(project)
+	id := manualSessionIDPrefix + project
+	err := s.CreateSessionWithOwnershipMode(id, project, directory, SessionOwnershipProjectOwned)
+	if err == nil {
+		return id, nil
+	}
+	var conflict *SessionProjectConflictError
+	if !errors.As(err, &conflict) {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(project))
+	id = "manual-fallback-" + hex.EncodeToString(digest[:])
+	if err := s.CreateSessionWithOwnershipMode(id, project, directory, SessionOwnershipProjectOwned); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
 // runtimeSessionLeaseDuration bounds local runtime-session liveness. It is not
 // synchronized and never changes a session's terminal state.
 const runtimeSessionLeaseDuration = "+30 minutes"
@@ -3255,14 +3344,26 @@ func (s *Store) StartSession(id, project, directory string) error {
 // lease. It preserves the existing session identity and refuses to reopen an
 // ended session; EndSession remains terminal truth.
 func (s *Store) StartSessionWithOwnershipMode(id, project, directory, mode string) error {
-	return s.startSessionRegistration(id, project, directory, mode, false, nil, false)
+	return s.startSessionRegistration(id, project, directory, mode, false, nil, false, nil)
+}
+
+// StartSessionWithOwnershipModeTimed records database-stage timings without
+// changing session-registration behavior.
+func (s *Store) StartSessionWithOwnershipModeTimed(id, project, directory, mode string, timings *WriteTimings) error {
+	return s.startSessionRegistration(id, project, directory, mode, false, nil, false, timings)
 }
 
 // ResumeSessionWithOwnershipMode atomically selects and registers a live runtime
 // identity. Ended rows remain terminal; ordinary and MCP registrations do not opt in.
 func (s *Store) ResumeSessionWithOwnershipMode(id, project, directory, mode string) (string, error) {
+	return s.ResumeSessionWithOwnershipModeTimed(id, project, directory, mode, nil)
+}
+
+// ResumeSessionWithOwnershipModeTimed records database-stage timings without
+// changing runtime-session continuation selection.
+func (s *Store) ResumeSessionWithOwnershipModeTimed(id, project, directory, mode string, timings *WriteTimings) (string, error) {
 	effective := id
-	err := s.startSessionRegistration(id, project, directory, mode, true, &effective, false)
+	err := s.startSessionRegistration(id, project, directory, mode, true, &effective, false, timings)
 	if err != nil {
 		return "", err
 	}
@@ -3279,8 +3380,14 @@ var ErrSessionIsolationConflict = errors.New("isolated session registration requ
 // Cloud pull or local import), because isolated registration never changes a
 // persisted ownership mode and a shared lease would accept cross-project writes.
 func (s *Store) RegisterIsolatedSession(id, project string, resume bool) (string, error) {
+	return s.RegisterIsolatedSessionTimed(id, project, resume, nil)
+}
+
+// RegisterIsolatedSessionTimed records database-stage timings without changing
+// isolated-session validation or persistence.
+func (s *Store) RegisterIsolatedSessionTimed(id, project string, resume bool, timings *WriteTimings) (string, error) {
 	effective := id
-	if err := s.startSessionRegistration(id, project, "", SessionOwnershipProjectOwned, resume, &effective, true); err != nil {
+	if err := s.startSessionRegistration(id, project, "", SessionOwnershipProjectOwned, resume, &effective, true, timings); err != nil {
 		return "", err
 	}
 	return effective, nil
@@ -3345,7 +3452,7 @@ func continuationSessionTx(tx *sql.Tx, root string) (string, error) {
 	return prefix + max.Add(max, big.NewInt(1)).String(), nil
 }
 
-func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string, isolated bool) error {
+func (s *Store) startSessionRegistration(id, project, directory, mode string, resume bool, effective *string, isolated bool, timings *WriteTimings) error {
 	if err := validateSessionID(id); err != nil {
 		return err
 	}
@@ -3359,7 +3466,7 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 
 	claimed := false
 	root := id
-	err := s.withTx(func(tx *sql.Tx) error {
+	err := s.withWriteTimings(timings, func(tx *sql.Tx) error {
 		// withTx may retry its callback. Only the outcome of a committed
 		// attempt may become the terminal response.
 		claimed = false
@@ -3684,7 +3791,7 @@ const activeRuntimeSessionWindow = "-7 days"
 //   - A live lease suppresses unleased legacy candidates in its directory only.
 //     Where no live lease exists, preserve the legacy effective-activity window:
 //     the latest observation, falling back to started_at, must be recent.
-//   - Exclude the manual-save fallback sessions (id LIKE 'manual-save%'); those
+//   - Exclude manual-save and manual-fallback sessions; those
 //     are created by the fallback path itself and must not be resolved as "the
 //     active session", which would make resolution circular.
 //
@@ -3726,6 +3833,7 @@ func (s *Store) ActiveRuntimeSessions(project string, directories ...string) ([]
 			  AND s.directory IN (`+strings.Join(placeholders, ", ")+`)
 			  AND s.ended_at IS NULL
 			  AND s.id NOT LIKE 'manual-save%'
+			  AND s.id NOT LIKE 'manual-fallback-%'
 			GROUP BY s.id
 		), live_leased_directories AS (
 			SELECT directory
@@ -3916,7 +4024,100 @@ func ValidateObservationTitle(title string) error {
 	return nil
 }
 
+// observationSaveFingerprint returns a stable, canonical fingerprint of the
+// effect-bearing inputs for an observation save. It must include every input
+// that would change the persisted state if it differed, and it must be
+// computed from normalized request fields, before resolving session ownership.
+func observationSaveFingerprint(p AddObservationParams, title, content, project, scope, topicKey string) string {
+	h := sha256.New()
+	var length [8]byte
+	for _, v := range []string{p.SessionID, p.Type, title, content, p.ToolName, project, scope, topicKey} {
+		binary.BigEndian.PutUint64(length[:], uint64(len(v)))
+		h.Write(length[:])
+		h.Write([]byte(v))
+	}
+	return "v1:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// GetObservationSaveResult returns the committed observation ID for a previous
+// observation save operation, if any. It is intended for clients that lost the
+// response and want to recover without replaying the write. A zero result with
+// a nil error means no operation was recorded. ErrObservationOperationExpired
+// means the operation is retained but its observation was deleted, so it must
+// not be replayed.
+func (s *Store) GetObservationSaveResult(operationID string) (observationID int64, err error) {
+	if operationID == "" {
+		return 0, nil
+	}
+	var nullableID sql.NullInt64
+	err = s.db.QueryRow(
+		`SELECT o.id
+		 FROM observation_save_operations AS operation
+		 LEFT JOIN observations AS o ON o.id = operation.observation_id AND o.deleted_at IS NULL
+		 WHERE operation.operation_id = ?`,
+		operationID,
+	).Scan(&nullableID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !nullableID.Valid {
+		return 0, ErrObservationOperationExpired
+	}
+	return nullableID.Int64, nil
+}
+
+// ObservationOperationRecorded is a cheap existence probe for the operation
+// ledger. It returns true when any row exists for the operation ID, including
+// tombstones left by hard deletion, so callers can short-circuit session
+// ownership pre-validation for committed operations.
+func (s *Store) ObservationOperationRecorded(operationID string) (bool, error) {
+	if operationID == "" {
+		return false, nil
+	}
+	var exists bool
+	err := s.db.QueryRow(
+		`SELECT 1 FROM observation_save_operations WHERE operation_id = ? LIMIT 1`,
+		operationID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// recordObservationSaveOperationTx persists the idempotent operation ledger row
+// when an operation ID was supplied, then enqueues the sync mutation for the
+// observation. It is called from every success path inside AddObservation so
+// that the ledger is written in the same transaction as the observation.
+func (s *Store) recordObservationSaveOperationTx(tx *sql.Tx, operationID, fingerprint string, observationID int64, obs *Observation) error {
+	if operationID != "" {
+		if _, err := s.execHook(tx,
+			`INSERT INTO observation_save_operations (operation_id, fingerprint, observation_id)
+				 VALUES (?, ?, ?)`,
+			operationID, fingerprint, observationID,
+		); err != nil {
+			return fmt.Errorf("record observation save operation: %w", err)
+		}
+	}
+	return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
+}
+
+// AddObservation preserves the legacy ID-only API for callers that do not need
+// to distinguish a new save from an exact operation replay.
 func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
+	result, err := s.AddObservationWithResult(p)
+	return result.ID, err
+}
+
+// AddObservationWithResult persists an observation or returns an exact replay
+// outcome from the operation ledger in the same transaction.
+func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservationResult, error) {
 	// Normalize project name (lowercase + trim) before any persistence
 	p.Project, _ = NormalizeProject(p.Project)
 
@@ -3929,21 +4130,55 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	// observation also enqueues a cloud upsert that the sync validators reject,
 	// which blocks every later mutation for the project (#459).
 	if err := ValidateObservationTitle(title); err != nil {
-		return 0, err
+		return AddObservationResult{}, err
 	}
 	if content == "" {
-		return 0, ErrObservationContentRequired
+		return AddObservationResult{}, ErrObservationContentRequired
 	}
 
 	scope := normalizeScope(p.Scope)
 	normHash := hashNormalized(content)
 	topicKey := normalizeTopicKey(p.TopicKey)
+	fingerprint := observationSaveFingerprint(p, title, content, p.Project, scope, topicKey)
 
 	var observationID int64
-	err := s.withTx(func(tx *sql.Tx) error {
+	replayed := false
+	err := s.withWriteTimings(p.Timings, func(tx *sql.Tx) error {
+		replayed = false
+		// If the caller supplied an operation ID, check for a committed result first
+		// so a replay can return the original outcome without repeating mutations.
+		// The check runs inside the transaction so it races safely with concurrent
+		// commits of the same operation.
+		if p.OperationID != "" {
+			var committedID sql.NullInt64
+			var committedFingerprint string
+			err := tx.QueryRow(
+				`SELECT o.id, operation.fingerprint
+				 FROM observation_save_operations AS operation
+				 LEFT JOIN observations AS o ON o.id = operation.observation_id AND o.deleted_at IS NULL
+				 WHERE operation.operation_id = ?`,
+				p.OperationID,
+			).Scan(&committedID, &committedFingerprint)
+			if err == nil {
+				if !strings.HasPrefix(committedFingerprint, "v1:") {
+					return ErrObservationOperationExpired
+				}
+				if committedFingerprint == fingerprint {
+					if !committedID.Valid {
+						return ErrObservationOperationExpired
+					}
+					observationID = committedID.Int64
+					replayed = true
+					return nil
+				}
+				return ErrObservationOperationConflict
+			}
+			if err != sql.ErrNoRows {
+				return err
+			}
+		}
 		{
-			// Settle ownership first: an unowned legacy session adopts this
-			// write's project rather than rejecting the write forever.
+			// Only a genuinely new save may adopt an unowned legacy session.
 			resolved, err := s.resolveWriteProjectTx(tx, p.SessionID, p.Project)
 			if err != nil {
 				return err
@@ -4002,7 +4237,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 					return err
 				}
 				observationID = existingID
-				return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
+				return s.recordObservationSaveOperationTx(tx, p.OperationID, fingerprint, observationID, obs)
 			}
 			if err != sql.ErrNoRows {
 				return err
@@ -4040,7 +4275,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 				return err
 			}
 			observationID = existingID
-			return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
+			return s.recordObservationSaveOperationTx(tx, p.OperationID, fingerprint, observationID, obs)
 		}
 		if err != sql.ErrNoRows {
 			return err
@@ -4078,12 +4313,12 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 		if err != nil {
 			return err
 		}
-		return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, observationPayloadFromObservation(obs))
+		return s.recordObservationSaveOperationTx(tx, p.OperationID, fingerprint, observationID, obs)
 	})
 	if err != nil {
-		return 0, err
+		return AddObservationResult{}, err
 	}
-	return observationID, nil
+	return AddObservationResult{ID: observationID, Replayed: replayed}, nil
 }
 
 func (s *Store) RecentObservations(project, scope string, limit int) ([]Observation, error) {
@@ -4254,7 +4489,7 @@ func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observat
 
 // MarkReviewed resets an observation's review_after using its type's configured decay offset.
 // Types without a decay offset return to a NULL review_after value.
-// This lifecycle reset is intentionally local-only until the sync wire format includes review_after.
+// The reset and its sync upsert are committed atomically.
 func (s *Store) MarkReviewed(id int64) error {
 	return s.markReviewed(id, "")
 }
@@ -4268,14 +4503,15 @@ func (s *Store) MarkReviewedForProject(id int64, project string) error {
 
 func (s *Store) markReviewed(id int64, project string) error {
 	return s.withTx(func(tx *sql.Tx) error {
-		query := `SELECT type FROM observations WHERE id = ? AND deleted_at IS NULL`
+		query := `SELECT type, review_after FROM observations WHERE id = ? AND deleted_at IS NULL`
 		args := []any{id}
 		if project != "" {
 			query += ` AND LOWER(project) = ?`
 			args = append(args, project)
 		}
 		var observationType string
-		err := tx.QueryRow(query, args...).Scan(&observationType)
+		var priorReviewAfter sql.NullString
+		err := tx.QueryRow(query, args...).Scan(&observationType, &priorReviewAfter)
 		if err == sql.ErrNoRows {
 			return ErrObservationNotFound
 		}
@@ -4287,8 +4523,8 @@ func (s *Store) markReviewed(id int64, project string) error {
 		if months, ok := decayReviewAfterMonths[observationType]; ok {
 			reviewAfter = time.Now().UTC().AddDate(0, months, 0).Format("2006-01-02 15:04:05")
 		}
-		update := `UPDATE observations SET review_after = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`
-		updateArgs := []any{reviewAfter, id}
+		update := `UPDATE observations SET review_after = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`
+		updateArgs := []any{reviewAfter, Now(), id}
 		if project != "" {
 			update += ` AND LOWER(project) = ?`
 			updateArgs = append(updateArgs, project)
@@ -4304,8 +4540,47 @@ func (s *Store) markReviewed(id int64, project string) error {
 		if affected == 0 {
 			return ErrObservationNotFound
 		}
-		return nil
+		obs, err := s.getObservationTx(tx, id)
+		if err != nil {
+			return err
+		}
+		payload := observationPayloadFromObservation(obs)
+		if obs.ReviewAfter == nil && priorReviewAfter.Valid {
+			payload.ReviewAfter = json.RawMessage("null")
+			if _, err := s.execHook(tx, `INSERT INTO review_clear_events (event_key, sync_id) VALUES (?, ?)`, newSyncID("review-clear"), obs.SyncID); err != nil {
+				return err
+			}
+		}
+		return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpUpsert, payload)
 	})
+}
+
+// ReviewClearEvent is local-only intent; it is never part of cloud payloads.
+type ReviewClearEvent struct {
+	ID     int64
+	Key    string
+	SyncID string
+}
+
+// ExportReviewClearEvents returns retained events whose observation is still
+// live and undated. Restoring a date or deleting the observation suppresses it.
+func (s *Store) ExportReviewClearEvents() ([]ReviewClearEvent, error) {
+	rows, err := s.queryItHook(s.db, `SELECT e.id, e.event_key, e.sync_id FROM review_clear_events e
+		JOIN observations o ON o.sync_id = e.sync_id
+		WHERE o.review_after IS NULL AND o.deleted_at IS NULL ORDER BY e.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var events []ReviewClearEvent
+	for rows.Next() {
+		var event ReviewClearEvent
+		if err := rows.Scan(&event.ID, &event.Key, &event.SyncID); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 // ─── User Prompts ────────────────────────────────────────────────────────────
@@ -8700,6 +8975,10 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 
 		// Plan settled — only now does anything change.
 		for _, sessionID := range plan.claim {
+			// The ownership stamp also assigns the project and counts the session.
+			if plan.stampOwnershipMode[sessionID] {
+				continue
+			}
 			if _, err := s.execHook(tx, rescueSessionQuery.updateProject, target, sessionID); err != nil {
 				return err
 			}
@@ -8765,8 +9044,8 @@ func (s *Store) RescueNullProjectOwnership(p ProjectRescueParams) (*ProjectRescu
 type rescuePlan struct {
 	// claim lists unowned sessions that will be moved to the target.
 	claim []string
-	// stampOwnershipMode identifies target-owned sessions whose blank ownership
-	// mode can be deterministically classified from their session ID.
+	// stampOwnershipMode identifies sessions owned by the target after rescue
+	// whose blank mode can be deterministically classified from their session ID.
 	stampOwnershipMode map[string]bool
 	// willOwn reports, for every session in scope, whether it belongs to the
 	// target once the plan is applied.
@@ -8820,6 +9099,9 @@ func planRescueSessionsTx(tx *sql.Tx, scope rescueSessionScope, target string, r
 			}
 			plan.claim = append(plan.claim, sessionID)
 			plan.willOwn[sessionID] = true
+			if mode == "" {
+				plan.stampOwnershipMode[sessionID] = true
+			}
 		}
 	}
 	return plan, nil
@@ -9726,16 +10008,37 @@ func (s *Store) DeleteProject(project string, hardDelete bool) (*DeleteProjectRe
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func (s *Store) withTx(fn func(tx *sql.Tx) error) error {
+	return s.withWriteTimings(nil, fn)
+}
+
+func (s *Store) withWriteTimings(timings *WriteTimings, fn func(tx *sql.Tx) error) error {
 	return withSQLiteWriteRetry(func() error {
+		if timings != nil {
+			timings.Attempts++
+		}
+		started := time.Now()
 		tx, err := s.beginTxHook()
+		if timings != nil {
+			timings.ConnectionWait += time.Since(started)
+		}
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		if err := fn(tx); err != nil {
+		started = time.Now()
+		err = fn(tx)
+		if timings != nil {
+			timings.Transaction += time.Since(started)
+		}
+		if err != nil {
 			return err
 		}
-		return s.commitHook(tx)
+		started = time.Now()
+		err = s.commitHook(tx)
+		if timings != nil {
+			timings.Commit += time.Since(started)
+		}
+		return err
 	})
 }
 
@@ -12198,6 +12501,12 @@ func (s *Store) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includeDelet
 }
 
 func observationPayloadFromObservation(obs *Observation) syncObservationPayload {
+	// Missing dates carry no clear intent. MarkReviewed emits an explicit null
+	// only when it actually removes a previously stored review date.
+	var reviewAfter json.RawMessage
+	if obs.ReviewAfter != nil {
+		reviewAfter, _ = json.Marshal(obs.ReviewAfter)
+	}
 	return syncObservationPayload{
 		SyncID:         obs.SyncID,
 		SessionID:      obs.SessionID,
@@ -12211,6 +12520,7 @@ func observationPayloadFromObservation(obs *Observation) syncObservationPayload 
 		RevisionCount:  obs.RevisionCount,
 		DuplicateCount: obs.DuplicateCount,
 		LastSeenAt:     obs.LastSeenAt,
+		ReviewAfter:    reviewAfter,
 		CreatedAt:      obs.CreatedAt,
 		UpdatedAt:      obs.UpdatedAt,
 	}
@@ -12355,11 +12665,33 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 		updatedAt = createdAt
 	}
 
+	var reviewAfter *string
+	if len(payload.ReviewAfter) > 0 {
+		if err := json.Unmarshal(payload.ReviewAfter, &reviewAfter); err != nil {
+			return fmt.Errorf("decode review_after: %w", err)
+		}
+		if reviewAfter != nil {
+			if _, err := parseObservationTime(*reviewAfter); err != nil {
+				return fmt.Errorf("invalid review_after: %w", err)
+			}
+		}
+	}
+
 	existing, err := s.getObservationBySyncIDTx(tx, payload.SyncID, true)
 	if err == sql.ErrNoRows {
+		if len(payload.ReviewAfter) == 0 {
+			if months, ok := decayReviewAfterMonths[payload.Type]; ok {
+				created, parseErr := parseObservationTime(createdAt)
+				if parseErr != nil {
+					return fmt.Errorf("derive review_after from created_at: %w", parseErr)
+				}
+				date := created.AddDate(0, months, 0).Format("2006-01-02 15:04:05")
+				reviewAfter = &date
+			}
+		}
 		_, err = s.execHook(tx,
-			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at)
-			 VALUES (?, ?, ?, ?, ?, ?, CAST(? AS TEXT), ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, created_at, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, CAST(? AS TEXT), ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 			payload.SyncID,
 			payload.SessionID,
 			payload.Type,
@@ -12373,6 +12705,7 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 			revisionCount,
 			duplicateCount,
 			payload.LastSeenAt,
+			reviewAfter,
 			createdAt,
 			updatedAt,
 		)
@@ -12394,6 +12727,9 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 	if payload.LastSeenAt == nil {
 		payload.LastSeenAt = existing.LastSeenAt
 	}
+	if len(payload.ReviewAfter) == 0 {
+		reviewAfter = existing.ReviewAfter
+	}
 	if strings.TrimSpace(payload.CreatedAt) == "" {
 		createdAt = existing.CreatedAt
 	}
@@ -12403,7 +12739,7 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 
 	_, err = s.execHook(tx,
 		`UPDATE observations
-		 SET session_id = ?, type = ?, title = ?, content = ?, tool_name = ?, project = CAST(? AS TEXT), scope = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, created_at = ?, updated_at = ?, deleted_at = NULL
+		 SET session_id = ?, type = ?, title = ?, content = ?, tool_name = ?, project = CAST(? AS TEXT), scope = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, review_after = ?, created_at = ?, updated_at = ?, deleted_at = NULL
 		 WHERE id = ?`,
 		payload.SessionID,
 		payload.Type,
@@ -12417,6 +12753,7 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 		revisionCount,
 		duplicateCount,
 		payload.LastSeenAt,
+		reviewAfter,
 		createdAt,
 		updatedAt,
 		existing.ID,
@@ -13195,10 +13532,11 @@ func sanitizeFTS(query string) string {
 
 // PassiveCaptureParams holds the input for passive memory capture.
 type PassiveCaptureParams struct {
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-	Source    string `json:"source,omitempty"` // e.g. "subagent-stop", "session-end"
+	SessionID string        `json:"session_id"`
+	Content   string        `json:"content"`
+	Project   string        `json:"project,omitempty"`
+	Source    string        `json:"source,omitempty"` // e.g. "subagent-stop", "session-end"
+	Timings   *WriteTimings `json:"-"`
 }
 
 // PassiveCaptureResult holds the output of passive memory capture.
@@ -13326,6 +13664,7 @@ func (s *Store) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, e
 			Project:   p.Project,
 			Scope:     "project",
 			ToolName:  p.Source,
+			Timings:   p.Timings,
 		})
 		if err != nil {
 			return result, fmt.Errorf("passive capture save: %w", err)
@@ -13849,8 +14188,8 @@ func scanDeferredRow(row scannable) (DeferredRow, error) {
 
 // ListObservationSyncPayloads returns the decoded payloads of all sync_mutations
 // rows whose entity = 'observation'. Used by integration tests to assert that
-// new observation columns (review_after, expires_at, embedding*) are NOT present
-// in the sync wire format in Phase 1 (REQ-009).
+// local-only observation columns (expires_at, embedding*) remain absent from
+// the sync wire format; review_after is replicated.
 func (s *Store) ListObservationSyncPayloads() ([]any, error) {
 	rows, err := s.db.Query(`
 		SELECT payload

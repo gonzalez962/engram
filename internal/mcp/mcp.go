@@ -53,12 +53,12 @@ type MCPConfig struct {
 	// auto-resolution; per-call project arguments remain separately validated.
 	DefaultProject string
 
-	// BM25Floor overrides the default BM25 score floor used by FindCandidates
-	// during conflict candidate detection (REQ-001). The floor is the minimum
-	// acceptable BM25 rank (negative; closer to 0 = better match). Candidates
-	// whose score falls below this threshold are excluded.
+	// BM25Floor preserves the deprecated minimum-rank override used by
+	// FindCandidates during conflict candidate detection. Raw FTS5 BM25 ranks
+	// are negative; smaller (more negative) ranks are better matches. This legacy
+	// floor excludes ranks below its value, unlike a relevance maximum.
 	//
-	// nil means "use the store default" (-2.0). An explicit pointer value
+	// nil uses the store's maximum-rank default (0.0). An explicit pointer value
 	// (including 0.0) is forwarded directly. Using a pointer avoids the
 	// zero-value ambiguity where 0.0 would otherwise be indistinguishable
 	// from "not set".
@@ -568,7 +568,7 @@ Examples:
 					mcp.Required(),
 					mcp.Description("Observation ID to update"),
 				),
-				mcp.WithString("expected_project", mcp.Required(), mcp.Description("Explicit expected owner; does not bypass current-project checks")),
+				mcp.WithString("expected_project", mcp.Required(), mcp.Description("Required expected owner, checked atomically against the observation; independent of the server's current project")),
 				mcp.WithString("title",
 					mcp.Description("New title"),
 				),
@@ -1628,9 +1628,10 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		// Build CandidateOptions, forwarding any MCPConfig overrides.
 		// nil fields mean "use store defaults"; explicit pointer values override.
 		candOpts := store.CandidateOptions{
-			Project:   project,
-			Scope:     scope,
-			BM25Floor: cfg.BM25Floor, // nil → store default (-2.0); explicit value overrides
+			Project:              project,
+			Scope:                scope,
+			BM25Floor:            cfg.BM25Floor, // nil retains ordinary negative ranks.
+			RequireSaveRelevance: true,
 		}
 		if cfg.Limit != nil {
 			candOpts.Limit = *cfg.Limit
@@ -1706,7 +1707,7 @@ func handleSuggestTopicKey() server.ToolHandlerFunc {
 	}
 }
 
-func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
+func handleUpdate(s *store.Store, _ MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		expected, _ := req.GetArguments()["expected_project"].(string)
 		if _, err := store.ValidateExpectedProject(expected); err != nil {
@@ -1744,40 +1745,13 @@ func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 			return mcp.NewToolResultError("provide at least one field to update"), nil
 		}
 
-		obs, err := s.GetObservation(id)
-		if err != nil {
-			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
-		}
-
-		detRes, err := resolveWriteProjectWithProcessOverride(s, cfg.DefaultProject, true)
-		if err != nil {
-			return writeProjectErrorResult(nil, "", detRes, err), nil
-		}
-		resolvedProject, _ := store.NormalizeProject(detRes.Project)
-		storedProject := ""
-		if obs.Project != nil {
-			storedProject, _ = store.NormalizeProject(*obs.Project)
-		}
-		if storedProject == "" {
-			return errorWithMeta("project_required", "The stored observation has no project identity", knownWriteProjects(s, detRes)), nil
-		}
-		if storedProject != resolvedProject {
-			return errorWithMeta("project_mismatch", "The current project does not own this observation", knownWriteProjects(s, detRes)), nil
-		}
-		if detRes.Source == projectpkg.SourceDirBasename {
-			session, err := s.GetSession(obs.SessionID)
-			if err != nil || strings.TrimSpace(session.Directory) == "" || runtimeSessionDirectory(session.Directory) != runtimeSessionDirectory(detRes.Path) {
-				return errorWithMeta("project_mismatch", "The current project does not own this observation", knownWriteProjects(s, detRes)), nil
-			}
-		}
-
 		var truncation *store.TruncationMetadata
 		if update.Content != nil {
 			metadata := s.ContentTruncation(*update.Content)
 			truncation = &metadata
 		}
 
-		obs, err = s.UpdateObservationForProject(id, expected, update)
+		obs, err := s.UpdateObservationForProject(id, expected, update)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to update memory: " + err.Error()), nil
 		}
@@ -1789,7 +1763,8 @@ func handleUpdate(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 			extra["truncation"] = *truncation
 		}
 
-		return respondWithProject(detRes, msg, extra), nil
+		owner, _ := store.NormalizeProject(*obs.Project)
+		return respondWithProject(projectpkg.DetectionResult{Project: owner, Source: projectpkg.SourceExplicitOverride}, msg, extra), nil
 	}
 }
 
@@ -3715,13 +3690,16 @@ func resolveFallbackSessionID(s *store.Store, project string) (string, error) {
 		if err == nil {
 			switch len(ids) {
 			case 0:
-				return defaultSessionID(project), nil
+				return s.ResolveManualSession(project, currentWorkingDirectory())
 			case 1:
 				return ids[0], nil
 			default:
 				return "", fmt.Errorf("multiple active runtime sessions match the current project and directory; provide session_id, end other active matching sessions, or save independently with engram save. The resolved project is %q; pass that exact name as the --project value and never invent another. This writes to an independent project manual-save session and does not bind it to this MCP session", project)
 			}
 		}
+	}
+	if s != nil {
+		return s.ResolveManualSession(project, currentWorkingDirectory())
 	}
 	return defaultSessionID(project), nil
 }

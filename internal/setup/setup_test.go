@@ -816,7 +816,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	}
 	// Pi >= 0.99.0 ships built-in MCP and an installed pi-mcp-adapter replaces it,
 	// so setup must never install the adapter.
-	wantCommands := []string{"pi install npm:gentle-engram@0.3.0"}
+	wantCommands := []string{"pi install npm:gentle-engram@0.4.2"}
 	if !reflect.DeepEqual(commands, wantCommands) {
 		t.Fatalf("unexpected pi install commands: got %#v want %#v", commands, wantCommands)
 	}
@@ -831,7 +831,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if err := json.Unmarshal(settingsRaw, &settings); err != nil {
 		t.Fatalf("parse settings: %v", err)
 	}
-	if want := []string{"npm:gentle-engram@0.3.0"}; !reflect.DeepEqual(settings.Packages, want) {
+	if want := []string{"npm:gentle-engram@0.4.2"}; !reflect.DeepEqual(settings.Packages, want) {
 		t.Fatalf("expected fresh settings packages %#v without pi-mcp-adapter, got %#v", want, settings.Packages)
 	}
 
@@ -852,7 +852,7 @@ func TestInstallPiPreservesExistingEngramMCPServer(t *testing.T) {
 	if err := os.MkdirAll(agentDir, 0755); err != nil {
 		t.Fatalf("mkdir agent dir: %v", err)
 	}
-	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.12","npm:gentle-engram@0.1.14","npm:gentle-engram@0.2.0","npm:gentle-engram@0.1.11","npm:pi-mcp-adapter"]}`), 0644); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.12","npm:gentle-engram@0.1.14","npm:gentle-engram@0.2.0","npm:gentle-engram@0.3.0","npm:gentle-engram@0.4.0","npm:gentle-engram@0.1.11","npm:pi-mcp-adapter"]}`), 0644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
 	originalMCP := `{"mcpServers":{"engram":{"command":"custom-engram","args":["mcp"],"lifecycle":"eager"},"other":{"command":"other"}}}`
@@ -885,7 +885,7 @@ func TestInstallPiPreservesExistingEngramMCPServer(t *testing.T) {
 	if err := json.Unmarshal(settingsRaw, &settings); err != nil {
 		t.Fatalf("parse settings after install: %v", err)
 	}
-	wantPackages := []string{"npm:existing", "npm:pi-mcp-adapter", "npm:gentle-engram@0.3.0"}
+	wantPackages := []string{"npm:existing", "npm:pi-mcp-adapter", "npm:gentle-engram@0.4.2"}
 	if !reflect.DeepEqual(settings.Packages, wantPackages) {
 		t.Fatalf("expected settings packages to preserve unrelated entries and migrate legacy pins: got %#v want %#v", settings.Packages, wantPackages)
 	}
@@ -960,7 +960,7 @@ func TestWarnPiMCPConfigRejectsMalformedConfig(t *testing.T) {
 func TestEnsurePiPackageSettingsMigratesLegacyPackageIdempotently(t *testing.T) {
 	resetSetupSeams(t)
 	settingsPath := filepath.Join(t.TempDir(), "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.12","npm:gentle-engram@0.1.14","npm:gentle-engram@0.1.15","npm:gentle-engram@0.1.16","npm:gentle-engram@0.1.8","npm:pi-mcp-adapter"]}`), 0644); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.12","npm:gentle-engram@0.1.14","npm:gentle-engram@0.1.15","npm:gentle-engram@0.1.16","npm:gentle-engram@0.1.8","npm:gentle-engram@0.4.1","npm:pi-mcp-adapter"]}`), 0644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
 
@@ -982,7 +982,7 @@ func TestEnsurePiPackageSettingsMigratesLegacyPackageIdempotently(t *testing.T) 
 	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatalf("parse migrated settings: %v", err)
 	}
-	wantPackages := []string{"npm:existing", "npm:pi-mcp-adapter", "npm:gentle-engram@0.3.0"}
+	wantPackages := []string{"npm:existing", "npm:pi-mcp-adapter", "npm:gentle-engram@0.4.2"}
 	if !reflect.DeepEqual(settings.Packages, wantPackages) {
 		t.Fatalf("unexpected migrated packages: got %#v want %#v", settings.Packages, wantPackages)
 	}
@@ -999,7 +999,7 @@ func TestEnsurePiPackageSettingsMigratesLegacyPackageIdempotently(t *testing.T) 
 func TestEnsurePiPackageSettingsDoesNotAddMCPAdapter(t *testing.T) {
 	resetSetupSeams(t)
 	settingsPath := filepath.Join(t.TempDir(), "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.3.0"]}`), 0644); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.4.2"]}`), 0644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
 	original, err := os.ReadFile(settingsPath)
@@ -1029,7 +1029,7 @@ func TestInstallPiCommandFailure(t *testing.T) {
 		return []byte("boom"), errors.New("exit 1")
 	}
 	_, err := Install("pi")
-	if err == nil || !strings.Contains(err.Error(), "install npm:gentle-engram@0.3.0") {
+	if err == nil || !strings.Contains(err.Error(), "install npm:gentle-engram@0.4.2") {
 		t.Fatalf("expected pi install error, got %v", err)
 	}
 }
@@ -3961,7 +3961,10 @@ func TestClaudeCodeUserPromptHookWithoutJQFirstSaveThresholdIsExact(t *testing.T
 	const sessionID = "session-first-save-boundary"
 	fixedNow := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
 	bashEnvPath := filepath.Join(t.TempDir(), "fixed-date.sh")
-	bashEnv := fmt.Sprintf(`date() {
+	bashEnv := fmt.Sprintf(`if [ "${ENGRAM_TEST_STDERR_WARNING:-}" = "true" ]; then
+  printf 'bash.exe: warning: could not find /tmp, please create!\n' >&2
+fi
+date() {
 case "$*" in
   "+%%s") printf '%%d\n' %d ;;
   *"2024-12-31 23:45:01"*) printf '%%d\n' %d ;;
@@ -3981,12 +3984,15 @@ esac
 	}
 
 	for _, tt := range []struct {
-		name      string
-		startedAt string
-		wantNudge bool
+		name          string
+		startedAt     string
+		wantNudge     bool
+		stderrWarning bool
 	}{
 		{name: "899 seconds", startedAt: "2024-12-31 23:45:01", wantNudge: false},
 		{name: "900 seconds", startedAt: "2024-12-31 23:45:00", wantNudge: true},
+		{name: "899 seconds with stderr warning", startedAt: "2024-12-31 23:45:01", wantNudge: false, stderrWarning: true},
+		{name: "900 seconds with stderr warning", startedAt: "2024-12-31 23:45:00", wantNudge: true, stderrWarning: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4007,11 +4013,12 @@ esac
 				t.Fatalf("parse test server URL: %v", err)
 			}
 
-			env := withoutEnv(os.Environ(), "PATH", "TMPDIR", "BASH_ENV", "ENGRAM_PORT", "ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE", "ENGRAM_HOOK_MAX_TIME")
+			env := withoutEnv(os.Environ(), "PATH", "TMPDIR", "BASH_ENV", "ENGRAM_PORT", "ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE", "ENGRAM_HOOK_MAX_TIME", "ENGRAM_TEST_STDERR_WARNING")
 			env = append(env,
 				"PATH="+strings.Join(pathDirs, string(os.PathListSeparator)),
 				"TMPDIR="+t.TempDir(),
 				"BASH_ENV="+bashEnvPath,
+				"ENGRAM_TEST_STDERR_WARNING="+strconv.FormatBool(tt.stderrWarning),
 				"ENGRAM_PORT="+serverURL.Port(),
 				"ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE=0",
 				"ENGRAM_HOOK_MAX_TIME=1",
@@ -4021,14 +4028,22 @@ esac
 				cmd := exec.Command(bashPath, scriptPath)
 				cmd.Env = env
 				cmd.Stdin = strings.NewReader(`{"cwd":"/workspace","session_id":"` + sessionID + `"}`)
-				output, err := cmd.CombinedOutput()
-				if err != nil {
-					t.Fatalf("run user prompt hook without jq: %v\noutput: %s", err, output)
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout = &stdout
+				cmd.Stderr = &stderr
+				if err := cmd.Run(); err != nil {
+					t.Fatalf("run user prompt hook without jq: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
 				}
-				if !json.Valid(output) {
-					t.Fatalf("user prompt hook emitted invalid JSON %q", output)
+				if !json.Valid(stdout.Bytes()) {
+					t.Fatalf("user prompt hook emitted invalid JSON %q\nstderr: %s", stdout.String(), stderr.String())
 				}
-				return string(output)
+				if tt.stderrWarning && !strings.Contains(stderr.String(), "bash.exe: warning: could not find /tmp, please create!\n") {
+					t.Fatalf("controlled warning missing from stderr: %q", stderr.String())
+				}
+				if stderr.Len() > 0 {
+					t.Logf("user prompt hook stderr: %s", stderr.String())
+				}
+				return stdout.String()
 			}
 
 			runHook()
