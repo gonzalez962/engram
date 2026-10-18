@@ -392,6 +392,7 @@ for (const scenario of [
         const writes = calls.filter(({ method, path }) => method === "POST" && path === "/prompts");
         assert.deepEqual(writes.map(({ body }) => body), scenario.capture ? [{
           session_id: sessionId, content: prompt, project: "engram",
+          project_provenance: { source: "unknown", directory: ctx.cwd },
         }] : [], "only human-authored prompts may be persisted, exactly once");
       });
     } finally {
@@ -450,6 +451,29 @@ test("Pi native saves persist under separate host sessions and stop on failed re
       const append = (customType, data) => entries.push({ type: "custom", customType, data });
       const { registeredTools, eventHandlers } = await loadPluginHarness(sandbox, append);
       const save = registeredTools.get("mem_save");
+      const suggest = registeredTools.get("mem_suggest_topic_key");
+      for (const params of [
+        { type: "architecture", title: "Auth model" },
+        { type: "bugfix", title: "Fix café / Unicode" },
+        { type: "decision", content: "Use SQLite for local state" },
+        { title: "X".repeat(120) },
+      ]) {
+        const direct = await fetch(`${url}/topic-keys/suggest`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(params),
+        });
+        assert.equal(direct.status, 200);
+        const expected = await direct.json();
+        const result = await suggest.execute("real-suggest", params, undefined, undefined, runtimeContext("pi-host-alpha"));
+        assert.notEqual(result.isError, true, result.content?.[0]?.text);
+        assert.deepEqual(result.details.data, expected);
+        if (params.title === "Auth model") assert.equal(expected.topic_key, "architecture/auth-model");
+      }
+      const rejected = await suggest.execute("empty-suggest", {}, undefined, undefined, runtimeContext("pi-host-alpha"));
+      assert.equal(rejected.isError, true);
+      assert.equal(rejected.details.http_status, 400);
+      const beforeSaves = await fetch(`${url}/observations?all_projects=true&limit=20`);
+      assert.equal(beforeSaves.status, 200);
+      assert.deepEqual(await beforeSaves.json(), [], "suggestions and rejected input must not create observations");
       const ids = ["pi-host-alpha", "pi-host-beta"];
       for (const [index, host] of [ids[0], ids[1], ids[0], ids[1]].entries()) {
         const result = await save.execute(`real-${index}`, {
@@ -1114,7 +1138,7 @@ test("registered Pi-native mem_context forwards optional bounds and compact mode
   }
 });
 
-test("Pi doctor forwards its resolved project while preserving global review and stats contracts", async () => {
+test("Pi doctor forwards its resolved project while preserving global review contracts", async () => {
   const originalFetch = globalThis.fetch;
   const originalUrl = process.env.ENGRAM_URL;
   process.env.ENGRAM_URL = "http://127.0.0.1:17437";
@@ -1126,7 +1150,6 @@ test("Pi doctor forwards its resolved project while preserving global review and
     { method: "GET", path: "/review", body: { observations: [] } },
     { method: "GET", path: "/review", body: { observations: [] } },
     { method: "POST", path: "/review/mark_reviewed", body: { state: "active" } },
-    { method: "GET", path: "/stats", body: { total_observations: 2 } },
   ]);
   globalThis.fetch = fetchStub;
 
@@ -1143,13 +1166,11 @@ test("Pi doctor forwards its resolved project while preserving global review and
       await registeredTools.get("mem_review").execute("review", { action: "list" }, undefined, undefined, ctx);
       await registeredTools.get("mem_review").execute("review-filtered", { action: "list", project: "override-project" }, undefined, undefined, ctx);
       await registeredTools.get("mem_review").execute("mark-reviewed", { action: "mark_reviewed", observation_id: 42 }, undefined, undefined, ctx);
-      await registeredTools.get("mem_stats").execute("stats", {}, undefined, undefined, ctx);
 
       const search = calls.find((call) => call.path.startsWith("/search"));
       const doctor = calls.find((call) => call.path.startsWith("/doctor"));
       const reviews = calls.filter((call) => call.method === "GET" && call.path.startsWith("/review"));
       const markReviewed = calls.find((call) => call.method === "POST" && call.path.startsWith("/review/mark_reviewed"));
-      const stats = calls.find((call) => call.path.startsWith("/stats"));
       assert.match(search.path, /project=override-project/);
       assert.match(doctor.path, /project=override-project/);
       assert.equal(reviews.length, 2);
@@ -1160,7 +1181,6 @@ test("Pi doctor forwards its resolved project while preserving global review and
       assert.equal(filteredReviewQuery.get("project"), "override-project");
       assert.equal(filteredReviewQuery.has("all_projects"), false);
       assert.equal(new URL(`http://test${markReviewed.path}`).searchParams.get("project"), "override-project");
-      assert.equal(new URL(`http://test${stats.path}`).searchParams.get("all_projects"), "true");
     });
   } finally {
     globalThis.fetch = originalFetch;
@@ -1565,7 +1585,7 @@ test("an opaque runtime session ID stays byte-identical through registration, co
       assert.equal(compactionSummary.session_id, runtimeSessionId, "compaction must attribute the summary to the exact identity");
 
       await eventHandlers.get("session_shutdown")({}, ctx);
-      assert.deepEqual(sessionEndBodies, [{ summary: "" }], "shutdown must end the exact registered runtime session");
+      assert.deepEqual(sessionEndBodies, [{ summary: "", project_provenance: { source: "dir_basename", directory: ctx.cwd } }], "shutdown must end the exact registered runtime session");
       assert.deepEqual(sessionEndMethods, ["POST"], "shutdown must use the session-end POST contract");
       await eventHandlers.get("session_shutdown")({}, ctx);
       assert.equal(sessionEndBodies.length, 1, "repeated shutdown must not end an already discarded session twice");
@@ -1932,6 +1952,78 @@ test("root resume compatibility negotiates support and fails closed", async () =
       }
     }
   } finally {
+    globalThis.fetch = originalFetch;
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL;
+    else process.env.ENGRAM_URL = originalUrl;
+  }
+});
+
+test("retired sandbox self-heal cannot consume lost-ack capability evidence", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  let retiredClock;
+  try {
+    const refuse = async (url) => {
+      if (new URL(url).pathname === "/project/current") return new Response('{"project":"retry-project"}');
+      throw new Error("connection refused");
+    };
+    globalThis.fetch = refuse;
+    await withPluginSandbox("engram-pi-retired-heal-", async ({ sandbox, clock }) => {
+      retiredClock = clock;
+      const { registeredTools } = await loadPluginHarness(sandbox);
+      const refused = await registeredTools.get("mem_search").execute("refused", { query: "outage", project: "retry-project" }, undefined, undefined, runtimeContext("retired"));
+      assert.equal(refused.isError, true);
+      assert.equal(clock.pending(), 1, JSON.stringify(refused));
+      let liveHealth = 0;
+      globalThis.fetch = async (url) => {
+        assert.equal(new URL(url).pathname, "/health", "live heal must only probe health");
+        liveHealth++;
+        return new Response('{}');
+      };
+      await clock.advance();
+      assert.equal(liveHealth, 1, "a live sandbox retains ordinary self-heal policy");
+      assert.equal(clock.pending(), 0);
+      globalThis.fetch = refuse;
+      const again = await registeredTools.get("mem_search").execute("refused-again", { query: "outage", project: "retry-project" }, undefined, undefined, runtimeContext("retired"));
+      assert.equal(again.isError, true);
+      assert.equal(clock.pending(), 1, "retirement must cancel a newly scheduled heal");
+    }, { controlledDelay: 5000 });
+
+    let healthChecks = 0;
+    const posts = [];
+    const writes = [];
+    const entries = [];
+    globalThis.fetch = async (url, init = {}) => {
+      const path = new URL(url).pathname;
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      if (path === "/health") return new Response(JSON.stringify({ capabilities: { root_session_resume: healthChecks++ !== 0 } }));
+      if (path === "/project/current") return new Response('{"project":"retry-project"}');
+      if (path === "/sessions") {
+        posts.push(body);
+        return new Response(posts.length === 1 ? "truncated acknowledgement" : JSON.stringify({ id: body.id, status: "created" }));
+      }
+      if (path === "/observations") {
+        writes.push(body);
+        return new Response('{"id":1,"status":"saved"}');
+      }
+      return new Response('{}');
+    };
+    await withPluginSandbox("engram-pi-after-heal-", async ({ sandbox }) => {
+      const { registeredTools } = await loadPluginHarness(sandbox, (customType, data) => entries.push({ type: "custom", customType, data }));
+      await retiredClock.advance();
+      const ctx = runtimeContext("retry-compat");
+      ctx.sessionManager.getBranch = () => entries;
+      const result = await registeredTools.get("mem_save").execute("lost-ack", { title: "retry", content: "retry" }, undefined, undefined, ctx);
+      assert.equal(result.isError, true, JSON.stringify({ healthChecks, result }));
+      assert.match(JSON.stringify(result), /resume support changed.*retry/i);
+      assert.deepEqual(posts.map(({ resume }) => resume), [false]);
+      assert.equal(writes.length, 0);
+      assert.equal(entries.length, 0, "lost acknowledgement must not adopt an identity");
+      assert.equal(healthChecks, 2, "retired heal must not consume the new stub's health evidence");
+    });
+  } finally {
+    retiredClock?.dispose();
     globalThis.fetch = originalFetch;
     if (originalUrl === undefined) delete process.env.ENGRAM_URL;
     else process.env.ENGRAM_URL = originalUrl;
@@ -3550,7 +3642,7 @@ test("Pi session shutdown serializes end delivery and waits for registration", a
       endGate.resolve();
       const [, explicitEndResult] = await Promise.all([firstShutdown, explicitEnd, secondShutdown]);
       assert.equal(explicitEndResult.isError, undefined, "an explicit end must join shutdown delivery");
-      assert.deepEqual(endCalls, [{ method: "POST", body: { summary: "" } }], "concurrent shutdown and explicit end must send one POST");
+      assert.deepEqual(endCalls, [{ method: "POST", body: { summary: "", project_provenance: { source: "unknown", directory: ctx.cwd } } }], "concurrent shutdown and explicit end must send one POST");
 
       await eventHandlers.get("session_start")({}, runtimeContext(undefined));
       await eventHandlers.get("session_shutdown")({}, runtimeContext(undefined));
@@ -3584,7 +3676,7 @@ test("Pi session shutdown serializes end delivery and waits for registration", a
       const shutdown = eventHandlers.get("session_shutdown")({}, ctx);
       registrationGate.resolve();
       await Promise.all([write, shutdown]);
-      assert.deepEqual(raceEndCalls, [{ method: "POST", body: { summary: "" } }], "shutdown must end a registration that was already in flight");
+      assert.deepEqual(raceEndCalls, [{ method: "POST", body: { summary: "", project_provenance: { source: "unknown", directory: ctx.cwd } } }], "shutdown must end a registration that was already in flight");
     });
 
     const uncertainRegistration = deferred();

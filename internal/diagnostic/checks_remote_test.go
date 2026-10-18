@@ -78,8 +78,8 @@ func TestSyncTargetClosedSpaceCheckSeparatesLiveAndOrphanedRemoteState(t *testin
 		t.Fatalf("orphan finding = %+v (ok=%v), want a warning with reason %q", orphanFinding, ok, ReasonOrphanedRemoteSyncState)
 	}
 	foreign, ok := findings["satellite:inert"]
-	if !ok || foreign.ReasonCode != ReasonForeignSyncTarget || foreign.Severity != SeverityError {
-		t.Fatalf("other foreign targets keep their error finding: %+v", result.Findings)
+	if !ok || foreign.ReasonCode != ReasonForeignSyncTarget || foreign.Severity != SeverityWarning {
+		t.Fatalf("other inert foreign targets keep their warning finding: %+v", result.Findings)
 	}
 	if len(findings) != 2 {
 		t.Fatalf("findings = %+v, want only the orphan and the foreign target", result.Findings)

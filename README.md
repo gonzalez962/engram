@@ -21,6 +21,7 @@
 <a href="https://engram.gentlemanprogramming.com/"><strong>Website</strong></a> &bull;
 <a href="#get-started"><strong>Quickstart</strong></a> &bull;
 <a href="DOCS.md"><strong>Docs</strong></a> &bull;
+<a href="docs/RELEASE-STAGING.md"><strong>Candidate staging</strong></a> &bull;
 <a href="https://gentle-ai.gentlemanprogramming.com/"><strong>Gentle-AI</strong></a> &bull;
 <a href="https://gentle-ai-wiki.gentlemanprogramming.com/"><strong>Wiki</strong></a>
 </p>
@@ -161,8 +162,8 @@ Navigate with `j`/`k`, use `Enter` to drill in, `c` to copy content to the clipb
 
 | Component | What it does |
 | :--- | :--- |
-| **[MCP tools](DOCS.md#mcp-tools-23-tools)** | Save, search, timeline, session, review, and diagnosis tools for your agent |
-| **[HTTP API](DOCS.md#http-api-endpoints)** | The same memory over local HTTP endpoints |
+| **[MCP tools](DOCS.md#mcp-tools-26-tools)** | Save, search, timeline, session, review, and diagnosis tools for your agent |
+| **[HTTP API](DOCS.md#http-api-endpoints)** | The same memory over local HTTP endpoints; [compound agent workflows](docs/HTTP-AGENT-WORKFLOWS.md) |
 | **[Doctor](docs/DOCTOR.md)** | `engram doctor` — read-only operational diagnostics |
 | **[Conflict surfacing](docs/AGENT-SETUP.md#conflict-surfacing-automatic)** | Flags related or conflicting memories so the agent can judge them |
 | **[Plugins](docs/PLUGINS.md)** | OpenCode and Claude Code plugin details |
@@ -320,9 +321,10 @@ Tool availability can vary by MCP profile. Start with the intent, then use your 
 | Find prior knowledge without repeating work | `mem_search` |
 | Inspect a result in enough detail | `mem_timeline`, `mem_get_observation` |
 | Save or refine durable knowledge | `mem_save`, `mem_update`, `mem_suggest_topic_key` |
+| Consolidate observations after preview and explicit confirmation | `mem_consolidate` (Go MCP server; [contract](docs/codebase/OBSERVATION-CONSOLIDATION.md#mcp-contract)) |
 | Preserve the user's request | `mem_save_prompt` |
-| Hand off or close a session | `mem_session_summary`, `mem_session_start`, `mem_session_end` |
-| Review stale knowledge or memory relationships | `mem_review`, `mem_judge`, `mem_compare` |
+| Hand off or close a session | `mem_session_summary`, `mem_session_start`, `mem_session_end`; MCP atomic close: `mem_session_finalize` |
+| Review stale knowledge or memory relationships | `mem_review`, `mem_judge`, `mem_compare`; MCP batch: `mem_judge_many` |
 | Diagnose project or store state | `mem_doctor` |
 
 For parameters and the complete, current tool reference, see [the full documentation](DOCS.md).

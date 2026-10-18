@@ -7,7 +7,7 @@ Thanks for contributing. Engram enforces a strict **issue-first workflow** — e
 ## Contribution Workflow
 
 ```
-Open Issue → Get status:approved → Open PR → Add type:* label → Review & Merge
+Search canonical issue → Investigate proportionally → Approve → Implement → Review & Merge
 ```
 
 ### Step 1: Open an Issue
@@ -21,15 +21,23 @@ Use the correct template:
 > ⚠️ Blank issues are disabled. You must use a template.
 > General questions and support belong in [Discussions](https://github.com/Gentleman-Programming/engram/discussions).
 
-Fill in all required fields. Your issue will automatically receive the `status:needs-review` label.
+Search existing issues for a canonical tracker before opening a new one. Fill in all required fields; report symptoms, impact, release context, and logs without having to diagnose the root cause. Your issue receives `status:needs-review`.
 
-If useful for alignment, search existing issues before opening a new one.
+### Step 2: Investigation and Proportional Approval
 
-### Step 2: Wait for Approval
+A maintainer triages the report and assigns a real investigator/owner. Keep evidence on the canonical issue; cluster duplicates only when their root cause and affected contract match, not just their symptoms. Move useful occurrence evidence there before duplicate closure.
 
-A maintainer will review the issue and replace `status:needs-review` with `status:approved` if it's accepted for implementation.
+Use the smallest evidence set that establishes correctness:
 
-**Do not open a PR until the issue is approved.** Automated checks will block PRs that reference unapproved issues.
+| Change | Evidence before approval |
+|--------|--------------------------|
+| Trivial change | Clear scope and an applicable check |
+| Bug | Reproduction against exact current remote `main` SHA, first violated repository-owned invariant (root cause), and a regression test plan |
+| High-risk change (data, security, or shared contracts) | Applicable bug evidence, approved design, non-goals, and an independent review plan |
+
+A short explanation in the issue is sufficient; no separate design document is required by default. Maintainers assess the reasoning, not CI. Replace the current `status:*` label with `status:approved` only after accepting the evidence appropriate to the change. For behavior changes, verify the regression tests before merge; for high-risk changes, complete independent review before merge.
+
+**New work requires an approved issue and a real assignee before implementation.** Any issue assignee satisfies ownership; the PR author need not match. CI checks approval and assignment, not the quality of prose, and cannot prevent opening a noncompliant PR.
 
 ### Step 3: Open a Pull Request
 
@@ -47,7 +55,7 @@ The active required contexts run automatically on every PR and merge queue group
 | Check | What it verifies |
 |-------|-----------------|
 | **Check Issue Reference** | PR body contains `Closes #N`, `Fixes #N`, or `Resolves #N` |
-| **Check Issue Has status:approved** | The linked issue has the `status:approved` label |
+| **Check Issue Has status:approved** | Every linked issue has `status:approved` and at least one assignee |
 | **Check PR Has type:* Label** | PR labels use the canonical vocabulary and cardinality |
 | **Unit Tests** | `go test ./...` — all tests except those tagged with `//go:build e2e`; runs `make deadcode-check` to reject newly unreachable functions |
 | **E2E Tests** | `go test -tags e2e ./internal/server/...` — end-to-end integration tests |
@@ -57,14 +65,67 @@ PR Validation runs on PR opening, edits, label addition/removal, synchronization
 and reopening. Reopening requests a fresh **Check Issue Reference** and
 **Check Issue Has status:approved** evaluation under the existing rules.
 Changes to labels on a linked issue do not themselves trigger PR Validation;
-the approval check fetches issue labels when the workflow runs. PR label events
+the approval check fetches current issue labels and assignees when the workflow runs. PR label events
 and linked-issue label events are distinct.
 
-All required checks must pass before a PR can be merged.
+**Issue-refresh bootstrap (not yet live proof):** the candidate **Issue Validation
+Refresh** workflow adds trusted metadata-only publication for approval-label
+addition/removal and the same PR events via `pull_request_target`, not merge-group
+events. Native PR Validation merge-group jobs and their resolver remain unchanged
+and must remain intact even in later PR-writer retirement. It becomes
+available only after integration on the trusted branch; do not assume this
+introducing PR can run it. Original PR Validation and its issue jobs remain
+unchanged until live provider/required-gate compatibility is observed.
+See the [rollout and trusted manual recovery guide](docs/ci-issue-refresh-rollout.md)
+before relying on refresh or retiring legacy writers. The publisher uses only
+`checks: write`, PR/issues read access and contents read access for trusted helpers;
+it never executes PR-head code or changes approvals, settings or required gates.
+Its issue/default and PR-target/base triggers establish trusted provenance;
+`workflow_sha` alone is not a universal trust marker.
+Refresh is eventual, not atomic: scheduling/API delays, metadata changes after
+reads, concurrent or late legacy writes and already evaluated merge groups leave
+consistency windows. Existing visible checks may remain after an error. Recover
+by rerunning an eligible **Issue Validation Refresh** metadata-only run, not
+original PR Validation or broad CI; verify current-head results afterwards.
+
+**Approved native-gating amendment:** #1802 now permits `actions: write` only
+on the selective issue-label router job, never globally. Native metadata
+jobs remain read-only. #1834 / PR #1838 integrated the native jobs and head-bound
+adapter; PR #1843 integrated the inactive guarded rerun helper on trusted main.
+PR #1850 integrated #1844's inactive dispatcher on verified main at `f14fc4f3`.
+The #1835 branch candidate adds approval-label issue routing, not yet available
+on trusted main. Its dispatcher prerequisite is integrated; workflow delivery
+and activation remain separate from local preparation. Repository Actions
+capability is constrained by trusted code, not workflow-granular permissions.
+Missing native-run PR association or token capability blocks refresh explicitly.
+Partial target failures can leave earlier reruns requested; this is not atomic
+reconciliation. Local tests are not live required-gate proof. Legacy writers,
+the queue, six contexts and App15368 remain intact. #1802 stays open and #1810
+retirement stays blocked: fresh T4 probe consent and live evidence are required
+before rollout claims or retirement. See the
+[native-policy scope and rollout boundary](docs/ci-issue-native-policy.md).
+
+Closing references also support `Closes OWNER/REPO#N`, `Fixes OWNER/REPO#N`
+and `Resolves OWNER/REPO#N` for the current repository or
+`Gentleman-Programming/engram` (repository identity is case-insensitive).
+Every recognized reference must be approved and assigned in its own repository;
+a recognized reference to another repository rejects both issue checks before
+any issue lookup for that PR, even when mixed with trusted or bare references.
+Unsupported syntax remains ignored. Validation supports qualified references,
+but automatic issue-label refresh discovery remains bare-only (`#N`) in the
+current repository; qualified-only links do not expand discovery or rerun routing.
+
+All required checks must pass before a PR can be merged. Issue API errors fail closed.
+
+### Existing PR Transition
+
+The original #1293 audit found 23 open PRs needing migration; that is a historical snapshot, not a permanent count. Activation does not wait for the whole backlog to be remediated. Review existing PRs when they become active again or before merge: confirm proportional evidence, replace outdated approval where needed, and assign a real owner. Close obsolete work through normal maintainer review. Do not assign a placeholder solely to turn CI green.
+
+**Every PR, including existing PRs, must comply before merge.** There is no date cutoff, silent grandfathering, or automatic assignment. Re-run native PR validation after issue approval/assignment changes before merging; an old green check is not current readiness evidence.
 
 > **Repo admin note:** The active `main` ruleset requires exactly these six contexts: `E2E Tests`, `Unit Tests`, `Plugin Tests`, `Check Issue Has status:approved`, `Check Issue Reference`, and `Check PR Has type:* Label`.
 
-Non-required PR checks include the Claude plugin version guard, lint, Windows setup and wrapper coverage, transient-artifact validation, **Policy Helper Tests** (the merge-queue, label-policy, transient-artifacts, and PR-size-notice script suites), and **Obsidian Build** (tests, typecheck, and build after dependency installation). Policy Helper Tests, Obsidian Build, and the Claude plugin version guard also run on merge groups; lint, Windows checks, and transient-artifact validation do not run as merge-group CI jobs. None of these are active `main` required contexts; a maintainer must explicitly add the Claude plugin version guard to the ruleset before it becomes required.
+Non-required PR checks include the Claude plugin version guard, lint, Windows setup and wrapper coverage, transient-artifact validation, **Policy Helper Tests** (the unchanged merge-queue, label-policy, transient-artifacts and PR-size-notice command, plus a separate step discovering available `.github/scripts/issue-*.test.mjs` regressions), and **Obsidian Build** (tests, typecheck, and build after dependency installation). Policy Helper Tests, Obsidian Build, and the Claude plugin version guard also run on merge groups; lint, Windows checks, and transient-artifact validation do not run as merge-group CI jobs. None of these are active `main` required contexts; a maintainer must explicitly add the Claude plugin version guard to the ruleset before it becomes required.
 
 ### Merge Queue Activation (administrators)
 
@@ -304,7 +365,7 @@ with `HEAD~`.
 | Label | Meaning |
 |-------|---------|
 | `status:needs-review` | Awaiting maintainer review (auto-applied to new issues) |
-| `status:approved` | Approved for implementation — PRs can now be opened |
+| `status:approved` | Maintainer accepted proportional evidence; bugs include current-main reproduction and root cause |
 | `status:in-progress` | Actively being worked on — auto-exempt from stale bot |
 | `status:blocked` | Blocked by another issue or external dependency |
 | `status:stale` | No activity for 30 days — auto-applied by stale bot |
@@ -416,6 +477,29 @@ The command is a dry run: it prints the canonical label list as JSON and never w
 - Do not reference endpoints/scripts that do not exist in code
 - Do not include `Co-Authored-By` trailers in commits
 - Do not include paths prohibited by the [Transient Artifact Policy](#transient-artifact-policy)
+
+### Focused Verification Map
+
+Use the row that matches the change, not every row. These are existing entry points,
+not a new required local gate. Run commands from the listed directory; paths are
+relative to the repository root.
+
+| Changed area | Working directory | Prerequisites | Existing commands | What they verify |
+|--------------|-------------------|---------------|-------------------|------------------|
+| Go behavior | Repository root | Go version from [go.mod](go.mod) and module dependencies | `go test ./internal/setup -run '^TestStaleMCPCommands$' -count=1`, then `go test ./internal/setup -count=1` | Example focused regression and affected-package suite. Substitute the actual changed package and regression; this is not the full module suite. |
+| Pi plugin | `plugin/pi` | Node.js 24, npm, and Go from [go.mod](go.mod) for Go-backed fixtures; no npm install step | `npm test` | Pi plugin suite from a Go checkout, including fixture-based workflows; not the full installed-host lifecycle. See [scripts](plugin/pi/package.json) and [real HTTP test prerequisites](plugin/pi/README.md#testing-the-real-http-workflows). |
+| Obsidian plugin | `plugin/obsidian` | Node.js 24, npm, and dependencies installed with `npm ci` under the existing [dependency policy](#npm-dependency-hygiene) | `npm test`, `npm run typecheck`, `npm run build` | Plugin tests, TypeScript checking, and bundle generation; not an interactive Obsidian smoke test. See [scripts](plugin/obsidian/package.json). |
+| PR policy helpers | Repository root | Node.js 24; no npm install step | `node --test .github/scripts/merge-queue.test.mjs .github/scripts/label-policy.test.mjs .github/scripts/transient-artifacts.test.mjs .github/scripts/pr-size-notice.test.mjs` | Merge-queue, label, artifact and PR-size helper logic; not live GitHub permissions or event delivery. |
+| Issue policy helpers | Repository root | Node.js 24; no npm install step | `node --test .github/scripts/issue-*.test.mjs` | Issue-policy helper suites; not live approval-refresh behavior. |
+
+The [CI workflow](.github/workflows/ci.yml) is authoritative for hosted commands,
+setup steps and platform coverage; the [Makefile](Makefile) defines the existing
+lint and quality-ratchet targets. This map does not replace either definition.
+Record which commands actually ran and their results; distinguish structural
+command checks from execution. A green local subset is **not** a full CI or release
+verdict. Hosted full-unit, E2E, plugin and applicable platform results remain
+pending until GitHub runs them. Documentation-only changes can use proportional
+link/command-definition checks without executing unrelated suites.
 
 ### Conventional Commit Format
 

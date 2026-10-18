@@ -44,6 +44,26 @@ function extractClassDefinition(name) {
   throw new Error(`${name} class body not found`);
 }
 
+// Shared mode (ENGRAM_SERVER_MODE unset), evaluated with the production helpers.
+// The session-owned branches are unreachable here; startup-lifecycle covers them.
+function sharedModeTransportSource() {
+  return `
+    const SERVER_MODE = undefined;
+    const SESSION_OWNED = false;
+    const CONFIGURED_HTTP_TOKEN = "";
+    const ownedToken = "";
+    function transportHeaders(json = false) {
+      ${extractFunctionBody("transportHeaders", "{\n  if (SERVER_MODE")}
+    }
+    function ownedModeConfiguration() {
+      ${extractFunctionBody("ownedModeConfiguration", "{\n  if (SERVER_MODE")}
+    }
+    async function startOwnedTransport() {
+      throw new Error("shared-mode fixture must not start an owned transport");
+    }
+  `;
+}
+
 function buildOptionalEnvironmentValueForTest() {
   const body = extractFunctionBody("optionalEnvironmentValue", "{\n  return");
   return new Function(`
@@ -140,6 +160,7 @@ function buildEngramFetchForTest({
       }
     }
     ${extractClassDefinition("EngramUnavailableError")}
+    ${sharedModeTransportSource()}
     function isTimeoutError(error) {
       ${extractFunctionBody("isTimeoutError", "{\n  return error instanceof Error")}
     }
@@ -254,6 +275,7 @@ function buildInitializeEngramServerForTest({
     const localEngramVersion = () => "unknown";
     const missingInstanceIdentityMessage = () => "missing identity";
     const localInstanceID = resolveInstanceID;
+    ${sharedModeTransportSource()}
     async function initializeEngramServer() {
       ${body}
     }
@@ -350,6 +372,7 @@ function buildProbeEngramHealthForTest({ fetch, isTimeoutError }) {
     "AbortSignal",
     `
     let engramServerVersion = "unknown";
+    ${sharedModeTransportSource()}
     function hasConnectionRefusedCode(value, depth = 0) {
       ${refusedBody}
     }
@@ -499,7 +522,12 @@ function buildEnsureSessionForTest(engramFetch) {
   const body = extractFunctionBody("ensureSession", "{\n  const key")
     .replace("const body: SessionBody", "const body")
     .replace("let acknowledgement: unknown;", "let acknowledgement;");
+  const provenanceBody = extractFunctionBody("captureProjectProvenance", "{\n  return {");
   const factory = new Function("knownSessions", "registeredSessionProjects", "sessionRegistrationsInFlight", "sessionRegistrationProjects", "sessionProjectConflict", "sessionProjectConflictFromResponse", "engramFetch", "project", "directory", `
+    let detectedProjectEvidence;
+    function captureProjectProvenance(cwd, target, detected = detectedProjectEvidence) {
+      ${provenanceBody}
+    }
     return async function ensureSession(sessionId, sessionProject = project, fetch = engramFetch, renew = false) {
       ${body}
     };
@@ -520,11 +548,12 @@ function buildEnsureSessionForTest(engramFetch) {
 
 function buildProjectDetectionBoundaryForTest() {
   const safeProjectBody = extractFunctionBody("isSafeDetectedProject", "{\n  const candidate");
-  const applyBody = extractFunctionBody("applyDetectedProject", "{\n  if (!detected)");
+  const applyBody = extractFunctionBody("applyDetectedProject", "{\n  detectedProjectEvidence = detected;");
   const messageBody = extractFunctionBody("projectResolutionMessage", "{\n  const choices");
   const requireBody = extractFunctionBody("requireResolvedProject", "{\n  if (projectResolutionError)");
   const factory = new Function(`
     let project = "fallback-project";
+    let detectedProjectEvidence;
     let projectResolutionError;
     let projectDetectionPending = false;
     function isSafeDetectedProject(detected) {
@@ -665,6 +694,41 @@ test("memory protocol declares gentle-engram as the Pi-native provider", () => {
   assert.match(source, /These instructions are injected by gentle-engram, the Pi-native memory provider/);
   assert.match(source, /Use the memory tools named in this section as the authoritative Pi memory contract/);
   assert.match(source, /Do not infer alternative Engram tool names from other integrations/);
+});
+
+test("memory protocol enforces the canonical topic workflow", () => {
+  const workflowStart = source.indexOf("### CANONICAL TOPIC WORKFLOW");
+  assert.notEqual(workflowStart, -1, "canonical topic workflow section missing");
+  const nextHeading = source.indexOf("\n### ", workflowStart + 1);
+  const workflow = source.slice(workflowStart, nextHeading);
+
+  assert.match(workflow, /SEARCH first[\s\S]*mem_search/);
+  assert.match(workflow, /READ in full[\s\S]*mem_get_observation/);
+  assert.match(workflow, /search snippets are not enough/);
+  assert.match(workflow, /SAME bounded topic[\s\S]*mem_update[\s\S]*by ID/);
+  assert.match(workflow, /preserve every still-valid fact/);
+  assert.match(workflow, /Record superseded facts as history/);
+  assert.match(workflow, /Genuinely new topic[\s\S]*mem_save/);
+  assert.match(workflow, /If the learning is already covered, write nothing/);
+  assert.match(workflow, /Ambiguous identity or failed lookup[\s\S]*Do not blindly overwrite/);
+  assert.match(workflow, /A failed read is not evidence of absence/);
+  assert.match(workflow, /Never merge across projects or scopes/);
+  assert.match(workflow, /hint, not proof of identity/);
+
+  assert.doesNotMatch(workflow, /Call `mem_save` IMMEDIATELY/);
+  assert.match(source, /Bug fix completed[\s\S]*Architecture or design decision made[\s\S]*User preference or constraint learned/);
+  assert.match(source, /Format for \\`mem_update\\`:/);
+  assert.match(source, /expected_project[\s\S]*project that owns the observation/);
+  assert.match(source, /full rewritten content including every still-valid fact/);
+});
+
+test("memory tool descriptions carry the canonical workflow guidance", () => {
+  assert.match(source, /mem_search: Type\.Object\(\{[\s\S]*Search existing memories before saving; snippets are not enough to decide identity/);
+  assert.match(source, /mem_get_observation: Type\.Object\(\{[\s\S]*Read in full before deciding identity or updating/);
+  assert.match(source, /mem_save: Type\.Object\(\{[\s\S]*New topics only: search and read first; use mem_update for an existing topic/);
+  assert.match(source, /mem_update: Type\.Object\(\{[\s\S]*Update an existing observation by ID; preserve still-valid facts and keep its topic_key/);
+  assert.match(source, /mem_save: Type\.Object\(\{[\s\S]*Stable, deliberate topic key; reuse via mem_update rather than duplicating/);
+  assert.match(source, /mem_update: Type\.Object\(\{[\s\S]*Keep the existing topic_key unless the topic itself changed/);
 });
 
 test("an inconclusive health probe still attempts the spawn", async () => {
@@ -1541,7 +1605,8 @@ test("Pi cancellation aborts a held native HTTP request before it can return a l
 
   try {
     const pending = engramFetch("/held", { signal: controller.signal });
-    await requestStarted;
+    // A request that fails before dispatch must fail this test, not hang the file.
+    await Promise.race([requestStarted, pending]);
     controller.abort();
     await assert.rejects(pending, (error) => error?.name === "AbortError");
     await requestAborted;
@@ -2291,4 +2356,28 @@ test("background diagnostics remain safe when formatting or delivery fails", () 
   assert.doesNotThrow(() => warn("/prompts", { toString() { throw new Error("format failed"); } }));
   assert.doesNotThrow(() => warn("/prompts", "failure", { hasUI: true, ui: {} }));
   assert.equal(stderr.length, 0);
+});
+
+test("concurrent owned startups share one in-flight start so no child is orphaned", async () => {
+  const body = extractFunctionBody("startOwnedTransport", "{\n  ownedStart");
+  let starts = 0;
+  let release;
+  const startOwnedTransport = new Function("startOwnedTransportOnce", `
+    let ownedStart;
+    return function startOwnedTransport() {
+      ${body}
+    };
+  `)(() => {
+    starts += 1;
+    return new Promise((resolve) => { release = resolve; });
+  });
+  const first = startOwnedTransport();
+  const second = startOwnedTransport();
+  assert.equal(starts, 1, "a second caller during startup must not spawn another child");
+  release();
+  await Promise.all([first, second]);
+  const restart = startOwnedTransport();
+  assert.equal(starts, 2, "a finished start does not block a later restart");
+  release();
+  await restart;
 });

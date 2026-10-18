@@ -15,7 +15,7 @@
     "pi-engram": "cli.js"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test --test-concurrency=1 test/*.test.mjs"
   },
   "keywords": [
     "pi-package",
@@ -34,7 +34,8 @@
     "extension"
   ],
   "engram": {
-    "startupPolicy": 1
+    "startupPolicy": 1,
+    "sessionOwned": 1
   },
   "pi": {
     "image": "https://raw.githubusercontent.com/Gentleman-Programming/engram/main/plugin/pi/assets/engram-logo-only.png",
@@ -50,6 +51,8 @@
     "memory-tool-chrome.js",
     "mcp-template.json",
     "private-redaction.js",
+    "runtime-contract.js",
+    "runtime-contract.json",
     "test/",
     "README.md",
     "package.json"
