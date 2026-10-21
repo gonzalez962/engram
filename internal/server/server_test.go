@@ -17,14 +17,198 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	projectpkg "github.com/Gentleman-Programming/engram/v2/internal/project"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 	_ "modernc.org/sqlite"
 )
+
+func TestGenerationInvalidationRequestsOneShutdown(t *testing.T) {
+	for _, path := range []string{"/health", "/stats?all_projects=true"} {
+		t.Run(path, func(t *testing.T) {
+			st := newServerTestStore(t)
+			srv := New(st, 0)
+			notifier, ok := any(srv).(interface{ GenerationInvalidated() <-chan struct{} })
+			if !ok {
+				t.Fatal("server lacks generation shutdown notification")
+			}
+			oldObserved, oldStats := observedGenerationError, loadServerStats
+			t.Cleanup(func() { observedGenerationError, loadServerStats = oldObserved, oldStats })
+			observedGenerationError = func(*store.Store) error { return store.ErrDatabaseGenerationChanged }
+			loadServerStats = func(*store.Store) (*store.Stats, error) { return nil, store.ErrDatabaseGenerationChanged }
+			var requests sync.WaitGroup
+			for i := 0; i < 32; i++ {
+				requests.Add(1)
+				go func() {
+					defer requests.Done()
+					rec := httptest.NewRecorder()
+					srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+					want := "stats unavailable"
+					if path == "/health" {
+						want = "health check failed"
+					}
+					if rec.Code != 500 || !strings.Contains(rec.Body.String(), want) {
+						t.Errorf("response = %d: %s", rec.Code, rec.Body.String())
+					}
+				}()
+			}
+			requests.Wait()
+			select {
+			case <-notifier.GenerationInvalidated():
+			default:
+				t.Fatal("generation change did not notify owner")
+			}
+			select {
+			case <-notifier.GenerationInvalidated():
+				t.Fatal("duplicate notification")
+			default:
+			}
+		})
+	}
+}
+
+func TestTransientHealthFailureDoesNotRequestShutdown(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	notifier, ok := any(srv).(interface{ GenerationInvalidated() <-chan struct{} })
+	if !ok {
+		t.Fatal("server lacks generation shutdown notification")
+	}
+	old := loadServerStats
+	t.Cleanup(func() { loadServerStats = old })
+	loadServerStats = func(*store.Store) (*store.Stats, error) { return nil, errors.New("transient") }
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
+	if rec.Code != 500 || strings.Contains(rec.Body.String(), "transient") {
+		t.Fatalf("response: %d %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-notifier.GenerationInvalidated():
+		t.Fatal("transient failure notified shutdown")
+	default:
+	}
+	loadServerStats = old
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
+	if rec.Code != 200 {
+		t.Fatalf("recovery = %d", rec.Code)
+	}
+}
+
+func TestShutdownDrainsInflightRequestAndReleasesListener(t *testing.T) {
+	srv := New(nil, 0)
+	shutdown, ok := any(srv).(interface{ Shutdown(context.Context) error })
+	if !ok {
+		t.Fatal("server lacks graceful shutdown")
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	srv.mux.HandleFunc("/gate", func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		_, _ = w.Write([]byte("drained"))
+	})
+	bound := make(chan net.Listener, 1)
+	srv.listen = func(network, addr string) (net.Listener, error) {
+		ln, err := net.Listen(network, addr)
+		if err == nil {
+			bound <- ln
+		}
+		return ln, err
+	}
+	started := make(chan error, 1)
+	go func() { started <- srv.Start() }()
+	ln := <-bound
+	response := make(chan error, 1)
+	go func() {
+		res, err := http.Get("http://" + ln.Addr().String() + "/gate")
+		if err == nil {
+			defer func() { _ = res.Body.Close() }()
+			var b bytes.Buffer
+			_, err = b.ReadFrom(res.Body)
+			if b.String() != "drained" {
+				err = fmt.Errorf("body = %q", b.String())
+			}
+		}
+		response <- err
+	}()
+	<-entered
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	drained := make(chan error, 1)
+	go func() { drained <- shutdown.Shutdown(ctx) }()
+	// The serving loop ends when Shutdown closes the listener, before drain completes.
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-drained:
+		t.Fatalf("shutdown returned before release: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-response; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-drained; err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := net.Listen("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("listener not released: %v", err)
+	}
+	_ = rebound.Close()
+}
+
+func TestShutdownDrainsExpiryForcesClose(t *testing.T) {
+	srv := New(nil, 0)
+	entered, canceled := make(chan struct{}), make(chan struct{})
+	srv.mux.HandleFunc("/gate", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(entered)
+		<-r.Context().Done()
+		close(canceled)
+	})
+	bound := make(chan net.Listener, 1)
+	srv.listen = func(network, addr string) (net.Listener, error) {
+		ln, err := net.Listen(network, addr)
+		if err == nil {
+			bound <- ln
+		}
+		return ln, err
+	}
+	started := make(chan error, 1)
+	go func() { started <- srv.Start() }()
+	ln := <-bound
+	res, err := http.Get("http://" + ln.Addr().String() + "/gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	<-entered
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // deterministic expired drain budget, no wall-clock sleep
+	if err := srv.Shutdown(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown = %v", err)
+	}
+	<-canceled
+	var body bytes.Buffer
+	if _, err := body.ReadFrom(res.Body); err == nil {
+		t.Fatal("forced connection close did not interrupt response")
+	}
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := net.Listen("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("listener not released: %v", err)
+	}
+	_ = rebound.Close()
+}
 
 func TestCreateSessionResume(t *testing.T) {
 	st := newServerTestStore(t)
@@ -217,10 +401,17 @@ func TestHealthReportsVersion(t *testing.T) {
 			}
 
 			var response struct {
-				Version string `json:"version"`
+				Version      string          `json:"version"`
+				Capabilities map[string]bool `json:"capabilities"`
 			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 				t.Fatalf("decode /health response: %v", err)
+			}
+			if !response.Capabilities["runtime_session_resolution"] {
+				t.Fatal("/health must advertise runtime_session_resolution")
+			}
+			if !response.Capabilities["root_session_resume"] {
+				t.Fatal("/health must advertise root_session_resume")
 			}
 			if response.Version != tt.version {
 				t.Fatalf("/health version = %q, want %q", response.Version, tt.version)
@@ -720,32 +911,50 @@ func TestHandleCreateSessionStoresRuntimeWorktreeDirectory(t *testing.T) {
 	for _, tc := range []struct {
 		id        string
 		directory string
+		omit      bool
 	}{
 		{id: "nested-trailing", directory: nested + string(os.PathSeparator)},
 		{id: "nested-relative", directory: filepath.Join("nested", "child")},
-		{id: "omitted-directory"},
+		{id: "omitted-directory", omit: true},
+		{id: "empty-directory"},
+		{id: "whitespace-directory", directory: " \t\n "},
 	} {
-		t.Run(tc.id, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			body := fmt.Sprintf(`{"id":%q,"project":"engram"`, tc.id)
-			if tc.directory != "" {
-				body += fmt.Sprintf(`,"directory":%q`, tc.directory)
-			}
-			body += `}`
-			req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(body))
-			h.ServeHTTP(rec, req)
-			if rec.Code != http.StatusCreated {
-				t.Fatalf("create session = %d, want 201: %s", rec.Code, rec.Body.String())
-			}
+		for _, resume := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/resume=%t", tc.id, resume), func(t *testing.T) {
+				id := fmt.Sprintf("%s-%t", tc.id, resume)
+				rec := httptest.NewRecorder()
+				body := fmt.Sprintf(`{"id":%q,"project":"engram","resume":%t}`, id, resume)
+				if !tc.omit {
+					body = strings.TrimSuffix(body, "}") + fmt.Sprintf(`,"directory":%q}`, tc.directory)
+				}
+				req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(body))
+				h.ServeHTTP(rec, req)
+				if rec.Code != http.StatusCreated {
+					t.Fatalf("create session = %d, want 201: %s", rec.Code, rec.Body.String())
+				}
 
-			session, err := st.GetSession(tc.id)
-			if err != nil {
-				t.Fatalf("get session: %v", err)
-			}
-			if want := projectpkg.RuntimeWorktreeDirectory(root); session.Directory != want {
-				t.Fatalf("stored directory = %q, want worktree root %q", session.Directory, want)
-			}
-		})
+				session, err := st.GetSession(id)
+				if err != nil {
+					t.Fatalf("get session: %v", err)
+				}
+				// Ordinary registrations retain runtime cwd normalization, including blank input.
+				want := projectpkg.RuntimeWorktreeDirectory(root)
+				if session.Directory != want {
+					t.Errorf("stored directory = %q, want %q", session.Directory, want)
+				}
+				candidates, err := st.ActiveRuntimeSessions("engram", want)
+				if err != nil {
+					t.Fatalf("active runtime sessions: %v", err)
+				}
+				found := false
+				for _, candidate := range candidates {
+					found = found || candidate == id
+				}
+				if found != (want != "") {
+					t.Errorf("runtime candidate = %t, want %t (candidates: %v)", found, want != "", candidates)
+				}
+			})
+		}
 	}
 }
 

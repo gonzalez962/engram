@@ -7,9 +7,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/constants"
-	projectpkg "github.com/Gentleman-Programming/engram/v2/internal/project"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/constants"
+	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
 const (
@@ -207,7 +207,7 @@ func detectSessionDirectoryProject(scope Scope, cache map[string]DetectedProject
 	if _, err := os.Stat(directory); err != nil {
 		return DetectedProject{}, false
 	}
-	res := projectpkg.DetectProjectFull(directory)
+	res := projectpkg.DetectProjectFullWithOptions(directory, projectpkg.DetectionOptions{InspectOnly: true})
 	if res.Error != nil {
 		return DetectedProject{}, false
 	}
@@ -399,7 +399,7 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 			Message:              fmt.Sprintf("Observation source row %d is missing required fields: %s", observation.ID, strings.Join(observation.MissingFields, ", ")),
 			Why:                  "A corrupt local observation source can produce rejected cloud payloads even when no pending mutation remains to diagnose.",
 			Evidence:             mustJSON(observation),
-			SafeNextStep:         syncMutationRequiredFieldsRepairHint(scope.Project),
+			SafeNextStep:         observationSourceRepairHint(scope.Project, observation.MissingFields),
 			RequiresConfirmation: true,
 		})
 	}
@@ -485,6 +485,16 @@ func (c SyncMutationRequiredFieldsCheck) Run(ctx context.Context, scope Scope) (
 		})
 	}
 	return resultFromFindings(c.Code(), evidence, rollUp()), nil
+}
+
+func observationSourceRepairHint(project string, missingFields []string) string {
+	hint := syncMutationRequiredFieldsRepairHint(project)
+	for _, field := range missingFields {
+		if field == "type" || field == "content" {
+			return hint + " Repair cannot reconstruct missing type or content; manual investigation is required. Inspect source_unrepairable in the repair output."
+		}
+	}
+	return hint + " Only titles recoverable from existing content can be repaired; sources without a recoverable title require manual investigation and appear in source_unrepairable."
 }
 
 func syncMutationRequiredFieldsRepairHint(project string) string {
@@ -613,9 +623,13 @@ func (c SyncTargetClosedSpaceCheck) Run(ctx context.Context, scope Scope) (Check
 			}
 			continue
 		}
+		severity := SeverityError
+		if state.UnackedMutations == 0 {
+			severity = SeverityWarning
+		}
 		findings = append(findings, Finding{
 			CheckID:    c.Code(),
-			Severity:   SeverityError,
+			Severity:   severity,
 			ReasonCode: ReasonForeignSyncTarget,
 			Message:    fmt.Sprintf("Sync target %q is outside the closed set of legitimate sync targets.", state.TargetKey),
 			Why:        "A sync_state row for an unknown target records sync progress no configured delivery pipeline can ever advance, so its state can silently rot while appearing live.",

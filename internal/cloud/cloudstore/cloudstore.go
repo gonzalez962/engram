@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/chunkcodec"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
-	engramsync "github.com/Gentleman-Programming/engram/v2/internal/sync"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/v3/internal/sync"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -27,6 +27,10 @@ type CloudStore struct {
 	dashboardReadModel     dashboardReadModel
 	dashboardReadModelOK   bool
 	dashboardReadModelLoad func() (dashboardReadModel, error)
+	// dashboardReadModelGen is bumped by every invalidation; a build only
+	// publishes its result when the generation it started under is current.
+	dashboardReadModelGen   uint64
+	dashboardReadModelBuild *dashboardReadModelBuild
 }
 
 var ErrChunkNotFound = errors.New("cloudstore: chunk not found")
@@ -298,6 +302,10 @@ func (cs *CloudStore) invalidateDashboardReadModel() {
 	defer cs.dashboardReadModelMu.Unlock()
 	cs.dashboardReadModel = dashboardReadModel{}
 	cs.dashboardReadModelOK = false
+	cs.dashboardReadModelGen++
+	// Detach the in-flight build so later callers start a fresh one; its
+	// existing waiters still receive its (unpublished) result.
+	cs.dashboardReadModelBuild = nil
 }
 
 func (cs *CloudStore) KnownSessionIDs(ctx context.Context, project string) (map[string]struct{}, error) {

@@ -43,7 +43,11 @@ engram sync --cloud --status --project smoke-project
 ### 5) Verify browser dashboard
 
 Open:
-- `http://127.0.0.1:18080/dashboard`
+- `http://127.0.0.1:18080/` — redirects to `/dashboard/` with HTTP 302.
+- `http://127.0.0.1:18080/dashboard` — direct dashboard entrypoint.
+
+In authenticated deployments, an unauthenticated browser is then redirected to
+`/dashboard/login`. Unknown paths still return HTTP 404.
 
 In compose smoke mode, `/dashboard/login` redirects to `/dashboard/` (no bearer login needed).
 
@@ -203,7 +207,9 @@ engram cloud bootstrap admin --username alice \
 - Running bootstrap again once a managed admin exists is refused (no silent duplicate admin), and every attempt — accepted or refused — is recorded as a `bootstrap.cli` audit event.
 - If the one-time bootstrap token output was lost, use `engram cloud bootstrap recover-token` only when no managed token rows exist. To replace the sole unused, active bootstrap token explicitly, use `engram cloud bootstrap recover-token --revoke-existing`; retry it after another lost output only while the current token remains unused. It refuses used, revoked, ambiguous, or multiple-active-token states and preserves the admin and project grants.
 
-**Runtime authentication:** set `ENGRAM_CLOUD_TOKEN_PEPPER` (the same secret used at token-issuance time) on the `engram cloud serve` process to enable managed-token authentication — `engram cloud serve` then resolves managed tokens first, then falls back to the legacy `ENGRAM_CLOUD_TOKEN`/`ENGRAM_CLOUD_ADMIN` credentials, on every `/sync/*`, `/admin/*`, and dashboard-login request. If `ENGRAM_CLOUD_TOKEN_PEPPER` is not set, the server still starts normally and continues to authenticate only via the legacy env-token credentials. Full details: [DOCS.md — Managed users, tokens, and CLI bootstrap](../../DOCS.md#managed-users-tokens-and-cli-bootstrap).
+**Managed-token last use:** last use records successful managed bearer-token authentication, including dashboard login, not activity in an existing browser cookie session. Authentication fails closed if usage cannot be persisted. Once a token has authenticated successfully, `recover-token --revoke-existing` cannot replace it; use normal token management instead. Legacy credentials and existing cookie-session behavior are unchanged.
+
+**Runtime authentication:** set `ENGRAM_CLOUD_TOKEN_PEPPER` (the same secret used at token-issuance time) on the `engram cloud serve` process to enable managed-token authentication — `engram cloud serve` then checks the legacy `ENGRAM_CLOUD_TOKEN`/`ENGRAM_CLOUD_ADMIN` credentials first and resolves other bearer tokens through managed storage, on every `/sync/*`, `/admin/*`, and dashboard-login request. If `ENGRAM_CLOUD_TOKEN_PEPPER` is not set, the server still starts normally and continues to authenticate only via the legacy env-token credentials. Full details: [DOCS.md — Managed users, tokens, and CLI bootstrap](../../DOCS.md#managed-users-tokens-and-cli-bootstrap).
 
 ---
 

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/chunkcodec"
 )
 
 // writeDashboardScopeChunk persists one canonical chunk with a single session
@@ -284,7 +284,7 @@ func TestDashboardListsRegisteredProjectsWithoutChunks(t *testing.T) {
 
 func TestReadModelWithRegisteredProjectsAddsZeroCountRows(t *testing.T) {
 	base := dashboardPrincipalReadModel()
-	model := base.withRegisteredProjects([]string{"project-a", " fresh-project ", ""})
+	model := base.withRegisteredProjectNames([]string{"project-a", " fresh-project ", ""})
 
 	if got := dashboardProjectNames(model.projects); len(got) != 3 || got[0] != "fresh-project" || got[1] != "project-a" || got[2] != "project-b" {
 		t.Fatalf("expected sorted rows including the empty registered project, got %v", got)

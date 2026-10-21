@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/auth"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/auth"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
 )
 
 // fakeManagedTokenHashStore is an in-memory stand-in for the narrow storage
@@ -27,6 +27,34 @@ type fakeManagedTokenHashStore struct {
 	// of consulting byHash, so tests can prove a generic (non-not-found)
 	// storage error is propagated rather than swallowed or misreported.
 	forceErr error
+	usageID  string
+	usageErr error
+}
+
+func (f *fakeManagedTokenHashStore) MarkPrincipalTokenUsed(_ context.Context, id string) error {
+	f.usageID = id
+	return f.usageErr
+}
+
+func TestManagedTokenUsageAdapter(t *testing.T) {
+	failure := errors.New("storage unavailable")
+	for _, want := range []error{nil, failure, cloudstore.ErrPrincipalTokenNotFound, cloudstore.ErrPrincipalNotFound, cloudstore.ErrPrincipalTokenRevoked, cloudstore.ErrPrincipalDisabled} {
+		store := &fakeManagedTokenHashStore{usageErr: want}
+		lookup := cloudstoreManagedTokenLookup{store: store}
+		err := lookup.MarkManagedTokenUsed(context.Background(), "token-id")
+		mapped := want
+		switch want {
+		case cloudstore.ErrPrincipalTokenNotFound, cloudstore.ErrPrincipalNotFound:
+			mapped = auth.ErrUnknownToken
+		case cloudstore.ErrPrincipalTokenRevoked:
+			mapped = auth.ErrTokenRevoked
+		case cloudstore.ErrPrincipalDisabled:
+			mapped = auth.ErrPrincipalDisabled
+		}
+		if store.usageID != "token-id" || !errors.Is(err, mapped) {
+			t.Fatalf("id=%q error=%v want=%v", store.usageID, err, mapped)
+		}
+	}
 }
 
 func (f *fakeManagedTokenHashStore) FindPrincipalTokenByHash(_ context.Context, hash string) (cloudstore.PrincipalToken, cloudstore.Principal, error) {
@@ -406,47 +434,9 @@ func TestCloudRuntimeAuthenticatorRejectsPrincipalTokenMismatch(t *testing.T) {
 	}
 }
 
-// touchingManagedTokenHashStore extends the in-memory hash store with the
-// optional TouchPrincipalTokenLastUsed capability *cloudstore.CloudStore
-// provides, recording every touched token ID.
-type touchingManagedTokenHashStore struct {
-	fakeManagedTokenHashStore
-	touched  []string
-	touchErr error
-}
-
-func (s *touchingManagedTokenHashStore) TouchPrincipalTokenLastUsed(_ context.Context, tokenID string) error {
-	s.touched = append(s.touched, tokenID)
-	return s.touchErr
-}
-
-func TestCloudstoreManagedTokenLookupRecordsUseThroughStore(t *testing.T) {
-	store := &touchingManagedTokenHashStore{touchErr: errors.New("touch failed")}
-	var lookup auth.ManagedTokenLookup = cloudstoreManagedTokenLookup{store: store}
-	recorder, ok := lookup.(auth.ManagedTokenUsageRecorder)
-	if !ok {
-		t.Fatal("cloudstoreManagedTokenLookup must implement auth.ManagedTokenUsageRecorder")
-	}
-	if err := recorder.RecordManagedTokenUse(context.Background(), "tok-1"); !errors.Is(err, store.touchErr) {
-		t.Fatalf("expected store touch error to propagate to the resolver, got %v", err)
-	}
-	if len(store.touched) != 1 || store.touched[0] != "tok-1" {
-		t.Fatalf("expected touch of tok-1, got %v", store.touched)
-	}
-}
-
-func TestCloudstoreManagedTokenLookupRecordUseIsNoopWithoutTouchCapability(t *testing.T) {
-	var lookup auth.ManagedTokenLookup = cloudstoreManagedTokenLookup{store: &fakeManagedTokenHashStore{}}
-	recorder, ok := lookup.(auth.ManagedTokenUsageRecorder)
-	if !ok {
-		t.Fatal("cloudstoreManagedTokenLookup must implement auth.ManagedTokenUsageRecorder")
-	}
-	if err := recorder.RecordManagedTokenUse(context.Background(), "tok-1"); err != nil {
-		t.Fatalf("store without touch capability must be a no-op, got %v", err)
-	}
-}
-
-func TestCloudRuntimeResolverTouchesOnlySuccessfullyAuthenticatedManagedTokens(t *testing.T) {
+// TestCloudRuntimeResolverFailsClosedWhenUsageRecordingFails verifies upstream's
+// fail-closed token semantics through cloudstoreManagedTokenLookup.
+func TestCloudRuntimeResolverFailsClosedWhenUsageRecordingFails(t *testing.T) {
 	hasher, err := auth.NewManagedTokenHasher([]byte("dedicated-cloud-token-pepper-32-bytes"))
 	if err != nil {
 		t.Fatalf("NewManagedTokenHasher: %v", err)
@@ -458,44 +448,31 @@ func TestCloudRuntimeResolverTouchesOnlySuccessfullyAuthenticatedManagedTokens(t
 		}
 		return h
 	}
-	revokedAt := time.Now().UTC()
-	store := &touchingManagedTokenHashStore{fakeManagedTokenHashStore: fakeManagedTokenHashStore{byHash: map[string]struct {
-		token     cloudstore.PrincipalToken
-		principal cloudstore.Principal
-	}{
-		hash("egc_live_active"): {
-			token:     cloudstore.PrincipalToken{ID: "tok-active", PrincipalID: "p-1"},
-			principal: cloudstore.Principal{ID: "p-1", Kind: cloudstore.PrincipalKindHuman, Role: cloudstore.PrincipalRoleAdmin, Enabled: true},
+	usageFailure := errors.New("usage storage failed")
+	store := &fakeManagedTokenHashStore{
+		byHash: map[string]struct {
+			token     cloudstore.PrincipalToken
+			principal cloudstore.Principal
+		}{
+			hash("egc_live_active"): {
+				token:     cloudstore.PrincipalToken{ID: "tok-active", PrincipalID: "p-1"},
+				principal: cloudstore.Principal{ID: "p-1", Kind: cloudstore.PrincipalKindHuman, Role: cloudstore.PrincipalRoleAdmin, Enabled: true},
+			},
 		},
-		hash("egc_live_revoked"): {
-			token:     cloudstore.PrincipalToken{ID: "tok-revoked", PrincipalID: "p-1", RevokedAt: &revokedAt},
-			principal: cloudstore.Principal{ID: "p-1", Kind: cloudstore.PrincipalKindHuman, Role: cloudstore.PrincipalRoleAdmin, Enabled: true},
-		},
-		hash("egc_live_disabled"): {
-			token:     cloudstore.PrincipalToken{ID: "tok-disabled", PrincipalID: "p-2"},
-			principal: cloudstore.Principal{ID: "p-2", Kind: cloudstore.PrincipalKindHuman, Role: cloudstore.PrincipalRoleMember, Enabled: false},
-		},
-	}}}
-	resolver := auth.NewPrincipalResolver(auth.ResolverConfig{Hasher: hasher, ManagedTokens: cloudstoreManagedTokenLookup{store: store}})
+		usageErr: usageFailure,
+	}
+	resolver := auth.NewPrincipalResolver(auth.ResolverConfig{
+		Hasher:        hasher,
+		ManagedTokens: cloudstoreManagedTokenLookup{store: store},
+	})
 
-	for _, rejected := range []string{"egc_live_revoked", "egc_live_disabled", "egc_live_unknown"} {
-		if _, err := resolver.ResolveBearerToken(context.Background(), rejected); err == nil {
-			t.Fatalf("expected %s to be rejected", rejected)
-		}
+	_, err = resolver.ResolveBearerToken(context.Background(), "egc_live_active")
+	if !errors.Is(err, usageFailure) {
+		t.Fatalf("expected fail-closed error %v, got %v", usageFailure, err)
 	}
-	if len(store.touched) != 0 {
-		t.Fatalf("rejected tokens must not be touched, got %v", store.touched)
-	}
-	store.touchErr = errors.New("touch failed")
-	principal, err := resolver.ResolveBearerToken(context.Background(), "egc_live_active")
-	if err != nil || principal.TokenID != "tok-active" {
-		t.Fatalf("touch failure must not fail authentication: principal=%+v err=%v", principal, err)
-	}
-	if len(store.touched) != 1 || store.touched[0] != "tok-active" {
-		t.Fatalf("expected active token touch, got %v", store.touched)
+	if store.usageID != "tok-active" {
+		t.Fatalf("expected usage recorded for tok-active, got %q", store.usageID)
 	}
 }
 
-// The production store must provide the touch capability; otherwise
-// RecordManagedTokenUse would silently no-op in a real `engram cloud serve`.
-var _ cloudManagedTokenUsageStore = (*cloudstore.CloudStore)(nil)
+var _ cloudManagedTokenHashStore = (*cloudstore.CloudStore)(nil)

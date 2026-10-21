@@ -8,8 +8,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloudconfig"
-	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloudconfig"
+	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
 
 const (
@@ -50,6 +50,79 @@ func RepairableCodes() []string {
 func IsRepairableCode(code string) bool {
 	_, ok := repairImplementations[strings.TrimSpace(code)]
 	return ok
+}
+
+type syncMutationRepairStore interface {
+	RepairPendingSessionDirectories(string, bool) ([]store.SyncMutationDirectoryRepairAction, error)
+	RepairObservationMutationTitles(string, bool) (store.SyncMutationTitleRepairReport, error)
+	SupersedeUnenrolledLegacyMutations(string, string, bool) (store.SyncMutationSupersedeReport, error)
+	QuarantineIrreparableSyncMutations(string, string, bool) (store.SyncMutationQuarantineReport, error)
+	RepairObservationSourceTitles(string, bool) (store.ObservationSourceTitleRepairReport, error)
+}
+
+// SyncMutationRepairResult aggregates the existing store repair results.
+// The caller owns presentation; store owns each repair's data and backup behavior.
+type SyncMutationRepairResult struct {
+	Quarantine             store.SyncMutationQuarantineReport
+	DirectoryRepairs       []store.SyncMutationDirectoryRepairAction
+	Repairs                []store.SyncMutationTitleRepairAction
+	Superseded             []store.SyncMutationSupersedeAction
+	SourceRepairs          []store.ObservationSourceTitleRepairAction
+	SourceRepairBackupPath string
+	SourceUnrepairable     []store.ObservationSourceUnrepairable
+}
+
+// RepairSyncMutationRequiredFields runs the existing five repairs in order.
+// Errors stop later repairs without rolling back earlier store effects.
+func RepairSyncMutationRequiredFields(s syncMutationRepairStore, project string, mode RepairMode) (SyncMutationRepairResult, error) {
+	apply := mode == RepairModeApply
+	directoryRepairs, err := s.RepairPendingSessionDirectories(project, apply)
+	if err != nil {
+		return SyncMutationRepairResult{}, err
+	}
+	repairs, err := s.RepairObservationMutationTitles(project, apply)
+	if err != nil {
+		return SyncMutationRepairResult{}, err
+	}
+	superseded, err := s.SupersedeUnenrolledLegacyMutations(store.DefaultSyncTargetKey, project, apply)
+	if err != nil {
+		return SyncMutationRepairResult{}, err
+	}
+	report, err := s.QuarantineIrreparableSyncMutations(store.DefaultSyncTargetKey, project, apply)
+	if err != nil {
+		return SyncMutationRepairResult{}, err
+	}
+	if !apply {
+		handledSeqs := make(map[int64]struct{}, len(repairs.Actions)+len(superseded.Actions)+len(directoryRepairs))
+		for _, action := range directoryRepairs {
+			handledSeqs[action.Seq] = struct{}{}
+		}
+		for _, action := range repairs.Actions {
+			handledSeqs[action.Seq] = struct{}{}
+		}
+		for _, action := range superseded.Actions {
+			handledSeqs[action.Seq] = struct{}{}
+		}
+		remaining := report.Actions[:0]
+		for _, action := range report.Actions {
+			if _, handled := handledSeqs[action.Seq]; !handled {
+				remaining = append(remaining, action)
+			}
+		}
+		report.Actions = remaining
+	}
+	sourceRepairs, err := s.RepairObservationSourceTitles(project, apply)
+	if err != nil {
+		return SyncMutationRepairResult{}, err
+	}
+	if apply {
+		report.Applied = len(directoryRepairs) > 0 || len(repairs.Actions) > 0 || len(report.Actions) > 0 || len(superseded.Actions) > 0 || len(sourceRepairs.Actions) > 0
+	}
+	return SyncMutationRepairResult{
+		Quarantine: report, DirectoryRepairs: directoryRepairs, Repairs: repairs.Actions,
+		Superseded: superseded.Actions, SourceRepairs: sourceRepairs.Actions,
+		SourceRepairBackupPath: sourceRepairs.BackupPath, SourceUnrepairable: sourceRepairs.Unrepairable,
+	}, nil
 }
 
 type ProjectReclassifyAction struct {
@@ -357,13 +430,8 @@ func PlanSessionIdentityReplacement(scope Scope, report Report, plan RepairPlan,
 		plan.Blockers = append(plan.Blockers, RepairSkip{ReasonCode: "ambiguous_or_missing_source", Message: "select one exact source with --source-id (use --source-id '' for the empty identity)"})
 		return plan
 	}
-	identity, err := scope.Store.PlanSessionIdentityRepair(sources[0], replacementID)
-	if err != nil {
-		plan.Status = "blocked"
-		plan.Blockers = append(plan.Blockers, RepairSkip{SessionID: sources[0], ReasonCode: "identity_repair_blocked", Message: err.Error()})
-		return plan
-	}
-	plan.IdentityRepair = &identity
+	// The selected source has an explicit replacement attempt, even if the
+	// store's safety checks block it. Keep guidance for unselected sources.
 	remaining := plan.Skipped[:0]
 	removed := false
 	for _, skipped := range plan.Skipped {
@@ -374,6 +442,13 @@ func PlanSessionIdentityReplacement(scope Scope, report Report, plan RepairPlan,
 		remaining = append(remaining, skipped)
 	}
 	plan.Skipped = remaining
+	identity, err := scope.Store.PlanSessionIdentityRepair(sources[0], replacementID)
+	if err != nil {
+		plan.Status = "blocked"
+		plan.Blockers = append(plan.Blockers, RepairSkip{SessionID: sources[0], ReasonCode: "identity_repair_blocked", Message: err.Error()})
+		return plan
+	}
+	plan.IdentityRepair = &identity
 	plan.Counts.SessionsPlanned = 1
 	plan.Counts.ObservationsPlanned = identity.Observations
 	plan.Counts.PromptsPlanned = identity.Prompts

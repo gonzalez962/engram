@@ -31,6 +31,39 @@ function extractFunctionBody(name, marker) {
   throw new Error(`${name} body not found`);
 }
 
+function extractClassDefinition(name) {
+  const start = source.indexOf(`class ${name} `);
+  assert.notEqual(start, -1, `${name} class not found`);
+  const bodyStart = source.indexOf("{", start);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") depth -= 1;
+    if (depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`${name} class body not found`);
+}
+
+// Shared mode (ENGRAM_SERVER_MODE unset), evaluated with the production helpers.
+// The session-owned branches are unreachable here; startup-lifecycle covers them.
+function sharedModeTransportSource() {
+  return `
+    const SERVER_MODE = undefined;
+    const SESSION_OWNED = false;
+    const CONFIGURED_HTTP_TOKEN = "";
+    const ownedToken = "";
+    function transportHeaders(json = false) {
+      ${extractFunctionBody("transportHeaders", "{\n  if (SERVER_MODE")}
+    }
+    function ownedModeConfiguration() {
+      ${extractFunctionBody("ownedModeConfiguration", "{\n  if (SERVER_MODE")}
+    }
+    async function startOwnedTransport() {
+      throw new Error("shared-mode fixture must not start an owned transport");
+    }
+  `;
+}
+
 function buildOptionalEnvironmentValueForTest() {
   const body = extractFunctionBody("optionalEnvironmentValue", "{\n  return");
   return new Function(`
@@ -71,6 +104,11 @@ function buildExecuteMemoryToolForTest({ awaitWithAbort, initOnce, refreshProjec
     `
     let project = "engram";
     class EngramHttpError extends Error {}
+    class EngramUnavailableError extends Error {}
+    class ForeignOwnershipError extends Error {}
+    function shouldScheduleEngramSelfHeal(error, failure) {
+      ${extractFunctionBody("shouldScheduleEngramSelfHeal", "{\n  return")}
+    }
     const humanToolName = (toolName) => toolName;
     const createMemoryToolTransport = () => ({
       fetch: async () => null,
@@ -84,6 +122,7 @@ function buildExecuteMemoryToolForTest({ awaitWithAbort, initOnce, refreshProjec
     async function executeMemoryTool(toolName, params, ctx, signal) {
       ${body}
     }
+    executeMemoryTool.reachabilityError = () => new EngramUnavailableError();
     return executeMemoryTool;
     `,
   );
@@ -100,7 +139,7 @@ function buildEngramFetchForTest({
   const body = extractFunctionBody("engramFetchResult", "{\n  const method")
     .replace("let res: Response;", "let res;")
     .replace("let data: unknown = null;", "let data = null;")
-    .replace("return engramFetchResult<TResponse>(path, opts);", "return engramFetchResult(path, opts);")
+    .replace("return engramFetchResult<TResponse>(path, opts, false);", "return engramFetchResult(path, opts, false);")
     .replace("return { data: data as TResponse };", "return { data };");
   const factory = new Function(
     "fetch",
@@ -120,6 +159,8 @@ function buildEngramFetchForTest({
         this.data = data;
       }
     }
+    ${extractClassDefinition("EngramUnavailableError")}
+    ${sharedModeTransportSource()}
     function isTimeoutError(error) {
       ${extractFunctionBody("isTimeoutError", "{\n  return error instanceof Error")}
     }
@@ -147,7 +188,7 @@ function buildEngramFetchForTest({
     function unreachableMessage() {
       return "gentle-engram could not reach the Engram HTTP server";
     }
-    const engramFetchResult = async function engramFetchResult(path, opts = {}) {
+    const engramFetchResult = async function engramFetchResult(path, opts = {}, allowGuardedRecovery = true) {
       ${body}
     };
     const engramFetch = async (path, opts = {}) => (await engramFetchResult(path, opts)).data;
@@ -206,8 +247,12 @@ function buildInitializeEngramServerForTest({
   instanceID = "00000000000000000000000000000000",
   engramUrl = "http://127.0.0.1:7437",
   legacyMessage = "legacy server message",
+  startupAllowed = true,
+  resolveInstanceID = () => instanceID,
 }) {
-  const body = extractFunctionBody("initializeEngramServer", "{\n  if (CONFIGURED_ENGRAM_URL");
+  // Extract from the opening brace, retaining the policy gate rather than
+  // skipping to the old URL early return.
+  const body = extractFunctionBody("initializeEngramServer", "{\n");
   class DeterministicStartupError extends Error {}
   const factory = new Function(
     "CONFIGURED_ENGRAM_URL",
@@ -219,9 +264,18 @@ function buildInitializeEngramServerForTest({
     "ENGRAM_URL",
     "legacyEngramServerMessage",
     "DeterministicStartupError",
+    "ENGRAM_STARTUP_ALLOWED",
+    "resolveInstanceID",
     `
+    const ENGRAM_DISABLED_NOTICE = "Engram memory is disabled by startup policy";
     let localEngramInstanceID = "";
-    const localInstanceID = () => instanceID;
+    class ForeignOwnershipError extends DeterministicStartupError {
+      constructor(evidence) { super("Engram server ownership mismatch at " + ENGRAM_URL); this.evidence = evidence; }
+    }
+    const localEngramVersion = () => "unknown";
+    const missingInstanceIdentityMessage = () => "missing identity";
+    const localInstanceID = resolveInstanceID;
+    ${sharedModeTransportSource()}
     async function initializeEngramServer() {
       ${body}
     }
@@ -231,7 +285,10 @@ function buildInitializeEngramServerForTest({
   );
   return factory(
     configuredUrl ? "http://configured" : undefined,
-    probeEngramHealth,
+    async (...args) => {
+      const status = await probeEngramHealth(...args);
+      return { status, localInstanceID: instanceID, remoteInstanceID: "ffffffffffffffffffffffffffffffff", remoteVersion: "unknown" };
+    },
     spawnAndWaitForEngram,
     waitForEngramReadiness,
     timeoutMs,
@@ -239,7 +296,24 @@ function buildInitializeEngramServerForTest({
     engramUrl,
     () => legacyMessage,
     DeterministicStartupError,
+    startupAllowed,
+    resolveInstanceID,
   );
+}
+
+for (const configuredUrl of [false, true]) {
+  test(`initialization policy gate precedes identity and URL early return (configured URL=${configuredUrl})`, async () => {
+    const effects = [];
+    const initialize = buildInitializeEngramServerForTest({
+      configuredUrl, startupAllowed: false,
+      resolveInstanceID: () => { effects.push("identity"); return "unused"; },
+      probeEngramHealth: async () => { effects.push("health"); return "ready"; },
+      spawnAndWaitForEngram: async () => { effects.push("spawn"); },
+      waitForEngramReadiness: async () => { effects.push("wait"); },
+    });
+    await assert.rejects(initialize(), /memory is disabled by startup policy/);
+    assert.deepEqual(effects, [], "disabled initialization has no identity, HTTP, spawn or readiness effects");
+  });
 }
 
 function buildLocalInstanceIDForTest({ spawnSync, DeterministicStartupError = class extends Error {}, instanceIDFailureMessage = buildInstanceIDFailureMessageForTest() }) {
@@ -265,8 +339,8 @@ function buildInstanceIDFailureMessageForTest() {
 
 function buildLegacyEngramServerMessageForTest({ engramUrl = "http://127.0.0.1:7437", serverVersion = "unknown", localEngramVersion = () => "unknown" }) {
   const body = extractFunctionBody("legacyEngramServerMessage", "{\n  return");
-  const factory = new Function("ENGRAM_URL", "engramServerVersion", "localEngramVersion", `
-    return function legacyEngramServerMessage() {
+  const factory = new Function("ENGRAM_URL", "serverVersion", "localEngramVersion", `
+    return function legacyEngramServerMessage(engramServerVersion = serverVersion) {
       ${body}
     };
   `);
@@ -284,7 +358,9 @@ function buildLocalEngramVersionForTest({ spawnSync }) {
 }
 
 function buildProbeEngramHealthForTest({ fetch, isTimeoutError }) {
-  const body = extractFunctionBody("probeEngramHealth", "{\n  try").replace("const health = await res.json() as { version?: unknown; instance_id?: unknown };", "const health = await res.json();");
+  const body = extractFunctionBody("probeEngramHealth", "{\n  const result")
+    .replace("const result: EngramHealthResult", "const result")
+    .replace("const health = await res.json() as { version?: unknown; instance_id?: unknown };", "const health = await res.json();");
   const preIdentityVersionBody = extractFunctionBody("isPreIdentityEngramVersion", "{\n  const match");
   const refusedBody = extractFunctionBody("hasConnectionRefusedCode", "{\n  if (depth")
     .replace("value as Record<string, unknown>", "value");
@@ -296,6 +372,7 @@ function buildProbeEngramHealthForTest({ fetch, isTimeoutError }) {
     "AbortSignal",
     `
     let engramServerVersion = "unknown";
+    ${sharedModeTransportSource()}
     function hasConnectionRefusedCode(value, depth = 0) {
       ${refusedBody}
     }
@@ -308,8 +385,10 @@ function buildProbeEngramHealthForTest({ fetch, isTimeoutError }) {
     async function probeEngramHealth(expectedID = "") {
       ${body}
     }
-    probeEngramHealth.serverVersion = () => engramServerVersion;
-    return probeEngramHealth;
+    let lastResult;
+    const probe = async (...args) => { lastResult = await probeEngramHealth(...args); return lastResult.status; };
+    probe.serverVersion = () => lastResult.remoteVersion;
+    return probe;
     `,
   );
   return factory(fetch, isTimeoutError, "http://127.0.0.1:7437", { timeout: () => undefined });
@@ -405,7 +484,7 @@ function buildWaitForEngramReadinessForTest({ probeEngramHealth, pollMs = 5 }) {
     return waitForEngramReadiness;
     `,
   );
-  return factory(probeEngramHealth, "http://127.0.0.1:7437", pollMs);
+  return factory(async (...args) => ({ status: await probeEngramHealth(...args) }), "http://127.0.0.1:7437", pollMs);
 }
 
 function buildSpawnAndWaitForEngramForTest({ spawn, probeEngramHealth, pollMs = 5 }) {
@@ -436,14 +515,19 @@ function buildSpawnAndWaitForEngramForTest({ spawn, probeEngramHealth, pollMs = 
     return spawnAndWaitForEngram;
     `,
   );
-  return factory(spawn, probeEngramHealth, "engram", "http://127.0.0.1:7437", pollMs);
+  return factory(spawn, async (...args) => ({ status: await probeEngramHealth(...args) }), "engram", "http://127.0.0.1:7437", pollMs);
 }
 
 function buildEnsureSessionForTest(engramFetch) {
   const body = extractFunctionBody("ensureSession", "{\n  const key")
     .replace("const body: SessionBody", "const body")
     .replace("let acknowledgement: unknown;", "let acknowledgement;");
+  const provenanceBody = extractFunctionBody("captureProjectProvenance", "{\n  return {");
   const factory = new Function("knownSessions", "registeredSessionProjects", "sessionRegistrationsInFlight", "sessionRegistrationProjects", "sessionProjectConflict", "sessionProjectConflictFromResponse", "engramFetch", "project", "directory", `
+    let detectedProjectEvidence;
+    function captureProjectProvenance(cwd, target, detected = detectedProjectEvidence) {
+      ${provenanceBody}
+    }
     return async function ensureSession(sessionId, sessionProject = project, fetch = engramFetch, renew = false) {
       ${body}
     };
@@ -464,10 +548,12 @@ function buildEnsureSessionForTest(engramFetch) {
 
 function buildProjectDetectionBoundaryForTest() {
   const safeProjectBody = extractFunctionBody("isSafeDetectedProject", "{\n  const candidate");
-  const applyBody = extractFunctionBody("applyDetectedProject", "{\n  if (!detected)");
+  const applyBody = extractFunctionBody("applyDetectedProject", "{\n  detectedProjectEvidence = detected;");
+  const messageBody = extractFunctionBody("projectResolutionMessage", "{\n  const choices");
   const requireBody = extractFunctionBody("requireResolvedProject", "{\n  if (projectResolutionError)");
   const factory = new Function(`
     let project = "fallback-project";
+    let detectedProjectEvidence;
     let projectResolutionError;
     let projectDetectionPending = false;
     function isSafeDetectedProject(detected) {
@@ -475,6 +561,9 @@ function buildProjectDetectionBoundaryForTest() {
     }
     function applyDetectedProject(detected) {
       ${applyBody}
+    }
+    function projectResolutionMessage(detected, listChoices = false) {
+      ${messageBody}
     }
     function requireResolvedProject() {
       ${requireBody}
@@ -524,8 +613,8 @@ test("optional Engram environment values treat blank strings as unset without re
 test("mem_session_summary accepts explicit project fallback", () => {
   assert.match(source, /mem_session_summary: Type\.Object\(\{[\s\S]*project: optionalString\("Optional project to use when automatic detection is unavailable"\)/);
   assert.match(source, /case "mem_session_summary":[\s\S]*if \(!requestedProject\) requireResolvedProject\(\);[\s\S]*await registeredSessionForWrite\(activeProject\)[\s\S]*session_id: summarySessionId[\s\S]*project: activeProject/);
-  assert.match(source, /const registeredSessionForWrite = async \(sessionProject: string\) => registerEffectiveSession\(ctx, sessionProject, appendEntry, fetch\)/);
-  assert.match(source, /async function registerEffectiveSession[\s\S]*return register\(runtimeID, canPersist\)/);
+  assert.match(source, /const registeredSessionForWrite = async \(sessionProject: string\) => \{[\s\S]*: registerEffectiveSession\(ctx, sessionProject, appendEntry, fetch\);/);
+  assert.match(source, /async function registerEffectiveSession[\s\S]*return register\(runtimeID, canPersist, true\)/);
 });
 
 test("mem_save_prompt returns a prompt-scoped identity", () => {
@@ -561,7 +650,7 @@ test("unsafe detected projects do not reach session or memory writes", () => {
     assert.match(block, /if \(!requestedProject\) requireResolvedProject\(\);[\s\S]*await registeredSessionForWrite\(activeProject\)/);
     assert.ok(block.indexOf("requireResolvedProject()") < block.indexOf("await registeredSessionForWrite"), `${tool} must resolve project before registration`);
   }
-  assert.match(source, /async function registerEffectiveSession[\s\S]*return register\(runtimeID, canPersist\)/);
+  assert.match(source, /async function registerEffectiveSession[\s\S]*return register\(runtimeID, canPersist, true\)/);
 
   for (const detected of [
     undefined,
@@ -605,6 +694,41 @@ test("memory protocol declares gentle-engram as the Pi-native provider", () => {
   assert.match(source, /These instructions are injected by gentle-engram, the Pi-native memory provider/);
   assert.match(source, /Use the memory tools named in this section as the authoritative Pi memory contract/);
   assert.match(source, /Do not infer alternative Engram tool names from other integrations/);
+});
+
+test("memory protocol enforces the canonical topic workflow", () => {
+  const workflowStart = source.indexOf("### CANONICAL TOPIC WORKFLOW");
+  assert.notEqual(workflowStart, -1, "canonical topic workflow section missing");
+  const nextHeading = source.indexOf("\n### ", workflowStart + 1);
+  const workflow = source.slice(workflowStart, nextHeading);
+
+  assert.match(workflow, /SEARCH first[\s\S]*mem_search/);
+  assert.match(workflow, /READ in full[\s\S]*mem_get_observation/);
+  assert.match(workflow, /search snippets are not enough/);
+  assert.match(workflow, /SAME bounded topic[\s\S]*mem_update[\s\S]*by ID/);
+  assert.match(workflow, /preserve every still-valid fact/);
+  assert.match(workflow, /Record superseded facts as history/);
+  assert.match(workflow, /Genuinely new topic[\s\S]*mem_save/);
+  assert.match(workflow, /If the learning is already covered, write nothing/);
+  assert.match(workflow, /Ambiguous identity or failed lookup[\s\S]*Do not blindly overwrite/);
+  assert.match(workflow, /A failed read is not evidence of absence/);
+  assert.match(workflow, /Never merge across projects or scopes/);
+  assert.match(workflow, /hint, not proof of identity/);
+
+  assert.doesNotMatch(workflow, /Call `mem_save` IMMEDIATELY/);
+  assert.match(source, /Bug fix completed[\s\S]*Architecture or design decision made[\s\S]*User preference or constraint learned/);
+  assert.match(source, /Format for \\`mem_update\\`:/);
+  assert.match(source, /expected_project[\s\S]*project that owns the observation/);
+  assert.match(source, /full rewritten content including every still-valid fact/);
+});
+
+test("memory tool descriptions carry the canonical workflow guidance", () => {
+  assert.match(source, /mem_search: Type\.Object\(\{[\s\S]*Search existing memories before saving; snippets are not enough to decide identity/);
+  assert.match(source, /mem_get_observation: Type\.Object\(\{[\s\S]*Read in full before deciding identity or updating/);
+  assert.match(source, /mem_save: Type\.Object\(\{[\s\S]*New topics only: search and read first; use mem_update for an existing topic/);
+  assert.match(source, /mem_update: Type\.Object\(\{[\s\S]*Update an existing observation by ID; preserve still-valid facts and keep its topic_key/);
+  assert.match(source, /mem_save: Type\.Object\(\{[\s\S]*Stable, deliberate topic key; reuse via mem_update rather than duplicating/);
+  assert.match(source, /mem_update: Type\.Object\(\{[\s\S]*Keep the existing topic_key unless the topic itself changed/);
 });
 
 test("an inconclusive health probe still attempts the spawn", async () => {
@@ -771,7 +895,7 @@ test("a legacy server fails closed without spawning or waiting", async () => {
   assert.equal(readinessWaits, 0, "a legacy server is never waited on");
 });
 
-test("a foreign server keeps the exact ownership mismatch message and fails closed", async () => {
+test("a foreign server carries probe evidence and fails closed", async () => {
   let spawns = 0;
   const initializeEngramServer = buildInitializeEngramServerForTest({
     probeEngramHealth: async () => "foreign",
@@ -783,8 +907,30 @@ test("a foreign server keeps the exact ownership mismatch message and fails clos
     (error) => error,
   );
   assert.ok(failure instanceof initializeEngramServer.deterministicStartupError, "ownership mismatch is a deterministic failure");
-  assert.equal(failure?.message, "Engram server ownership mismatch at http://127.0.0.1:7437");
+  assert.deepEqual(failure.evidence, {
+    localInstanceID: "00000000000000000000000000000000",
+    remoteInstanceID: "ffffffffffffffffffffffffffffffff",
+    localVersion: "unknown", remoteVersion: "unknown",
+  });
   assert.equal(spawns, 0, "a foreign server is never replaced by a spawn");
+});
+
+test("normalization preserves typed ownership evidence without text classification", () => {
+  class ForeignOwnershipError extends Error {
+    constructor(evidence, message) { super(message); this.evidence = evidence; }
+  }
+  const normalize = new Function("ForeignOwnershipError", "ENGRAM_URL", `
+    return function normalizeInitializationError(error) {
+      ${extractFunctionBody("normalizeInitializationError", "{\n  const message")}
+    };
+  `)(ForeignOwnershipError, "http://127.0.0.1:7437");
+  const evidence = { localInstanceID: "local", remoteInstanceID: "remote", localVersion: "unknown", remoteVersion: "2.0.0" };
+  const normalized = normalize(new ForeignOwnershipError(evidence, "ownership mismatch"));
+  assert.ok(normalized instanceof ForeignOwnershipError);
+  assert.strictEqual(normalized.evidence, evidence, "normalization retains the same evidence object");
+  assert.match(normalized.message, /could not initialize/);
+  assert.match(normalized.message, /ENGRAM_URL\/ENGRAM_PORT\/ENGRAM_BIN/);
+  assert.ok(!(normalize(new Error("ownership mismatch")) instanceof ForeignOwnershipError), "prose alone cannot authorize fallback");
 });
 
 test("an inconclusive probe falls back to an already-starting server when our child loses the port", async () => {
@@ -1459,7 +1605,8 @@ test("Pi cancellation aborts a held native HTTP request before it can return a l
 
   try {
     const pending = engramFetch("/held", { signal: controller.signal });
-    await requestStarted;
+    // A request that fails before dispatch must fail this test, not hang the file.
+    await Promise.race([requestStarted, pending]);
     controller.abort();
     await assert.rejects(pending, (error) => error?.name === "AbortError");
     await requestAborted;
@@ -1540,22 +1687,41 @@ test("cancelling initialization, project detection, or active memory work propag
   assert.match(source, /catch \(error\) \{\s*if \(signal\?\.aborted\) throw error;/);
 });
 
-test("a non-cancellation initialization failure still reports an outage and schedules recovery", async () => {
+test("a rejected compatibility flow reports its error without scheduling a health probe", async () => {
   const statuses = [];
   let recoveries = 0;
   const executeMemoryTool = buildExecuteMemoryToolForTest({
     awaitWithAbort: buildAwaitWithAbortForTest(),
-    initOnce: async () => { throw new Error("startup failed"); },
-    refreshProjectDetection: async () => assert.fail("failed initialization must not reach project detection"),
-    callMemoryTool: async () => assert.fail("failed initialization must not call memory"),
+    initOnce: async () => {},
+    refreshProjectDetection: async () => {},
+    callMemoryTool: async () => { throw new Error("root resume compatibility rejected"); },
     scheduleEngramSelfHeal: () => { recoveries += 1; },
   });
 
   const result = await executeMemoryTool("mem_search", {}, { ...sessionCtx("session", statuses), cwd: "/work" });
 
   assert.equal(result.isError, true);
-  assert.equal(result.details.error, "startup failed");
-  assert.deepEqual(statuses, [["engram", "🧠 engram · error"]]);
+  assert.equal(result.details.error, "root resume compatibility rejected");
+  assert.deepEqual(statuses, [["engram", "🧠 engram · mem_search…"], ["engram", "🧠 engram · error"]]);
+  assert.equal(recoveries, 0);
+});
+
+test("a typed reachability failure still schedules self-heal", async () => {
+  const statuses = [];
+  let recoveries = 0;
+  let unreachable;
+  const executeMemoryTool = buildExecuteMemoryToolForTest({
+    awaitWithAbort: buildAwaitWithAbortForTest(),
+    initOnce: async () => {},
+    refreshProjectDetection: async () => {},
+    callMemoryTool: async () => { throw unreachable; },
+    scheduleEngramSelfHeal: () => { recoveries += 1; },
+  });
+  unreachable = executeMemoryTool.reachabilityError();
+
+  const result = await executeMemoryTool("mem_search", {}, { ...sessionCtx("session", statuses), cwd: "/work" });
+
+  assert.equal(result.isError, true);
   assert.equal(recoveries, 1);
 });
 
@@ -1890,7 +2056,7 @@ test("session compaction strictly registers before forwarding its summary", () =
   assert.notEqual(summaryPost, -1, "session_compact summary post not found");
   assert.ok(registration < summaryPost, "strict registration must precede summary forwarding");
   assert.doesNotMatch(compactHandler, /ensureSessionBestEffort/, "session_compact must not hide registration failure");
-  assert.match(source, /async function registerEffectiveSession[\s\S]*return register\(runtimeID, canPersist\)/);
+  assert.match(source, /async function registerEffectiveSession[\s\S]*return register\(runtimeID, canPersist, true\)/);
   assert.match(source, /async function archiveCompactionSummary[\s\S]*engramFetchResult\("\/observations"/);
 });
 
@@ -2100,8 +2266,9 @@ test("self-heal gives up after exhausting its attempt budget without clearing th
   assert.equal(isInFlight(), false);
 });
 
-test("only reachability failures schedule self-heal, HTTP errors from a live server do not", () => {
-  assert.match(source, /if \(!\(error instanceof EngramHttpError\)\) scheduleEngramSelfHeal\(ctx\);/);
+test("only typed reachability failures schedule self-heal", () => {
+  assert.match(source, /return failure !== undefined \|\| error instanceof EngramUnavailableError;/);
+  assert.match(source, /if \(shouldScheduleEngramSelfHeal\(error, failure\)\) scheduleEngramSelfHeal\(ctx\);/);
 });
 
 test("waitUnref schedules a background timer that does not keep the process alive", async () => {
@@ -2189,4 +2356,28 @@ test("background diagnostics remain safe when formatting or delivery fails", () 
   assert.doesNotThrow(() => warn("/prompts", { toString() { throw new Error("format failed"); } }));
   assert.doesNotThrow(() => warn("/prompts", "failure", { hasUI: true, ui: {} }));
   assert.equal(stderr.length, 0);
+});
+
+test("concurrent owned startups share one in-flight start so no child is orphaned", async () => {
+  const body = extractFunctionBody("startOwnedTransport", "{\n  ownedStart");
+  let starts = 0;
+  let release;
+  const startOwnedTransport = new Function("startOwnedTransportOnce", `
+    let ownedStart;
+    return function startOwnedTransport() {
+      ${body}
+    };
+  `)(() => {
+    starts += 1;
+    return new Promise((resolve) => { release = resolve; });
+  });
+  const first = startOwnedTransport();
+  const second = startOwnedTransport();
+  assert.equal(starts, 1, "a second caller during startup must not spawn another child");
+  release();
+  await Promise.all([first, second]);
+  const restart = startOwnedTransport();
+  assert.equal(starts, 2, "a finished start does not block a later restart");
+  release();
+  await restart;
 });

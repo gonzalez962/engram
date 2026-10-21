@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/auth"
-	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/auth"
+	"github.com/Gentleman-Programming/engram/v3/internal/cloud/cloudstore"
 )
 
 // cloudRuntimeAuthenticator is the single Authenticator wired into
@@ -62,6 +62,7 @@ func (a *cloudRuntimeAuthenticator) ResolveBearerToken(ctx context.Context, toke
 // field-mapping/error-mapping logic can be proven without a Postgres
 // connection (see cloud_runtime_auth_test.go).
 type cloudManagedTokenHashStore interface {
+	MarkPrincipalTokenUsed(ctx context.Context, tokenID string) error
 	FindPrincipalTokenByHash(ctx context.Context, tokenHash string) (cloudstore.PrincipalToken, cloudstore.Principal, error)
 }
 
@@ -74,6 +75,20 @@ type cloudManagedTokenHashStore interface {
 // WithManagedTokenHasher are already wired here.
 type cloudstoreManagedTokenLookup struct {
 	store cloudManagedTokenHashStore
+}
+
+func (l cloudstoreManagedTokenLookup) MarkManagedTokenUsed(ctx context.Context, tokenID string) error {
+	err := l.store.MarkPrincipalTokenUsed(ctx, tokenID)
+	switch {
+	case errors.Is(err, cloudstore.ErrPrincipalTokenNotFound), errors.Is(err, cloudstore.ErrPrincipalNotFound):
+		return auth.ErrUnknownToken
+	case errors.Is(err, cloudstore.ErrPrincipalTokenRevoked):
+		return auth.ErrTokenRevoked
+	case errors.Is(err, cloudstore.ErrPrincipalDisabled):
+		return auth.ErrPrincipalDisabled
+	default:
+		return err
+	}
 }
 
 func (l cloudstoreManagedTokenLookup) FindManagedTokenByHash(ctx context.Context, hash string) (auth.ManagedTokenRecord, auth.Principal, error) {
@@ -109,25 +124,6 @@ func (l cloudstoreManagedTokenLookup) FindManagedTokenByHash(ctx context.Context
 		RevokedAt:   token.RevokedAt,
 	}
 	return record, resolvedPrincipal, nil
-}
-
-// cloudManagedTokenUsageStore is the optional storage capability
-// cloudstoreManagedTokenLookup uses to record managed token usage.
-// *cloudstore.CloudStore satisfies it; stores without it (test fakes) make
-// usage recording a no-op instead of widening cloudManagedTokenHashStore.
-type cloudManagedTokenUsageStore interface {
-	TouchPrincipalTokenLastUsed(ctx context.Context, tokenID string) error
-}
-
-// RecordManagedTokenUse implements auth.ManagedTokenUsageRecorder. The
-// resolver calls it only after a successful managed-token authentication;
-// the store throttles the actual write.
-func (l cloudstoreManagedTokenLookup) RecordManagedTokenUse(ctx context.Context, tokenID string) error {
-	usageStore, ok := l.store.(cloudManagedTokenUsageStore)
-	if !ok {
-		return nil
-	}
-	return usageStore.TouchPrincipalTokenLastUsed(ctx, tokenID)
 }
 
 // cloudProjectGrantStore is the narrow storage seam

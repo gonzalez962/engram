@@ -14,13 +14,29 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 PROJECT=$(resolve_project "$CWD") || PROJECT=""
 
-# Ensure session exists
+# Ensure session exists. Claude keeps the session ID across compaction as it
+# does on --resume, so the root may already be ended; resume=true lets the
+# server register a live continuation instead of refusing with
+# session_already_ended, which would leave every later write denied by the
+# PreToolUse gate. Registers exactly like session-start.sh.
 if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ]; then
+  # Roots created before Claude registered project_owned sessions are shared;
+  # resuming one keeps that mode so its continuation stays resolvable.
+  OWNERSHIP_MODE="project_owned"
+  ENCODED_SESSION_ID=$(printf '%s' "$SESSION_ID" | jq -sRr @uri 2>/dev/null)
+  SESSION=""
+  if [ -n "$ENCODED_SESSION_ID" ]; then
+    SESSION=$(engram_curl -sf "${ENGRAM_URL}/sessions/${ENCODED_SESSION_ID}" --max-time 1 2>/dev/null)
+  fi
+  if [ -n "$SESSION" ] && printf '%s' "$SESSION" \
+    | jq -e --arg id "$SESSION_ID" '.id == $id and .ended_at != null and .ownership_mode == "shared"' >/dev/null 2>&1; then
+    OWNERSHIP_MODE="shared"
+  fi
   engram_curl -sf "${ENGRAM_URL}/sessions" \
     -X POST \
     -H "Content-Type: application/json" \
-    -d "$(jq -n --arg id "$SESSION_ID" --arg project "$PROJECT" --arg dir "$CWD" \
-      '{id: $id, project: $project, directory: $dir}')" \
+    -d "$(jq -n --arg id "$SESSION_ID" --arg project "$PROJECT" --arg dir "$CWD" --arg mode "$OWNERSHIP_MODE" \
+      '{id: $id, project: $project, directory: $dir, ownership_mode: $mode, resume: true}')" \
     > /dev/null
 fi
 
@@ -51,7 +67,7 @@ if [ "$mode" != "slim" ]; then
 cat <<'PROTOCOL'
 ## Engram Persistent Memory — ACTIVE PROTOCOL
 
-You have engram memory tools. This protocol is MANDATORY and ALWAYS ACTIVE.
+You have engram memory tools. The agent MUST follow this protocol without waiting for activation.
 
 ### CORE TOOLS — always available, no ToolSearch needed
 mem_save, mem_search, mem_context, mem_session_summary, mem_get_observation, mem_save_prompt, mem_current_project, mem_judge, mem_compare
@@ -68,8 +84,12 @@ Call `mem_save` IMMEDIATELY after ANY of these:
 - Pattern established (naming, structure, approach)
 - User preference or constraint learned
 - Feature implemented with non-obvious approach
+- Configuration change or environment setup done
+- User confirms your recommendation
+- User rejects an approach or expresses a preference
+- Discussion concludes with a clear direction chosen
 
-**Self-check after EVERY task**: "Did I just make a decision, fix a bug, learn something, or establish a convention? If yes → mem_save NOW."
+**Self-check after EVERY task**: "Did I or the user just make a decision, confirm a recommendation, express a preference, fix a bug, learn something, or establish a convention? If yes → mem_save NOW."
 
 ### DELIVERY GUARANTEE
 Memory operations are internal bookkeeping, never the user-facing answer. Complete required memory work before composing the completed-task reply; send the complete answer as the final message of the turn with no later tool calls. If memory work fails or needs follow-up, still send the answer.
@@ -80,7 +100,14 @@ Memory operations are internal bookkeeping, never the user-facing answer. Comple
 - User mentions a topic you have no context on
 
 ### SESSION CLOSE — before saying "done":
-Call `mem_session_summary` with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
+Call `mem_session_summary` with: Goal, Instructions, Discoveries, Accomplished, Next Steps, Relevant Files.
+Summary persistence does not end the session; Claude's SessionEnd hook owns lifecycle closure.
+
+### PASSIVE CAPTURE — adapter-specific safety net
+Claude's SubagentStop hook forwards eligible delegated/subagent output for server-side extraction.
+Ordinary main-agent responses are not automatically captured; a numbered "## Key Learnings:" section alone does not guarantee storage.
+Use `mem_save` as the primary path for significant, verified knowledge. Explicit
+`mem_capture_passive(content)` extraction is a safety net, not a replacement for `mem_save`.
 
 ---
 
