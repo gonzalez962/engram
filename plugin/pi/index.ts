@@ -1516,7 +1516,7 @@ function supportsRootSessionResume(health: unknown): boolean {
 function rootResumeCompatibilityError(health: unknown): Error {
   const version = health && typeof health === "object" && typeof (health as { version?: unknown }).version === "string"
     ? (health as { version: string }).version : "unknown";
-  return new Error(`gentle-engram 0.4.2 cannot resume this Pi session with Engram core ${version}. Requires capabilities.root_session_resume: true or a supported release >= 3.0.0 without an explicit negative or malformed capability. Upgrade the Engram core and restart its server, then retry. No resumed identity was adopted.`);
+  return new Error(`gentle-engram 0.5.0 cannot resume this Pi session with Engram core ${version}. Requires capabilities.root_session_resume: true or a supported release >= 3.0.0 without an explicit negative or malformed capability. Upgrade the Engram core and restart its server, then retry. No resumed identity was adopted.`);
 }
 
 async function registerEffectiveSession(ctx: SessionContext, sessionProject: string, appendEntry: ExtensionAPI["appendEntry"] | undefined, fetch: EngramFetcher = engramFetch): Promise<string> {
@@ -2976,7 +2976,7 @@ export default function registerEngram(pi: ExtensionAPI) {
       prior.awaitingInitialUserMessage = false;
       prior.promptTurn = (prior.promptTurn || 0) + 1;
     }
-    let systemPrompt = event.systemPrompt.length > 0 ? `${event.systemPrompt}\n\n${MEMORY_INSTRUCTIONS}` : MEMORY_INSTRUCTIONS;
+    const systemPrompt = event.systemPrompt.length > 0 ? `${event.systemPrompt}\n\n${MEMORY_INSTRUCTIONS}` : MEMORY_INSTRUCTIONS;
     const state = sessionId ? lifecycle(ctx, sessionId) : undefined;
     if (state) state.awaitingInitialUserMessage = true;
     const epoch = state?.epoch;
@@ -2985,12 +2985,11 @@ export default function registerEngram(pi: ExtensionAPI) {
     // (pi#5581), so newer Pi receives the text through the per-run structured options instead.
     const options = event.systemPromptOptions && typeof event.systemPromptOptions === "object" ? event.systemPromptOptions : undefined;
     if (options) appendPromptSection(options, MEMORY_INSTRUCTIONS);
-    if (pendingRecoveryNotice !== undefined && sessionId === pendingRecoveryNotice.sessionId) {
-      if (options) appendPromptSection(options, pendingRecoveryNotice.content);
-      else systemPrompt = `${systemPrompt}\n\n${pendingRecoveryNotice.content}`;
-      pendingRecoveryNotice = undefined;
-    }
-    const result = options ? undefined : { systemPrompt };
+    const message = pendingRecoveryNotice !== undefined && sessionId === pendingRecoveryNotice.sessionId
+      ? { customType: "engram-compaction-recovery", content: pendingRecoveryNotice.content, display: false }
+      : undefined;
+    if (message) pendingRecoveryNotice = undefined;
+    const result = options ? (message ? { message } : undefined) : { systemPrompt, ...(message ? { message } : {}) };
     // The mem_* tools stay registered whether or not startup succeeded, so the agent still
     // needs the memory protocol; only the server-backed work below is skipped.
     if (!(await initOnceForHook(ctx.cwd))) return result;

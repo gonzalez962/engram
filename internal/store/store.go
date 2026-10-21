@@ -1109,10 +1109,7 @@ func newStoreWithStartupContext(ctx context.Context, cfg Config, ownedStartup bo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !filepath.IsAbs(cfg.DataDir) {
-		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
-	}
-	if err := checkDataDirectoryFilesystem(cfg.DataDir); err != nil {
+	if err := ValidateDataDirectory(cfg.DataDir); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
@@ -8846,7 +8843,7 @@ func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations [
 			mutation.Seq = seq
 			mutation.TargetKey = targetKey
 			mutation.Source = SyncSourceRemote
-			if applyErr := s.applyPulledMutationForDomainTx(tx, mutation, cloud, targetKey, pulledChunkDirectoryAdmission(cloud)); applyErr != nil {
+			if applyErr := s.applyPulledMutationWithSessionContextTx(tx, mutation, cloud, targetKey, pulledChunkDirectoryAdmission(cloud), mutations[i+1:]); applyErr != nil {
 				if handled, err := s.recordRelationApplyFailureTx(tx, targetKey, mutation, applyErr); err != nil {
 					return fmt.Errorf("apply chunk mutation %d: %w", i, err)
 				} else if !handled {
@@ -12072,7 +12069,52 @@ func (s *Store) applyCloudPulledMutationTx(tx *sql.Tx, targetKey string, mutatio
 	return s.applyPulledMutationForDomainTx(tx, mutation, true, targetKey, pulledSessionDirectoryCloudMutation)
 }
 
+// supersededSessionDelete classifies only validated actual session upserts.
+// Invalid candidates still reach normal validation/quarantine at their own
+// mutation position. The delete records its tombstone, but its physical effects
+// are suppressed when a valid recreation exists, preserving local children.
+// Called after delete validation and, locally, after recording the actual
+// tombstone: admission uses exactly the execution timestamp, including Now().
+func (s *Store) supersededSessionDeleteTx(tx *sql.Tx, mutation SyncMutation, later []SyncMutation, admission pulledSessionDirectoryAdmission, cloud bool) (bool, error) {
+	for _, candidate := range later {
+		if candidate.Entity != SyncEntitySession || candidate.Op != SyncOpUpsert || candidate.EntityKey != mutation.EntityKey {
+			continue
+		}
+		var next syncSessionPayload
+		if err := decodeSyncPayload([]byte(candidate.Payload), &next); err != nil {
+			continue
+		}
+		if strings.TrimSpace(next.ID) == "" {
+			next.ID = candidate.EntityKey
+		}
+		if err := validateSessionMutationIdentity(next.ID, candidate.EntityKey); err != nil {
+			continue
+		}
+		if isSessionDeletePayload(next) {
+			continue
+		}
+		if err := validatePulledSessionDirectoryAdmission(admission, []byte(candidate.Payload)); err != nil {
+			continue
+		}
+		if !cloud {
+			blocked, err := s.localUpsertBlockedByTombstoneTx(tx, SyncEntitySession, next.ID, next.StartedAt)
+			if err != nil {
+				return false, err
+			}
+			if blocked {
+				continue
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
 func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation, cloud bool, targetKey string, directoryAdmission pulledSessionDirectoryAdmission) error {
+	return s.applyPulledMutationWithSessionContextTx(tx, mutation, cloud, targetKey, directoryAdmission, nil)
+}
+
+func (s *Store) applyPulledMutationWithSessionContextTx(tx *sql.Tx, mutation SyncMutation, cloud bool, targetKey string, directoryAdmission pulledSessionDirectoryAdmission, later []SyncMutation) error {
 	switch mutation.Entity {
 	case SyncEntityRelation:
 		return s.applyRelationUpsertTx(tx, mutation)
@@ -12089,11 +12131,32 @@ func (s *Store) applyPulledMutationForDomainTx(tx *sql.Tx, mutation SyncMutation
 			return fmt.Errorf("%w: %v", ErrPulledSessionIdentityInvalid, err)
 		}
 		if mutation.Op == SyncOpDelete || isSessionDeletePayload(payload) {
-			if err := s.applySessionDeleteTx(tx, payload); err != nil {
+			// Local admission must see the tombstone this delete actually writes.
+			// Record once before lookahead; any later failure rolls it back too.
+			recorded := !cloud && len(later) > 0
+			if recorded {
+				deletedAt := strings.TrimSpace(derefString(payload.DeletedAt))
+				if deletedAt == "" {
+					deletedAt = Now()
+				}
+				if err := s.recordSyncDeleteTombstoneTx(tx, SyncEntitySession, payload.ID, "", payload.Project, deletedAt); err != nil {
+					return err
+				}
+			}
+			preserveSession, err := s.supersededSessionDeleteTx(tx, mutation, later, directoryAdmission, cloud)
+			if err != nil {
 				return err
+			}
+			if !preserveSession {
+				if err := s.applySessionDeleteTx(tx, payload); err != nil {
+					return err
+				}
 			}
 			if cloud {
 				return s.recordCloudDeleteTombstoneTx(tx, targetKey, SyncEntitySession, payload.ID, "", payload.Project, payload.DeletedAt, payload.HardDelete, mutation.Seq)
+			}
+			if recorded {
+				return nil
 			}
 			deletedAt := strings.TrimSpace(derefString(payload.DeletedAt))
 			if deletedAt == "" {

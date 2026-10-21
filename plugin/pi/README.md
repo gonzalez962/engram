@@ -308,12 +308,18 @@ it. No trace file is created automatically.
 
 ## Quick start
 
+**Unreleased preparation:** this source proposes companion `0.5.0` with core `3.5.0`.
+The commands below are for use only after the pair is published and validated;
+no compatible release is claimed here. See the [candidate pair plan](../../docs/SESSION-OWNED-RELEASE-PAIR.md)
+for required evidence and delivery blockers. Published companion `0.4.2` does not
+support the session-owned capability required by bundled launchers.
+
 ```bash
-pi install npm:gentle-engram@0.4.2
+pi install npm:gentle-engram@0.5.0
 pi-engram init
 ```
 
-This source version of Go's `engram setup pi` pins `0.4.2`. Released core `3.3.1` pins `0.4.1`, and older core `3.3.0` binaries pin `0.3.0`; use the explicit install command above to select `0.4.2` with an older core. Earlier `0.1.16` still registers Engram MCP during `pi-engram init`, so do not use it for native-only setup.
+This source version of Go's `engram setup pi` pins `0.5.0`; an older core does not acquire that pin by installing a newer companion. Released core `3.3.1` pins `0.4.1`, and older core `3.3.0` binaries pin `0.3.0`. Use the validated core/companion pair rather than changing installed metadata. Earlier `0.1.16` still registers Engram MCP during `pi-engram init`, so do not use it for native-only setup.
 
 Restart Pi after installation, then ask Pi what it remembers about the current project or call `mem_context`.
 
@@ -519,7 +525,9 @@ When Pi emits a compaction lifecycle event, `gentle-engram` reads the current pa
 Before archiving, the extension requires Engram to acknowledge registration for the effective session identity. Pi registers its runtime ID with `resume: true`; the Go core reuses a live continuation or creates the next `<runtimeID>:resume:N` identity when the root has ended. The extension validates and adopts the acknowledged ID rather than choosing a suffix; every ended row remains closed. Pi session entries retain the mapping for extension reloads, without appending duplicates on each renewal. If the host cannot append and read mapping entries, root registration does not request resume: an ended root is refused instead of creating an untrackable continuation. A valid existing continuation mapping can still be renewed without append support, but adopting any changed ID requires append support—even when fallback returns the runtime root. Root fallback supersedes the old mapping so writes and cleanup use the same identity. For read-only mappings, confirmed shutdown delivery is remembered in-process to avoid repeated `/end`; uncertain delivery remains retryable. Existing `:resume:<uuid>` mappings are registered as-is; when a mapped session has ended, Pi registers the runtime root with `resume: true` again. A fork uses its own runtime conversation ID and cannot inherit the parent's mapping. Unknown registration failures, invalid acknowledgements, and project ownership conflicts prevent attributed writes. An older server's `409 session_already_ended` is reported with that specific cause, without client-side guessing. It checks runtime-identity ambiguity against Pi's host ID, saves a `session_summary` observation with topic key `session/compaction-recovery` under the acknowledged effective ID (including resumed continuations), then requests `/context/compaction?session_id=...` for recovery guidance scoped to that same effective session.
 After a second distinct or blank/missing runtime identity, compaction recovery permanently fails closed until the plugin process restarts.
 
-The next turn receives outcome-specific guidance:
+The next turn for the exact owning Pi runtime session receives the unchanged outcome-specific guidance once through the `before_agent_start` result's `message` (`customType: "engram-compaction-recovery"`, `display: false`). Foreign sessions and subsequent turns receive no new recovery notice. The constant Memory Protocol instructions remain in the system prompt (or structured `appendSystemPrompt` options); recovery no longer inserts and then removes notice text there. Pi SDK 1.3.0 documentation describes custom message content as model-facing user-role context, with `display: false` hiding terminal rendering—not user-authored input. Public-plugin mock regressions cover the returned channel, stable instructions and request behavior; they do not establish installed-host execution, persistence/replay, compatibility across the entire declared SDK range, or real provider prompt-cache performance.
+
+Guidance depends on the archive outcome:
 
 - **Confirmed archive:** the summary is already saved; no manual `mem_session_summary` call is needed.
 - **Definite archive failure:** the manual `FIRST ACTION REQUIRED` fallback remains available.
@@ -589,7 +597,7 @@ This local-port remedy requires `ENGRAM_URL` to be unset. `ENGRAM_PORT` alone ne
 
 ### Startup safety policy
 
-`gentle-engram` 0.4.2 advertises `engram.startupPolicy: 1` in package metadata.
+The unreleased `gentle-engram` 0.5.0 source advertises `engram.startupPolicy: 1` and `engram.sessionOwned: 1` in package metadata. These declarations do not prove that the matching core/companion artifacts have been published or validated.
 Launchers can set `ENGRAM_STARTUP_POLICY=disabled` before loading the extension
 when safe use of an existing store cannot be established. Pi remains usable:
 no memory tools, memory protocol, bridge responder, normal lifecycle hooks,
@@ -649,7 +657,7 @@ The Pi extension treats absent, empty, and whitespace-only `ENGRAM_URL`, `ENGRAM
 
 With this Pi package version, `pi-engram init` updates Pi-owned config in the Pi agent directory:
 
-- `settings.json`: ensures `npm:gentle-engram@0.4.2` is declared, replacing affected `npm:gentle-engram@0.1.8`, `npm:gentle-engram@0.1.11`, `npm:gentle-engram@0.1.12`, `npm:gentle-engram@0.1.14`, `npm:gentle-engram@0.1.15`, `npm:gentle-engram@0.1.16`, `npm:gentle-engram@0.2.0`, `npm:gentle-engram@0.3.0`, `npm:gentle-engram@0.4.0`, and `npm:gentle-engram@0.4.1` pins when present. It does not add `npm:pi-mcp-adapter` and leaves an existing adapter entry untouched.
+- `settings.json`: with the prepared matching core, ensures `npm:gentle-engram@0.5.0` is declared, replacing affected `npm:gentle-engram@0.1.8`, `npm:gentle-engram@0.1.11`, `npm:gentle-engram@0.1.12`, `npm:gentle-engram@0.1.14`, `npm:gentle-engram@0.1.15`, `npm:gentle-engram@0.1.16`, `npm:gentle-engram@0.2.0`, `npm:gentle-engram@0.3.0`, `npm:gentle-engram@0.4.0`, `npm:gentle-engram@0.4.1`, and `npm:gentle-engram@0.4.2` pins when present. It does not add `npm:pi-mcp-adapter` and leaves an existing adapter entry untouched.
 - `mcp.json`: never created or changed by init. Existing `mcpServers.engram` triggers a warning with its exact config path. Manually remove only that key and restart/reload Pi to guarantee native-only agent writes; preserve unrelated MCP servers.
 
 `engram setup pi` also auto-pins `npmCommand` in Pi's `settings.json` when [mise](https://mise.jdx.dev/) is detected in `PATH`. It sets `npmCommand` to `["mise", "exec", "node@<version>", "--", "npm"]` so Pi always uses the mise-managed Node version. Existing `npmCommand` values are never overwritten; if mise is not found, this step is a no-op.
@@ -714,7 +722,7 @@ There is no automatic inference: editing files in another repository never chang
 
 | Symptom                                                      | Fix                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mem_*` tools are missing                                    | Install/verify `npm:gentle-engram@0.4.2`, run `pi-engram init`, then restart Pi. Earlier `0.1.16` init still registers Engram MCP; do not use it for native-only setup.                                                                                                 |
+| `mem_*` tools are missing                                    | After the candidate pair is published and validated, install/verify `npm:gentle-engram@0.5.0` with its matching core, run `pi-engram init`, then restart Pi. Earlier `0.1.16` init still registers Engram MCP; do not use it for native-only setup.                                                                                                 |
 | Pi cannot find `engram`                                      | Set `ENGRAM_BIN=/absolute/path/to/engram`.                                                                                                                                                                                                                              |
 | Session capture should use another server                    | Set `ENGRAM_URL=http://host:7437`.                                                                                                                                                                                                                                      |
 | Pi shows `error MCP: 0/N servers` but `mem_*` works          | That status covers Pi's MCP servers, not Engram's Pi-native HTTP tools. Check `~/.pi/agent/mcp.json` for stale/unreachable servers such as remote OAuth services. |
