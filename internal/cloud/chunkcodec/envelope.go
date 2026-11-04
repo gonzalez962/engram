@@ -83,7 +83,10 @@ func HasGzipMagic(payload []byte) bool {
 // EncodeCompressedEnvelope gzip-compresses a canonical JSON payload for transport.
 func EncodeCompressedEnvelope(payload []byte) ([]byte, error) {
 	var compressed bytes.Buffer
-	writer := gzip.NewWriter(&compressed)
+	writer, err := gzip.NewWriterLevel(&compressed, gzip.BestCompression)
+	if err != nil {
+		return nil, fmt.Errorf("init gzip writer: %w", err)
+	}
 	if _, err := writer.Write(payload); err != nil {
 		return nil, fmt.Errorf("compress payload: %w", err)
 	}
