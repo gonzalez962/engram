@@ -121,6 +121,63 @@ func TestFindCandidates_HappyPath(t *testing.T) {
 	}
 }
 
+func TestFindCandidatesValidatesStoredTitleLength(t *testing.T) {
+	s := setupRelationsStore(t)
+	_, _ = addTestObs(t, s, "candidate title", "decision", "testproject", "project")
+
+	atLimitID, _ := addTestObs(t, s, strings.Repeat("é", 32_768), "decision", "testproject", "project")
+	if _, err := s.FindCandidates(atLimitID, CandidateOptions{
+		Project:    "testproject",
+		Scope:      "project",
+		Query:      "candidate",
+		SkipInsert: true,
+	}); err != nil {
+		t.Fatalf("FindCandidates with a 65536-byte stored title: %v", err)
+	}
+
+	title := strings.Repeat("a", 65_537)
+	savedID, _ := addTestObs(t, s, title, "decision", "testproject", "project")
+	_, err := s.FindCandidates(savedID, CandidateOptions{
+		Project:    "testproject",
+		Scope:      "project",
+		SkipInsert: true,
+	})
+	if err == nil {
+		t.Fatal("FindCandidates with a 65537-byte stored title returned nil error")
+	}
+	if !errors.Is(err, ErrFTSQueryTooLarge) {
+		t.Fatalf("FindCandidates error = %v, want ErrFTSQueryTooLarge", err)
+	}
+	if got, want := err.Error(), "fts query too large: got 65537 bytes; maximum is 65536 bytes; shorten the query and retry"; got != want {
+		t.Fatalf("FindCandidates error = %q, want %q", got, want)
+	}
+}
+
+func TestFindCandidatesUsesEffectiveQueryForLengthValidation(t *testing.T) {
+	s := setupRelationsStore(t)
+	_, _ = addTestObs(t, s, "candidate title", "decision", "testproject", "project")
+
+	oversizedTitleID, _ := addTestObs(t, s, strings.Repeat("a", 65_537), "decision", "testproject", "project")
+	if _, err := s.FindCandidates(oversizedTitleID, CandidateOptions{
+		Project:    "testproject",
+		Scope:      "project",
+		Query:      "candidate",
+		SkipInsert: true,
+	}); err != nil {
+		t.Fatalf("FindCandidates with valid override query: %v", err)
+	}
+
+	_, err := s.FindCandidates(oversizedTitleID, CandidateOptions{
+		Project:    "testproject",
+		Scope:      "project",
+		Query:      strings.Repeat("b", 65_537),
+		SkipInsert: true,
+	})
+	if !errors.Is(err, ErrFTSQueryTooLarge) {
+		t.Fatalf("FindCandidates error = %v, want ErrFTSQueryTooLarge", err)
+	}
+}
+
 func TestFindCandidates_EscapesInteriorQuotes(t *testing.T) {
 	s := setupRelationsStore(t)
 	_, _ = addTestObs(t, s, `hello"world candidate`, "decision", "testproject", "project")
@@ -615,6 +672,60 @@ func TestJudgeRelation_OptionalFieldsNullWhenOmitted(t *testing.T) {
 	}
 	if judged.Evidence != nil {
 		t.Errorf("expected evidence=nil when not provided; got %v", judged.Evidence)
+	}
+}
+
+func TestJudgeRelation_PrivateExplanations(t *testing.T) {
+	for _, tc := range []struct{ name, input, want string }{
+		{"empty", "", ""},
+		{"public", "Public explanation", "Public explanation"},
+		{"private only", "<private>secret</private>", "[REDACTED]"},
+		{"mixed multiline", "Public <PRIVATE>secret\nvalue</PRIVATE> and <private>other</private> text", "Public [REDACTED] and [REDACTED] text"},
+		{"json evidence", `{"detail":"<private>secret</private>"}`, `{"detail":"[REDACTED]"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := setupEnrolledStore(t)
+			_, source := addEnrolledObs(t, s, "Source decision")
+			_, target := addEnrolledObs(t, s, "Target decision")
+			id := newSyncID("rel")
+			if _, err := s.SaveRelation(SaveRelationParams{SyncID: id, SourceID: source, TargetID: target}); err != nil {
+				t.Fatal(err)
+			}
+			input := tc.input
+			result, err := s.JudgeRelation(JudgeRelationParams{
+				JudgmentID: id, Relation: RelationRelated, Reason: &input, Evidence: &input,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check := func(label string, got *string) {
+				t.Helper()
+				if got == nil || *got != tc.want {
+					t.Errorf("%s: expected %q, got %v", label, tc.want, got)
+				}
+			}
+			check("response reason", result.Reason)
+			check("response evidence", result.Evidence)
+			var reason, evidence *string
+			if err := s.db.QueryRow(`SELECT reason, evidence FROM memory_relations WHERE sync_id = ?`, id).Scan(&reason, &evidence); err != nil {
+				t.Fatal(err)
+			}
+			check("stored reason", reason)
+			check("stored evidence", evidence)
+			var payload string
+			if err := s.db.QueryRow(`SELECT payload FROM sync_mutations WHERE entity = ? AND entity_key = ? ORDER BY seq DESC LIMIT 1`, SyncEntityRelation, id).Scan(&payload); err != nil {
+				t.Fatal(err)
+			}
+			var mutation syncRelationPayload
+			if err := decodeSyncPayload([]byte(payload), &mutation); err != nil {
+				t.Fatal(err)
+			}
+			check("sync reason", mutation.Reason)
+			check("sync evidence", mutation.Evidence)
+			if input != tc.input {
+				t.Error("JudgeRelation mutated caller-owned explanation")
+			}
+		})
 	}
 }
 

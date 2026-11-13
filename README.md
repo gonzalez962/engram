@@ -18,6 +18,12 @@
 </p>
 
 <p>
+<a href="https://trendshift.io/repositories/22750?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-22750" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/22750" alt="Gentleman-Programming%2Fengram | Trendshift" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/22750?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-22750" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/22750/weekly?language=Go" alt="Gentleman-Programming%2Fengram | Trendshift" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/22750?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-22750" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/22750/monthly?language=Go" alt="Gentleman-Programming%2Fengram | Trendshift" width="250" height="55"/></a>
+</p>
+
+<p>
 <a href="https://engram.gentlemanprogramming.com/"><strong>Website</strong></a> &bull;
 <a href="#get-started"><strong>Quickstart</strong></a> &bull;
 <a href="DOCS.md"><strong>Docs</strong></a> &bull;
@@ -79,6 +85,25 @@ Your AI coding agent forgets everything when the session ends.
 <strong><a href="docs/AGENT-SETUP.md#commandcode">CommandCode</a></strong>
 
 <sub>14 setup targets · plus any MCP-compatible agent · <a href="docs/AGENT-SETUP.md">per-agent setup →</a></sub>
+
+</div>
+
+<div align="center"><img src="assets/branding/engram-logo-only.png" width="28" alt="" /></div>
+
+## Support the project
+
+<div align="center">
+
+<a href="https://github.com/sponsors/Gentleman-Programming"><img width="100%" src="assets/branding/sponsor-banner.svg" alt="Free forever, independent by choice. No investors, no paywalls: Gentle AI, Engram and Gentle Shell are funded by the people who use them. Sponsor on GitHub, monthly or one-time."></a>
+
+<p>
+We deliberately don't depend on investors: no outside agenda deciding the roadmap and no features locked behind paywalls.<br/>
+Donations through <a href="https://github.com/sponsors/Gentleman-Programming"><strong>GitHub Sponsors</strong></a> go straight into maintenance, new features and keeping everything free and ours.
+</p>
+
+<p>Can't donate? A ⭐, a bug report or a pull request helps too.</p>
+
+<sub>Sponsorship never buys rankings, default selections or endorsements; see <a href="TRADEMARKS.md">TRADEMARKS.md</a>.</sub>
 
 </div>
 

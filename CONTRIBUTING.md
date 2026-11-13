@@ -58,7 +58,7 @@ Once the issue is approved:
 
 1. Fork the repo and create a branch from the canonical `main`
 2. Implement your change
-3. Open a PR using the PR template — **link the approved issue** with `Closes #N`
+3. Open a PR using the PR template — **link the approved issue** with `Closes #N` (or `Refs #N` for a partial PR that should not close the issue on merge)
 4. Add exactly **one `type:*` label** to the PR (see label system below)
 
 #### Forks and remotes
@@ -136,7 +136,7 @@ The active required contexts run automatically on every PR and merge queue group
 
 | Check | What it verifies |
 |-------|-----------------|
-| **Check Issue Reference** | PR body contains `Closes #N`, `Fixes #N`, or `Resolves #N` |
+| **Check Issue Reference** | PR body contains `Closes #N`, `Fixes #N`, `Resolves #N`, or `Refs #N` |
 | **Check Issue Has status:approved** | Every linked issue has `status:approved` and at least one assignee |
 | **Check PR Has type:* Label** | PR labels use the canonical vocabulary and cardinality |
 | **Unit Tests** | First runs non-mutating `go mod tidy -diff` with the release Go toolchain on PRs, merge groups and main pushes; runs `go test ./...` (except `//go:build e2e`) and `make deadcode-check` |
@@ -187,8 +187,9 @@ retirement stays blocked: fresh T4 probe consent and live evidence are required
 before rollout claims or retirement. See the
 [native-policy scope and rollout boundary](docs/ci-issue-native-policy.md).
 
-Closing references also support `Closes OWNER/REPO#N`, `Fixes OWNER/REPO#N`
-and `Resolves OWNER/REPO#N` for the current repository or
+Recognized references also support the qualified forms `Closes OWNER/REPO#N`,
+`Fixes OWNER/REPO#N`, `Resolves OWNER/REPO#N` and non-closing `Refs OWNER/REPO#N`
+for the current repository or
 `Gentleman-Programming/engram` (repository identity is case-insensitive).
 Every recognized reference must be approved and assigned in its own repository;
 a recognized reference to another repository rejects both issue checks before
@@ -202,7 +203,7 @@ All required checks must pass before a PR can be merged. Issue API errors fail c
 #### Unsupported runtime rejection
 
 `Unsupported Node Runtime Rejection` runs only the existing
-`TestArtifactCoreUnsupportedNode` under Node22 with Go1.26.10. Node24 remains the
+`TestArtifactCoreUnsupportedNode` under Node22 with Go1.26.11. Node24 remains the
 ordinary supported test runtime. The separate ten-minute lane verifies the
 actual major versions and requires a named executed pass and successful package
 completion via `prerequisite-coverage.mjs unsupported-node EVENTS.json GO_EXIT`.
@@ -224,7 +225,7 @@ App15368, or the queue. Its initial 30-minute outer ceiling is a new bounded
 observation policy, not the #2020 setup/wrapper budgets or a measured SLO;
 do not raise it to hide failures.
 
-The job checks Go 1.26.10, Node 24, PowerShell and Git for Windows Bash with
+The job checks Go 1.26.11, Node 24, PowerShell and Git for Windows Bash with
 jq/curl. It selects actual Git `usr/bin/bash.exe` (not the `bin` launcher),
 validates the absolute `jq.exe` selected from PATH, and exports the existing
 `CODEX_TEST_TRUSTED_BASH` / `CODEX_TEST_TRUSTED_JQ` fixture selectors before tests.
@@ -247,6 +248,13 @@ preserves exact Unicode readback assertions; system/PATH curl is not a substitut
 exit remains authoritative; successful JSON cannot mask it. The original native
 identity, job-object ownership and cleanup assertions remain unchanged. Wiring
 checks alone do not establish the new binary-backed native execution.
+
+The native Codex Windows test runners report command-context cancellation
+separately from ordinary child exit codes, retaining elapsed time and partial
+streams for PowerShell-file helper calls. The default command deadlines remain five
+seconds for manifest commands and eight seconds for PowerShell files. These
+diagnostics identify a canceled invocation; they do not explain why a hosted
+runner exceeded its deadline.
 
 JSON, stderr, suite exit code and elapsed seconds are retained in logs, with
 failure artifacts when available. Cancellation/outer timeout can leave partial
@@ -375,7 +383,7 @@ Hosted experiments require separate authorization.
 ### Native macOS baseline (initially non-required)
 
 The candidate **Native macOS ARM64 Tests** job runs the existing default-tag
-Go suite on `macos-15` ARM64 with Go 1.26.10 and Node 24. It checks native
+Go suite on `macos-15` ARM64 with Go 1.26.11 and Node 24. It checks native
 architecture and mandatory prerequisites (including the fixture's actual
 `/usr/bin/jq` path), uses isolated test state, preserves failure exits and
 reports JSON pass/fail/skip scope. The 20-minute job and 10-minute per-binary
@@ -387,7 +395,9 @@ then explicitly decide promotion, focused fix or defer.
 
 The separate **Native macOS ARM64 Adapter Tests** lane (#2150, Mac portion)
 reuses the serial Pi `npm test` script with CLI-only TAP reporting, locked TypeBox dependencies and the existing
-three-file OpenCode command with fresh Go-backed fixtures. Mandatory prerequisites
+three-file OpenCode command with fresh Go-backed fixtures. The Pi server and
+synthetic PATH runtime fixtures are prebuilt; the PATH selector is exported again
+after environment isolation so both runtime-negotiation tests execute. Mandatory prerequisites
 and unexpected skips fail completeness; only the installed-host opt-in exclusion
 is accepted. Its provisional ceilings are 15 minutes outer, 2 minutes fixture
 build and 5 minutes per adapter step. Source/fixture success is not installed-host,
@@ -397,10 +407,12 @@ artifact, Windows or release qualification. See [commands and finite rollout](do
 
 **Native Windows x64 Adapter Tests** adds one independent `windows-2022`
 PowerShell lane for #2150. It requires native Windows/x64 Node 24 and
-Windows/amd64 Go 1.26.10, a full checkout, contract JSON, and locked local
+Windows/amd64 Go 1.26.11, a full checkout, contract JSON, and locked local
 TypeBox 1.3.34 (`npm ci --ignore-scripts --legacy-peer-deps` in `plugin/pi`).
-It builds the existing Pi server as `$env:RUNNER_TEMP\pi-test-server.exe`;
-the existing prebuilt-server selector enables packaged positive workflows.
+It builds the existing Pi server as `$env:RUNNER_TEMP\pi-test-server.exe`
+and the synthetic PATH runtime fixture as `$env:RUNNER_TEMP\pi-test-path.exe`;
+both prebuilt selectors are exported again after environment isolation, so the
+packaged positive workflows and both runtime-negotiation tests execute.
 
 From `plugin/pi`, reuse the serial package script with CLI-only TAP:
 `node --test --test-reporter=tap --test-concurrency=1 test/*.test.mjs`.
@@ -446,7 +458,7 @@ These inspect workflow contracts; they do not execute the Go race suite.
 merge groups and main pushes. They preserve finding and tooling-failure exits;
 non-required does not mean failures are ignored. Existing required gates remain
 unchanged. See [scanner setup, real-tool tests and result interpretation](docs/ci-scanners.md)
-for pinned Go 1.26.10, govulncheck v1.7.0 and actionlint v1.7.12 commands.
+for pinned Go 1.26.11, govulncheck v1.7.0 and actionlint v1.7.12 commands.
 Mocked wrapper tests are distinct from opt-in real-tool integration tests; neither
 is hosted rollout evidence. Review findings without blanket suppressions or
 unapproved dependency upgrades.
@@ -455,6 +467,15 @@ unapproved dependency upgrades.
 
 The `main` merge queue is already active. Contributors submit eligible PRs to the
 queue; the six required contexts above also run on each merge group.
+
+Unit, E2E and Plugin run before the full Race, Windows and native macOS Go
+suites to give the required technical checks first access to runners. The latter
+jobs still run after failed or skipped prerequisites unless the run is cancelled;
+their results remain separate checks. This ordering applies to PR, merge-group
+and main events, so advisory feedback on PRs can arrive later. No suite, event,
+required context or job timeout is removed. Other jobs remain independent;
+runner availability can still delay required checks. Queue latency improvements
+must be measured on subsequent hosted executions, not inferred from this order.
 
 The effective queue rule was observed on **2026-10-09** with these settings:
 
@@ -807,6 +828,12 @@ The command is a dry run: it prints the canonical label list as JSON and never w
 The symlink cases in `TestCompatibilityOfflineNeverAuthorizes` and `TestMigrateCopyRejects` skip only when Windows returns `ERROR_PRIVILEGE_NOT_HELD` (1314). Other fixture errors still fail; hosts that support symlinks execute the original rejection assertions.
 
 ### Focused Verification Map
+
+The `cmd/engram` public CLI fixtures build the candidate once per package test
+process and remove that executable after the package finishes. Build inputs are
+captured before individual tests change their environment or working directory;
+each consumer still owns its runtime configuration, data and child processes.
+The executable is never reused across separate test invocations.
 
 Use the row that matches the change, not every row. These are existing entry points,
 not a new required local gate. Run commands from the listed directory; paths are

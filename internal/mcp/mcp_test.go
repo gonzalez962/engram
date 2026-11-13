@@ -711,6 +711,75 @@ func TestHandleSaveAcceptsObservationAliasForContent(t *testing.T) {
 	t.Fatalf("expected pending observation upsert sync mutation, got %#v", mutations)
 }
 
+// ─── Org grouping axis (#776) ────────────────────────────────────────────────
+
+func TestHandleSave_OrgInheritsFromConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".engram"), 0755); err != nil {
+		t.Fatalf("create config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".engram", "config.json"), []byte(`{"project_name":"engram","org":"acme-corp"}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Chdir(dir)
+
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Inherited org save",
+		"content": "This should inherit org from .engram/config.json",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 5)
+	if err != nil {
+		t.Fatalf("recent observations: %v", err)
+	}
+	if len(obs) != 1 || obs[0].Org == nil || *obs[0].Org != "acme-corp" {
+		t.Fatalf("expected org inherited from config, got %#v", obs)
+	}
+}
+
+func TestHandleSave_ExplicitOrgOverridesConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".engram"), 0755); err != nil {
+		t.Fatalf("create config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".engram", "config.json"), []byte(`{"project_name":"engram","org":"acme-corp"}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Chdir(dir)
+
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Explicit org save",
+		"content": "The org parameter should win over config",
+		"org":     "globex-inc",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 5)
+	if err != nil {
+		t.Fatalf("recent observations: %v", err)
+	}
+	if len(obs) != 1 || obs[0].Org == nil || *obs[0].Org != "globex-inc" {
+		t.Fatalf("expected explicit org to override config, got %#v", obs)
+	}
+}
+
 func TestHandleSaveRejectsMissingContent(t *testing.T) {
 	s := newMCPTestStore(t)
 	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
@@ -1945,6 +2014,59 @@ func TestHandleSearchOmitsEmptyPulledTopicKey(t *testing.T) {
 	}
 }
 
+func TestHandleSearch_FiltersByOrg(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("s-mcp", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-mcp",
+		Type:      "decision",
+		Title:     "Acme decision",
+		Content:   "acme grouping content",
+		Project:   "engram",
+		Scope:     "project",
+		Org:       "acme-corp",
+	}); err != nil {
+		t.Fatalf("add acme observation: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-mcp",
+		Type:      "decision",
+		Title:     "Globex decision",
+		Content:   "globex grouping content",
+		Project:   "engram",
+		Scope:     "project",
+		Org:       "globex-inc",
+	}); err != nil {
+		t.Fatalf("add globex observation: %v", err)
+	}
+
+	search := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+	res, err := search(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"query":   "grouping",
+		"project": "engram",
+		"org":     "acme-corp",
+		"limit":   5.0,
+	}}})
+	if err != nil {
+		t.Fatalf("search handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected search error: %s", callResultText(t, res))
+	}
+	body := callResultJSON(t, res)
+	results, ok := body["results"].([]any)
+	if !ok || len(results) != 1 {
+		t.Fatalf("expected exactly one org-filtered result, got %v", body["results"])
+	}
+	firstResult, _ := results[0].(map[string]any)
+	if firstResult["org"] != "acme-corp" {
+		t.Fatalf("expected result org=acme-corp, got %v", firstResult["org"])
+	}
+}
+
 func TestHandleSearch_PropagatesCanceledContext(t *testing.T) {
 	s := newMCPTestStore(t)
 	if err := s.CreateSession("s-canceled-search", "engram", "/tmp/engram"); err != nil {
@@ -2273,8 +2395,8 @@ func TestHandleContextPropagatesStatsError(t *testing.T) {
 	}
 	original := loadContextStats
 	t.Cleanup(func() { loadContextStats = original })
-	loadContextStats = func(*store.Store, string) (*store.Stats, error) {
-		return nil, store.ErrDatabaseGenerationChanged
+	loadContextStats = func(*store.Store, string) (*store.Stats, int, error) {
+		return nil, 0, store.ErrDatabaseGenerationChanged
 	}
 
 	result, err := handleContext(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"project": "engram"}}})
@@ -4085,6 +4207,73 @@ func TestHandleSessionSummaryCreatesProjectScopedSession(t *testing.T) {
 	assertSessionSyncMutationDirectory(t, s, "manual-save-summary-session-project", dir)
 }
 
+// TestHandleSessionSummary_OrgInheritsFromConfig is a regression test for
+// #776: unlike handleSave, handleSessionSummary never inherited org from
+// .engram/config.json, so session summaries saved in an org-scoped repo
+// silently carried no org and vanished from org-filtered views. There is no
+// explicit "org" argument on mem_session_summary, so config inheritance is
+// the only source.
+func TestHandleSessionSummary_OrgInheritsFromConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".engram"), 0755); err != nil {
+		t.Fatalf("create config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".engram", "config.json"), []byte(`{"project_name":"engram","org":"acme-corp"}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Chdir(dir)
+
+	s := newMCPTestStore(t)
+	h := handleSessionSummary(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"content": "## Goal\nInherit org from config",
+	}}})
+	if err != nil || res.IsError {
+		t.Fatalf("session summary: err=%v isError=%v text=%s", err, res.IsError, callResultText(t, res))
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 5)
+	if err != nil {
+		t.Fatalf("recent observations: %v", err)
+	}
+	if len(obs) != 1 || obs[0].Org == nil || *obs[0].Org != "acme-corp" {
+		t.Fatalf("expected org inherited from config, got %#v", obs)
+	}
+}
+
+// TestHandleSessionSummary_NoConfigLeavesOrgNil covers the counterpart: a
+// repo with no .engram/config.json (or none with an org field) must save the
+// summary with a nil org, not an empty-string placeholder.
+func TestHandleSessionSummary_NoConfigLeavesOrgNil(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	cmd := exec.Command("git", "-C", dir, "remote", "add", "origin",
+		"git@github.com:user/summary-no-org.git")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	t.Chdir(dir)
+
+	s := newMCPTestStore(t)
+	h := handleSessionSummary(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"content": "## Goal\nNo org configured",
+	}}})
+	if err != nil || res.IsError {
+		t.Fatalf("session summary: err=%v isError=%v text=%s", err, res.IsError, callResultText(t, res))
+	}
+
+	obs, err := s.RecentObservations("summary-no-org", "project", 5)
+	if err != nil {
+		t.Fatalf("recent observations: %v", err)
+	}
+	if len(obs) != 1 || obs[0].Org != nil {
+		t.Fatalf("expected nil org without config, got %#v", obs)
+	}
+}
+
 func TestHandleSessionSummarySkipsConflictCandidates(t *testing.T) {
 	s := newMCPTestStore(t)
 	for _, sessionID := range []string{"summary-candidates-1", "summary-candidates-2"} {
@@ -4435,6 +4624,14 @@ func TestHandleSaveNoSimilarWarningWhenProjectExists(t *testing.T) {
 		"content": "Memory content",
 	}}})
 
+	previousList := listSaveProjectNames
+	enumerations := 0
+	listSaveProjectNames = func(st *store.Store) ([]string, error) {
+		enumerations++
+		return previousList(st)
+	}
+	t.Cleanup(func() { listSaveProjectNames = previousList })
+
 	req2 := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"title":   "Second memory",
 		"content": "Another memory content",
@@ -4448,6 +4645,9 @@ func TestHandleSaveNoSimilarWarningWhenProjectExists(t *testing.T) {
 	if strings.Contains(text, "Similar project") {
 		t.Fatalf("unexpected similar project warning on existing project, got %q", text)
 	}
+	if enumerations != 0 {
+		t.Errorf("established project save enumerated all project names %d times, want zero", enumerations)
+	}
 }
 
 func TestHandleMergeProjectsExplicitSeparatorAndNoop(t *testing.T) {
@@ -4458,6 +4658,9 @@ func TestHandleMergeProjectsExplicitSeparatorAndNoop(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	if _, err := db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('explicit-session', 'foo-bar', '')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('space-session', 'foo bar', '')`); err != nil {
 		t.Fatal(err)
 	}
 	h := handleMergeProjects(s)
@@ -4471,6 +4674,16 @@ func TestHandleMergeProjectsExplicitSeparatorAndNoop(t *testing.T) {
 	}
 	if text := call("foo-bar"); !strings.Contains(text, `into "foo_bar"`) {
 		t.Fatalf("wrong destination: %q", text)
+	}
+	var source string
+	if err := db.QueryRow(`SELECT project FROM sessions WHERE id = 'space-session'`).Scan(&source); err != nil || source != "foo bar" {
+		t.Fatalf("merge rewrote an unnamed source: %q, %v", source, err)
+	}
+	if text := call("foo bar"); !strings.Contains(text, `into "foo_bar"`) {
+		t.Fatalf("space variant destination: %q", text)
+	}
+	if err := db.QueryRow(`SELECT project FROM sessions WHERE id = 'space-session'`).Scan(&source); err != nil || source != "foo_bar" {
+		t.Fatalf("space source was not merged: %q, %v", source, err)
 	}
 	if text := call("foo_bar"); !strings.Contains(text, "No records moved") {
 		t.Fatalf("ambiguous no-op: %q", text)
@@ -6453,26 +6666,37 @@ func TestAmbiguousRecoveryConcurrentSameChoiceBootstrap(t *testing.T) {
 }
 
 func TestAmbiguousRecoveryReadHintKeepsSameReadTool(t *testing.T) {
-	parent := t.TempDir()
-	for _, name := range []string{"read-a", "read-b"} {
-		child := filepath.Join(parent, name)
-		if err := os.MkdirAll(child, 0o755); err != nil {
+	// This tests recovery formatting, not whether the bounded child scan
+	// finishes under CI load. Detector integration has separate coverage.
+	res := project.DetectionResult{
+		Source:            project.SourceAmbiguous,
+		Path:              t.TempDir(),
+		Error:             project.ErrAmbiguousProject,
+		AvailableProjects: []string{"read-a", "read-b"},
+	}
+	for _, name := range res.AvailableProjects {
+		if err := os.MkdirAll(filepath.Join(res.Path, name, ".git"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		initTestGitRepo(t, child)
 	}
-	t.Chdir(parent)
-	res, err := resolveWriteProject(newMCPTestStore(t))
-	if !errors.Is(err, project.ErrAmbiguousProject) {
-		t.Fatalf("expected ambiguity, got %v", err)
-	}
-	body := callResultJSON(t, readProjectErrorResult(NewSessionActivity(time.Minute), res, err))
+	activity := NewSessionActivity(time.Minute)
+	body := callResultJSON(t, readProjectErrorResult(activity, res, res.Error))
 	hint, ok := body["hint"].(string)
 	if !ok || !strings.Contains(hint, "retry the same read tool") || strings.Contains(hint, "mem_save") {
 		t.Fatalf("incorrect read guidance: %v", body)
 	}
 	if body["error_code"] != "ambiguous_project" || body["recovery_token"] == nil || body["project_source"] != "ambiguous" {
 		t.Fatalf("missing compatible structured ambiguity: %v", body)
+	}
+	token, ok := body["recovery_token"].(string)
+	if !ok || token == "" {
+		t.Fatalf("missing usable recovery token: %v", body)
+	}
+	if !activity.ValidateAmbiguousProjectRecoveryToken(defaultSessionID(""), token, "read-a", res.AvailableProjects, res.Path) {
+		t.Fatal("issued recovery token did not validate for its candidate and context")
+	}
+	if !reflect.DeepEqual(body["available_projects"], []any{"read-a", "read-b"}) || body["project_path"] != res.Path {
+		t.Fatalf("lost ambiguity context: %v", body)
 	}
 }
 
@@ -7677,6 +7901,94 @@ func TestMemCurrentProject_NormalResult(t *testing.T) {
 	}
 	if !strings.Contains(text, "project_path") {
 		t.Errorf("expected project_path in response, got: %q", text)
+	}
+}
+
+// TestMemCurrentProject_IncludesOrgWhenConfigured verifies the "org" field
+// (#776) surfaces in mem_current_project's response when .engram/config.json
+// sets one, and is omitted when it doesn't (single-context users see no change).
+func TestMemCurrentProject_IncludesOrgWhenConfigured(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".engram"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".engram", "config.json"), []byte(`{"project_name":"acme-app","org":"acme-corp"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	s := newMCPTestStore(t)
+	h := handleCurrentProject(s, MCPConfig{})
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+	body := callResultJSON(t, res)
+	if body["org"] != "acme-corp" {
+		t.Fatalf("expected org=acme-corp in response, got %v", body["org"])
+	}
+}
+
+func TestMemCurrentProject_OmitsOrgWhenNotConfigured(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	t.Chdir(dir)
+
+	s := newMCPTestStore(t)
+	h := handleCurrentProject(s, MCPConfig{})
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+	body := callResultJSON(t, res)
+	if _, present := body["org"]; present {
+		t.Fatalf("expected org to be omitted when not configured, got %v", body["org"])
+	}
+}
+
+// TestMemCurrentProject_PreservesOrgUnderProcessOverride is a regression test
+// for #776: a process-level override (ENGRAM_PROJECT / mcp --project) only
+// resolves Project/Source/Path and never reads .engram/config.json, so it
+// used to fully replace the cwd-detected DetectionResult and silently drop
+// the org label. The override still wins for project identity; org must
+// survive.
+func TestMemCurrentProject_PreservesOrgUnderProcessOverride(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".engram"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".engram", "config.json"), []byte(`{"project_name":"acme-app","org":"acme-corp"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	s := newMCPTestStore(t)
+	h := handleCurrentProject(s, MCPConfig{DefaultProject: "Trusted Project"})
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+	body := callResultJSON(t, res)
+	if body["project"] != "trusted project" {
+		t.Fatalf("expected the process override to win project identity, got %v", body["project"])
+	}
+	if body["project_source"] != sourceProcessOverride {
+		t.Fatalf("project_source = %v, want %s", body["project_source"], sourceProcessOverride)
+	}
+	if body["org"] != "acme-corp" {
+		t.Fatalf("expected org=acme-corp to survive the process override, got %v", body["org"])
 	}
 }
 
@@ -11421,6 +11733,66 @@ func TestMemListProjects_ReturnsProjectsWithStats(t *testing.T) {
 	}
 }
 
+// TestMemListProjects_FiltersByOrg: mem_list_projects must honor an optional
+// "org" argument the same way `engram projects list --org` does, scoping the
+// listing to projects with at least one observation tagged with that org
+// (engram#776).
+func TestMemListProjects_FiltersByOrg(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.CreateSession("sess-acme", "acme-project", "/tmp/acme"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := s.CreateSession("sess-globex", "globex-project", "/tmp/globex"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-acme",
+		Type:      "decision",
+		Title:     "Acme decision",
+		Content:   "acme content",
+		Project:   "acme-project",
+		Scope:     "project",
+		Org:       "acme-corp",
+	}); err != nil {
+		t.Fatalf("add acme observation: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-globex",
+		Type:      "decision",
+		Title:     "Globex decision",
+		Content:   "globex content",
+		Project:   "globex-project",
+		Scope:     "project",
+		Org:       "globex-inc",
+	}); err != nil {
+		t.Fatalf("add globex observation: %v", err)
+	}
+
+	h := handleListProjects(s)
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"org": "acme-corp",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+
+	var envelope struct {
+		Count    int `json:"count"`
+		Projects []struct {
+			Name string `json:"name"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal([]byte(callResultText(t, res)), &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if envelope.Count != 1 || len(envelope.Projects) != 1 || envelope.Projects[0].Name != "acme-project" {
+		t.Fatalf("expected only acme-project when filtering by org=acme-corp, got %#v", envelope)
+	}
+}
+
 // TestMemListProjects_StoreErrorIsToolError: a store-query failure must
 // surface as a tool error, not as a success envelope with stale data — the
 // agent has to know discovery failed instead of trusting an empty answer.
@@ -11741,5 +12113,31 @@ func TestHandleUpdateGlobalScope(t *testing.T) {
 	}
 	if obs.Scope != "global" {
 		t.Fatalf("expected Scope=global after update, got %q", obs.Scope)
+	}
+}
+
+func TestHandleSave_TrimsExplicitOrgWhitespace(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
+
+	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"title":   "Padded org save",
+		"content": "Whitespace around org must not create a distinct organization",
+		"project": "engram",
+		"org":     "  globex-inc  ",
+	}}})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected save error: %s", callResultText(t, res))
+	}
+
+	obs, err := s.RecentObservations("engram", "project", 5)
+	if err != nil {
+		t.Fatalf("recent observations: %v", err)
+	}
+	if len(obs) != 1 || obs[0].Org == nil || *obs[0].Org != "globex-inc" {
+		t.Fatalf("expected padded org to be trimmed to globex-inc, got %#v", obs)
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -36,9 +36,12 @@ func TestGenerationInvalidationRequestsOneShutdown(t *testing.T) {
 			if !ok {
 				t.Fatal("server lacks generation shutdown notification")
 			}
-			oldObserved, oldStats := observedGenerationError, loadServerStats
-			t.Cleanup(func() { observedGenerationError, loadServerStats = oldObserved, oldStats })
+			oldObserved, oldStats, oldReadiness := observedGenerationError, loadServerStats, checkServerReadiness
+			t.Cleanup(func() {
+				observedGenerationError, loadServerStats, checkServerReadiness = oldObserved, oldStats, oldReadiness
+			})
 			observedGenerationError = func(*store.Store) error { return store.ErrDatabaseGenerationChanged }
+			checkServerReadiness = func(*store.Store) error { return store.ErrDatabaseGenerationChanged }
 			loadServerStats = func(*store.Store) (*store.Stats, error) { return nil, store.ErrDatabaseGenerationChanged }
 			var requests sync.WaitGroup
 			for i := 0; i < 32; i++ {
@@ -78,9 +81,9 @@ func TestTransientHealthFailureDoesNotRequestShutdown(t *testing.T) {
 	if !ok {
 		t.Fatal("server lacks generation shutdown notification")
 	}
-	old := loadServerStats
-	t.Cleanup(func() { loadServerStats = old })
-	loadServerStats = func(*store.Store) (*store.Stats, error) { return nil, errors.New("transient") }
+	old := checkServerReadiness
+	t.Cleanup(func() { checkServerReadiness = old })
+	checkServerReadiness = func(*store.Store) error { return errors.New("transient") }
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
 	if rec.Code != 500 || strings.Contains(rec.Body.String(), "transient") {
@@ -91,11 +94,41 @@ func TestTransientHealthFailureDoesNotRequestShutdown(t *testing.T) {
 		t.Fatal("transient failure notified shutdown")
 	default:
 	}
-	loadServerStats = old
+	checkServerReadiness = old
 	rec = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
 	if rec.Code != 200 {
 		t.Fatalf("recovery = %d", rec.Code)
+	}
+}
+
+// TestHealthReportsDaemonToken pins the daemon identity surface: a server
+// configured with a daemon start token reports it on GET /health, and a
+// non-daemon server omits the field entirely.
+func TestHealthReportsDaemonToken(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	srv.SetDaemonToken("tok-123")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		DaemonToken string `json:"daemon_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode health body: %v", err)
+	}
+	if body.DaemonToken != "tok-123" {
+		t.Fatalf("daemon_token = %q, want tok-123", body.DaemonToken)
+	}
+
+	plain := New(st, 0)
+	plainRec := httptest.NewRecorder()
+	plain.Handler().ServeHTTP(plainRec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if strings.Contains(plainRec.Body.String(), "daemon_token") {
+		t.Fatalf("non-daemon health body reports daemon_token: %s", plainRec.Body.String())
 	}
 }
 
@@ -486,7 +519,7 @@ func TestInstanceIDIsStableDistinctAndAtomic(t *testing.T) {
 	}
 }
 
-func TestStartAcceptsOnlySameInstanceBindLoser(t *testing.T) {
+func TestStartRejectsSameInstanceBindLoser(t *testing.T) {
 	owner := newServerTestStore(t)
 	winner := New(owner, 0)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -496,16 +529,12 @@ func TestStartAcceptsOnlySameInstanceBindLoser(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	go func() { _ = http.Serve(ln, winner.Handler()) }()
 	t.Cleanup(func() { _ = ln.Close() })
-	var output bytes.Buffer
-	originalWriter := log.Writer()
-	log.SetOutput(&output)
-	t.Cleanup(func() { log.SetOutput(originalWriter) })
-	if err := New(owner, port).Start(); err != nil {
-		t.Fatalf("same-instance bind loser: %v", err)
+	err = New(owner, port).Start()
+	if !errors.Is(err, ErrPortOwned) {
+		t.Fatalf("same-instance bind loser: %v, want ErrPortOwned", err)
 	}
-	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
-	if len(lines) != 1 || !strings.Contains(lines[0], "did not bind") || !strings.Contains(lines[0], "an existing instance owns the port") || !strings.Contains(lines[0], fmt.Sprintf("127.0.0.1:%d", port)) {
-		t.Fatalf("same-instance diagnostic = %q, want one actionable line", output.String())
+	if !strings.Contains(err.Error(), "an existing instance owns the port") || !strings.Contains(err.Error(), fmt.Sprintf("127.0.0.1:%d", port)) {
+		t.Fatalf("same-instance diagnostic = %q, want ownership message with listen address", err.Error())
 	}
 	foreign := newServerTestStore(t)
 	if err := New(foreign, port).Start(); err == nil || !strings.Contains(err.Error(), "different or legacy") {
@@ -1434,6 +1463,82 @@ func TestHandleSearchForwardsMatchModeAndAllProjects(t *testing.T) {
 	allProjectTitles := titles(allProjectResults)
 	if len(allProjectResults) != 2 || !allProjectTitles["Aurora project note"] || !allProjectTitles["Nebula project note"] {
 		t.Fatalf("expected explicit all_projects=true to return both project notes, got %#v", allProjectResults)
+	}
+}
+
+func TestSearchEndpointsRejectOversizedFTSQueries(t *testing.T) {
+	srv := New(newServerTestStore(t), 0)
+	query := strings.Repeat("a", 65_537)
+	want := "fts query too large: got 65537 bytes; maximum is 65536 bytes; shorten the query and retry"
+
+	for _, path := range []string{"/search", "/prompts/search"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path+"?q="+url.QueryEscape(query), nil)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+			}
+			var response map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if got := response["error"]; got != want {
+				t.Fatalf("error = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestSearchEndpointsReturnInternalErrorForStoreFailure(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	srv := New(st, 0)
+
+	for _, path := range []string{"/search?q=x", "/search?q=x&response_format=compact", "/prompts/search?q=x"} {
+		t.Run(path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
+			}
+			var response map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response["error"] == "" {
+				t.Fatalf("internal store error response missing error: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestSearchEndpointsRejectTooManyShortFTSTerms(t *testing.T) {
+	srv := New(newServerTestStore(t), 0)
+	query := strings.TrimSpace(strings.Repeat("x ", 769))
+	want := "fts query too large: got 769 terms; maximum is 768 terms for short-term search; shorten the query and retry"
+
+	for _, path := range []string{"/search", "/prompts/search"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path+"?q="+url.QueryEscape(query), nil)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+			}
+			var response map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if got := response["error"]; got != want {
+				t.Fatalf("error = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -4657,6 +4762,99 @@ func TestListProjectsEndpoint(t *testing.T) {
 	}
 	if body.Projects[0].ObservationCount != 1 {
 		t.Fatalf("expected 1 observation for alpha, got %d", body.Projects[0].ObservationCount)
+	}
+}
+
+func TestListProjectsEndpointOrgFilter(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.CreateSession("s-1", "alpha", t.TempDir()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := st.CreateSession("s-2", "beta", t.TempDir()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := st.AddObservation(store.AddObservationParams{SessionID: "s-1", Type: "note", Title: "alpha note", Content: "content", Project: "alpha", Org: "acme"}); err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+	if _, err := st.AddObservation(store.AddObservationParams{SessionID: "s-2", Type: "note", Title: "beta note", Content: "content", Project: "beta", Org: "globex"}); err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/projects?org=acme", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /projects?org=acme = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Projects []store.ProjectStats `json:"projects"`
+		Count    int                  `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode /projects response: %v", err)
+	}
+	if body.Count != 1 || len(body.Projects) != 1 {
+		t.Fatalf("expected 1 project for org acme, got count=%d projects=%d", body.Count, len(body.Projects))
+	}
+	if body.Projects[0].Name != "alpha" {
+		t.Fatalf("expected project alpha for org acme, got %q", body.Projects[0].Name)
+	}
+}
+
+func TestSearchEndpointOrgFilter(t *testing.T) {
+	st := newServerTestStore(t)
+	if err := st.CreateSession("s-1", "alpha", t.TempDir()); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	for _, p := range []store.AddObservationParams{
+		{SessionID: "s-1", Type: "note", Title: "acme aurora", Content: "aurora content", Project: "alpha", Org: "acme"},
+		{SessionID: "s-1", Type: "note", Title: "globex aurora", Content: "aurora content", Project: "alpha", Org: "globex"},
+		{SessionID: "s-1", Type: "note", Title: "unset aurora", Content: "aurora content", Project: "alpha"},
+	} {
+		if _, err := st.AddObservation(p); err != nil {
+			t.Fatalf("AddObservation: %v", err)
+		}
+	}
+
+	h := New(st, 0).Handler()
+	search := func(path string) []string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d: %s", path, rec.Code, rec.Body.String())
+		}
+		var results []store.SearchResult
+		if err := json.Unmarshal(rec.Body.Bytes(), &results); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+		titles := make([]string, 0, len(results))
+		for _, r := range results {
+			titles = append(titles, r.Title)
+		}
+		sort.Strings(titles)
+		return titles
+	}
+
+	tests := []struct {
+		name string
+		path string
+		want []string
+	}{
+		{name: "org filters results", path: "/search?q=aurora&project=alpha&org=acme", want: []string{"acme aurora"}},
+		{name: "org is trimmed", path: "/search?q=aurora&project=alpha&org=%20globex%20", want: []string{"globex aurora"}},
+		{name: "omitted org is unfiltered", path: "/search?q=aurora&project=alpha", want: []string{"acme aurora", "globex aurora", "unset aurora"}},
+		{name: "blank org is unfiltered", path: "/search?q=aurora&project=alpha&org=%20%20", want: []string{"acme aurora", "globex aurora", "unset aurora"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := search(tt.path); !slices.Equal(got, tt.want) {
+				t.Fatalf("GET %s titles = %v, want %v", tt.path, got, tt.want)
+			}
+		})
 	}
 }
 

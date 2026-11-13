@@ -7,9 +7,9 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer as createHTTPServer, get } from "node:http";
 import { createServer } from "node:net";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { test } from "node:test";
 import { PLUGIN_ROOT as ROOT, RUNTIME_STUB_MARKER, createPluginSandbox, importPluginFromSandbox } from "./plugin-sandbox.mjs";
 
@@ -48,11 +48,12 @@ if (process.argv[1]!==__filename && invocationArgs[0]==='serve') process.once('u
  throw error;
 });
 const server=createServer(async(req,res)=>{
- log({path:req.url,authorized:req.headers.authorization==='Bearer '+process.env.ENGRAM_TOKEN});
+ log({path:req.url,method:req.method,authorized:req.headers.authorization==='Bearer '+process.env.ENGRAM_TOKEN});
+ if(req.headers.authorization!=='Bearer '+process.env.ENGRAM_TOKEN){res.writeHead(401);res.end('{}');return;}
  let body='';for await(const c of req)body+=c;
  if(req.url==='/observations'){req.socket.destroy();return;}
  res.setHeader('content-type','application/json');
- if(req.url==='/runtime-contract'){res.end(${JSON.stringify(JSON.stringify(fixtureContract()))});return;}
+ if(req.url==='/runtime-contract'){res.end(${JSON.stringify(JSON.stringify({ ...fixtureContract(), ...(options.contractIdentity ? { instance_id: options.contractIdentity } : {}) }))});return;}
  res.end(JSON.stringify(req.url.startsWith('/project/current')?{project:'owned-project'}:req.url==='/sessions'?{id:JSON.parse(body).id,status:'created'}:req.url.startsWith('/observations/save-result')?{id:1,status:'committed'}:{}));
 });
 server.listen(0,'127.0.0.1',()=>{
@@ -138,9 +139,26 @@ test("owned child authenticates every path and reload closes transport without e
   assert.equal(before[0].tokenShape,true);
   assert.ok(before.some(e=>e.path?.startsWith('/observations/save-result')));
   assert.ok(before.filter(e=>e.path).every(e=>e.authorized));
+  assert.equal(tools.size,23);
+  const contractIndex = before.findIndex(e=>e.path==='/runtime-contract');
+  assert.ok(contractIndex >= 0, 'owned startup must request runtime qualification');
+  assert.ok(before.findIndex(e=>e.method==='POST') > contractIndex);
   await hooks.get('session_shutdown')({reason:'reload'},ctx);
   const after=await events();assert.ok(after.some(e=>e.eof));assert.ok(!after.some(e=>e.path?.endsWith('/end')));
  });
+});
+
+test("owned rejects authenticated metadata with a different private instance", async () => {
+  await withOwnedFixture({ contractIdentity: "f".repeat(32) }, async ({ hooks, ctx, tools, events, statuses }) => {
+    await hooks.get("session_start")({}, ctx);
+    const result = await tools.get("mem_save").execute("foreign-contract", { title: "Blocked", content: "Must not persist" }, undefined, undefined, ctx);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /contract identity does not match/);
+    assert.equal(statuses.some(value => value?.includes("ready")), false);
+    const records = await events();
+    assert.ok(records.some(record => record.path === "/runtime-contract" && record.authorized));
+    assert.equal(records.some(record => record.method === "POST"), false);
+  });
 });
 
 test("owned resources close even with missing session identity and preserve other hosted roots",async()=>{
@@ -222,11 +240,11 @@ function freePort() {
   });
 }
 
-// A fake `engram serve` that logs every invocation, then either dies before readiness or
-// starts answering /health after `readyAfterMs` — the slow-health window under test.
+// A fake Engram CLI that logs every invocation. Its shared server either dies before
+// readiness or answers /health after `readyAfterMs`; `daemon` models `run -d` support.
 // `instanceId: "fail"` models a pre-rc.11 binary whose `instance-id` command exits 1, and
 // `cliVersion` gives the `version` probe something to report.
-async function writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs, exitCode, instanceId = "ok", cliVersion }) {
+async function writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs, exitCode, instanceId = "ok", cliVersion, daemon = false }) {
   const binPath = join(dir, "fake-engram.cjs");
   const instanceIdHandler = instanceId === "fail"
     ? `if (command === "instance-id" || command === resolve("instance-id")) { process.stderr.write("Error: unknown command \\"instance-id\\" for \\"engram\\"\\n"); process.exit(1); }`
@@ -235,22 +253,31 @@ async function writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs, exitCode,
     ? ""
     : `if (command === "version" || command === resolve("version")) { process.stdout.write(${JSON.stringify(cliVersion)} + "\\n"); process.exit(0); }`;
   const script = `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
 const { appendFileSync } = require("node:fs");
 const { createServer } = require("node:http");
 const { resolve } = require("node:path");
 
 // A preloaded fake sees the synthetic command in argv[1], not its own script path.
 const invocationArgs = process.argv.slice(process.argv[1] === __filename ? 2 : 1);
-const syntheticCommand = ["instance-id", "version", "serve", "sync"]
+const syntheticCommand = ["instance-id", "version", "run", "serve", "sync"]
   .find((name) => invocationArgs[0] === resolve(name));
 if (syntheticCommand) invocationArgs[0] = syntheticCommand;
 appendFileSync(${JSON.stringify(spawnLog)}, "invoke=" + JSON.stringify(invocationArgs) + "\\n");
 const syntheticServePath = resolve("serve");
-const command = process.argv.at(-1); const isSyntheticServe = command === "serve" || command === syntheticServePath; ${instanceIdHandler} ${versionHandler}
+const command = invocationArgs[0]; const isSyntheticServe = command === "serve" || command === syntheticServePath; ${instanceIdHandler} ${versionHandler}
+if (command === "run" && invocationArgs[1] === "-d") {
+  if (!${daemon}) process.exit(1);
+  const child = spawn(process.execPath, [__filename, "serve"], {
+    detached: true, stdio: "ignore", env: { ...process.env, NODE_OPTIONS: "", ENGRAM_FAKE_DAEMON_CHILD: "1" },
+  });
+  child.unref();
+  setTimeout(() => process.exit(0), ${readyAfterMs} + 100);
+}
 if (process.argv.includes("sync") || process.argv.includes("--import")) { appendFileSync(${JSON.stringify(spawnLog)}, "sync --import\\n"); process.exit(0); }
 const isServe = process.argv[2] === "serve" || isSyntheticServe;
 if (isServe) {
-  appendFileSync(${JSON.stringify(spawnLog)}, "serve\\n");
+  appendFileSync(${JSON.stringify(spawnLog)}, process.env.ENGRAM_FAKE_DAEMON_CHILD === "1" ? "daemon-server\\n" : "serve\\n");
   appendFileSync(${JSON.stringify(spawnLog)}, "autosync=" + (process.env.ENGRAM_CLOUD_AUTOSYNC ?? "<unset>") + "\\n");
   ${exitCode === undefined
       ? `const server = createServer(async (req, res) => {
@@ -300,6 +327,84 @@ setTimeout(() => {
     : { engramBin: binPath };
 }
 
+// Never build implicitly: phase B supplies a separately built stdlib fixture.
+const pathBinary = process.env.ENGRAM_PI_TEST_PATH_BINARY;
+for (const mismatch of [false, true]) {
+  test(`public PATH runtime negotiation (mismatch=${mismatch})`, {
+    skip: pathBinary === undefined ? "requires ENGRAM_PI_TEST_PATH_BINARY (prebuilt synthetic fixture)" : false,
+  }, async () => {
+    assert.ok(pathBinary?.trim(), "configured PATH fixture binary must not be blank");
+    const sourceBinary = resolve(pathBinary);
+    const dir = await mkdtemp(join(tmpdir(), "engram-pi-path-"));
+    const saved = { ...process.env };
+    let plugin, port;
+    const stop = async () => {
+      if (!port) return;
+      try { await fetch(`http://127.0.0.1:${port}/fixture-stop`, { signal: AbortSignal.timeout(500) }); } catch { /* Not started/already stopped. */ }
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        try { await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(200) }); }
+        catch { return; }
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.fail("synthetic PATH fixture did not stop");
+    };
+    try {
+      for (const key of Object.keys(process.env)) if (key.startsWith("ENGRAM_") || key.startsWith("GENTLE_")) delete process.env[key];
+      delete process.env.NODE_OPTIONS;
+      const binary = join(dir, process.platform === "win32" ? "engram.exe" : "engram");
+      await copyFile(sourceBinary, binary);
+      await chmod(binary, 0o755);
+      process.env.PATH = `${dir}${delimiter}${saved.PATH ?? ""}`;
+      port = await freePort();
+      process.env.ENGRAM_DATA_DIR = join(dir, "store");
+      process.env.ENGRAM_PATH_TEST_LOG = join(dir, "events.jsonl");
+      process.env.ENGRAM_PATH_TEST_CONTRACT = join(dir, "contract.json");
+      await writeFile(process.env.ENGRAM_PATH_TEST_CONTRACT, JSON.stringify({ ...fixtureContract(), ...(mismatch ? { digest: "0".repeat(64) } : {}) }));
+      plugin = await loadPlugin({ port, cwd: dir, sandbox: await createPluginSandbox(dir) });
+      assert.equal(process.env.ENGRAM_BIN, undefined, "actual PATH lookup, not an explicit binary");
+      assert.equal(process.env.ENGRAM_URL, undefined);
+      assert.equal(plugin.tools.size, 23);
+      await plugin.hooks.get("session_start")({}, plugin.ctx);
+      const result = await plugin.tools.get("mem_save").execute("path-save", { title: "PATH", content: "Synthetic transport", project: "path-project" }, undefined, undefined, plugin.ctx);
+      const records = () => readFile(process.env.ENGRAM_PATH_TEST_LOG, "utf8").then(text => text.trim().split("\n").map(JSON.parse));
+      const initial = await records();
+      // The synthetic PATH binary has no daemon lifecycle: `run -d` is probed
+      // first and startup falls back to the legacy `serve`.
+      assert.deepEqual(initial.filter(record => record.args).map(record => record.args), [["instance-id"], ["run", "-d"], ["serve"]]);
+      assert.ok(initial.some(record => record.path === "/runtime-contract"));
+      if (mismatch) {
+        assert.equal(result.isError, true);
+        assert.match(result.content[0].text, /runtime contract.*Upgrade/);
+        assert.equal(initial.some(record => record.method === "POST"), false);
+        assert.equal(plugin.statusCalls.some(([, value]) => value.includes("ready")), false);
+      } else {
+        assert.notEqual(result.isError, true, JSON.stringify(result));
+        assert.ok(plugin.statusCalls.some(([, value]) => value.includes("path-project · ready")));
+        assert.ok(initial.findIndex(record => record.method === "POST") > initial.findIndex(record => record.path === "/runtime-contract"));
+        assert.ok(initial.some(record => record.path === "/observations" && record.method === "POST"));
+        await stop();
+        const call = id => plugin.tools.get("mem_context").execute(id, {}, undefined, undefined, plugin.ctx);
+        for (const recovered of await Promise.all([call("recovery-a"), call("recovery-b")])) assert.notEqual(recovered.isError, true, JSON.stringify(recovered));
+        const after = await records();
+        assert.equal(after.filter(record => record.args?.[0] === "serve").length, 2, "concurrent refused probes authorize one restart");
+        const restart = after.findLastIndex(record => record.args?.[0] === "serve");
+        const recoveredRecords = after.slice(restart);
+        const contractIndex = recoveredRecords.findIndex(record => record.path === "/runtime-contract");
+        assert.ok(contractIndex >= 0, "recovery must request runtime qualification");
+        assert.ok(recoveredRecords.findIndex(record => record.path === "/context") > contractIndex);
+      }
+    } finally {
+      try { if (plugin) await plugin.hooks.get("session_shutdown")?.({ reason: "reload" }, plugin.ctx); await stop(); }
+      finally {
+        for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+        Object.assign(process.env, saved);
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+}
+
 test("fake CLI logs logical argv for direct and preload launches", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "engram-pi-cli argv fixture-"));
   try {
@@ -343,7 +448,8 @@ test("fake CLI logs logical argv for direct and preload launches", async (t) => 
 async function loadPlugin({ engramBin, port, cwd, sandbox, explicitUrl }) {
   if (explicitUrl) process.env.ENGRAM_URL = `http://127.0.0.1:${port}`;
   else delete process.env.ENGRAM_URL;
-  process.env.ENGRAM_BIN = engramBin;
+  if (engramBin === undefined) delete process.env.ENGRAM_BIN;
+  else process.env.ENGRAM_BIN = engramBin;
   process.env.ENGRAM_PORT = String(port);
 
   const registerEngram = await importPluginFromSandbox(sandbox);
@@ -414,7 +520,7 @@ async function withFixture(options, run) {
     });
     const fakeEngram = options.missingBin
       ? { engramBin: join(dir, "engram-does-not-exist") }
-      : await writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs: options.readyAfterMs ?? 0, exitCode: options.exitCode, instanceId: options.instanceId, cliVersion: options.cliVersion });
+      : await writeFakeEngramBin(dir, { spawnLog, port, readyAfterMs: options.readyAfterMs ?? 0, exitCode: options.exitCode, instanceId: options.instanceId, cliVersion: options.cliVersion, daemon: options.daemon });
     if (fakeEngram.nodeOptions) {
       process.env.NODE_OPTIONS = [originalNodeOptions, fakeEngram.nodeOptions].filter(Boolean).join(" ");
     }
@@ -694,6 +800,30 @@ test("a plugin-launched server starts with cloud autosync enabled", async () => 
     if (previous === undefined) delete process.env.ENGRAM_CLOUD_AUTOSYNC;
     else process.env.ENGRAM_CLOUD_AUTOSYNC = previous;
   }
+});
+
+for (const cliVersion of ["3.7.0", "main"]) {
+  test(`shared startup uses the daemon lifecycle for CLI version ${cliVersion}`, async () => {
+    await withFixture({ daemon: true, cliVersion }, async ({ hooks, ctx, spawnLog }) => {
+      await hooks.get("session_start")({}, ctx);
+      const log = await readFile(spawnLog, "utf8");
+      const invocations = log.split("\n").filter(line => line.startsWith("invoke="));
+      // The fake daemon's own child serves HTTP; only another top-level serve
+      // would be the plugin's legacy fallback.
+      assert.deepEqual(invocations, ['invoke=["instance-id"]', 'invoke=["run","-d"]', 'invoke=["serve"]']);
+      assert.equal(await countSpawns(spawnLog), 0, "the daemon wrapper must not fall back to serve");
+    });
+  });
+}
+
+test("shared startup falls back to legacy serve when run -d is unavailable", async () => {
+  await withFixture({ daemon: false }, async ({ hooks, ctx, spawnLog }) => {
+    await hooks.get("session_start")({}, ctx);
+    const log = await readFile(spawnLog, "utf8");
+    const invocations = log.split("\n").filter(line => line.startsWith("invoke="));
+    assert.deepEqual(invocations, ['invoke=["instance-id"]', 'invoke=["run","-d"]', 'invoke=["serve"]']);
+    assert.equal(await countSpawns(spawnLog), 1, "only one legacy server is launched");
+  });
 });
 
 test("a child that exits before readiness surfaces a normalized tool error", async () => {

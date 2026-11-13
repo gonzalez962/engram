@@ -364,9 +364,9 @@ For an accepted `POST /sync/mutations/push`, each future materialized cloud chun
 
 ### Health
 
-- Local runtime (`engram serve`): `GET /health` checks the local store with live aggregate queries. On success it returns `200` with `{"status":"ok","service":"engram","version":"<release version>","instance_id":"<store instance ID>","capabilities":{"isolated_session_registration":true}}`; a failed store returns `500` with `{"error":"health check failed"}` instead of reporting healthy.
+- Local runtime (`engram serve`): `GET /health` checks readability of the core sessions, observations and prompts tables with one bounded read through the generation-fenced Store connection. It does not calculate statistics or perform a full integrity or writeability audit. On success it returns `200` with `{"status":"ok","service":"engram","version":"<release version>","instance_id":"<store instance ID>","capabilities":{"isolated_session_registration":true,"root_session_resume":true,"runtime_session_resolution":true}}`; a failed store returns `500` with `{"error":"health check failed"}` instead of reporting healthy.
 
-The Claude native PreToolUse gate omits a rewrite when the caller already supplies the exact confirmed effective session ID; confirmation remains mandatory. `mem_review` list needs no session confirmation, while mutating review calls keep confirmation without injecting an unused session field. Required binding changes can still be denied by interactive auto mode; see [the plugin integration limitation](docs/PLUGINS.md#how-it-works).
+The Claude native PreToolUse gate omits a rewrite when the caller already supplies the exact confirmed effective session ID; confirmation remains mandatory. `mem_review` list needs no session confirmation, while mutating review calls keep confirmation without injecting an unused session field. Required binding changes can still be denied by interactive auto mode. `engram setup claude-code --allow-memory-writes` explicitly authorizes a fixed memory tool set for both MCP prefixes without an interactive prompt, while preserving session confirmation. This bypasses prompts and auto-mode classification for those tools; delete and project-merge permissions are not added. Without the flag, defaults remain unchanged. See [the permission scope and integration limitation](docs/PLUGINS.md#how-it-works).
 
 The Claude native PreToolUse gate verifies the local `/health` instance ID against its configured data directory before sending session or cwd data. Directory resolution uses the same home fallback as `engram serve`. An unrelated, unidentified, redirected, or unhealthy local listener denies the write with an identity error. Explicit `ENGRAM_URL` selects an intentional remote endpoint and retains its existing connection contract. Local instance comparison prevents accidental cross-store routing; it does not authenticate a malicious server. Windows connection-refused recovery remains bounded by the hook confirmation deadline.
 - When a local HTTP request observes permanent database generation invalidation, its existing error response is preserved. After the handler returns, `engram serve` logs one restart diagnostic, stops autosync, drains HTTP requests for up to five seconds (then force-closes remaining connections), releases its listener, and exits nonzero after cleanup. Ordinary transient health failures remain generic `500` responses and do not stop the server. Detection is request-triggered, not a background watchdog; the database is not reopened automatically.
@@ -452,7 +452,18 @@ The Claude native PreToolUse gate verifies the local `/health` instance ID again
 
 ### Search
 
-- `GET /search` — FTS5 search. Query: `?q=QUERY&type=TYPE&project=PROJECT&scope=SCOPE&limit=N&match_mode=all&response_format=compact`
+Observation and prompt searches accept at most **65,536 raw UTF-8 bytes** before
+query sanitization. When a query contains a term shorter than three characters
+and uses the LIKE fallback, at most **768 terms** are accepted. Exceeding an
+applicable limit returns HTTP `400` with a JSON `error` telling the caller to
+shorten the query and retry; unrelated store failures still return `500`.
+This applies to both full and compact HTTP searches and the corresponding MCP
+search tools (which return a tool error). Relation-candidate queries and batched
+conflict-scan source titles share the byte bound; their FTS-only path does not
+use the LIKE term cap. Valid inputs are not silently truncated by this policy.
+
+- `GET /search` — FTS5 search. Query: `?q=QUERY&type=TYPE&project=PROJECT&scope=SCOPE&org=ORG&limit=N&match_mode=all&response_format=compact`
+  - `org` is trimmed; a nonblank value returns only observations with that org, and an omitted or blank value applies no org filter.
   - With `response_format` omitted or empty: `200` with the existing JSON array of full search results.
   - No-result example: `GET /search?q=definitely-no-hit` returns `200` with `[]` (never `null`).
   - Opt in with `response_format=compact`: `200` with `{"result":"Found N memories.","results":[...]}`. Each entry has `id`, `sync_id`, `title`, `type`, `state`, `scope`, `pinned`, `preview`, and `truncated`; `project`, nonempty `topic_key`, and `review_after` are conditional. Optional `relations` contains `as_source` and `as_target` annotations, matching MCP compact search semantics.
@@ -510,7 +521,7 @@ The Claude native PreToolUse gate verifies the local `/health` instance ID again
 ### Project Detection / Migration
 
 - `GET /project/current` — Detect the current project. Query: `?cwd=/path/to/repo`
-  - Successful detection returns `{project, project_source, project_path, cwd, available_projects}` plus optional `warning`/`error_hint`; unsafe untracked HOME descendants instead return the `409 explicit_project_required` contract above.
+  - Successful detection returns `{project, project_source, project_path, cwd, available_projects}` plus optional `org` from the nearest applicable `.engram/config.json` and optional `warning`/`error_hint`; unsafe untracked HOME descendants instead return the `409 explicit_project_required` contract above. A process project override preserves the caller cwd's org label independently of the selected project.
   - Ambiguous cwd is a successful discovery response: `project` is empty, `project_source` is `ambiguous`, `available_projects` lists the candidates, and `error_hint` explains why no project was selected.
   - Other current-project-scoped HTTP routes return `404` for an unknown explicit project, `409` with `{error, code:"ambiguous_project", available_projects, project_source, project_path}` for an ambiguous cwd, and `400` for an invalid selector or configuration.
   - For automatic Git detection, Engram creates a private versioned binding in the repository's shared Git metadata. It retains the first normalized remote/root label through remote renames, linked worktrees, and repository moves; the binding is not tracked and clones or forks create their own opaque ID. A corrupt or unwritable binding fails closed: configure `.engram/config.json` with the intended project name rather than relying on a renamed remote. Global local/cloud `project_id` propagation and alias migration remain deferred.
@@ -808,7 +819,7 @@ unchanged.
 | `ENGRAM_MEM_SAVE_TIMING`        | Set to exactly `1` in the MCP server environment to log one privacy-safe stage timing record per `mem_save` invocation to stderr. See [mem_save timing diagnostics](#mem_save-timing-diagnostics). | (unset — disabled) |
 | `ENGRAM_HTTP_WRITE_TIMING`      | Set to exactly `1` in the local HTTP server environment to log one privacy-safe timing record for each session registration, observation save, or passive capture. See [HTTP write timing diagnostics](#http-write-timing-diagnostics). | (unset — disabled) |
 | `ENGRAM_DATA_DIR`               | Engram CLI data directory. Empty or whitespace-only values use the platform default; nonblank values are used as provided.                                                                                                                               | `~/.engram`          |
-| `ENGRAM_PORT`                   | Override HTTP server port. Use an unsigned decimal value from `1` through `65535`; invalid values fall back to `7437` in `engram serve` and Claude Bash hooks.                                                                                         | `7437`               |
+| `ENGRAM_PORT`                   | Override HTTP server port. Use an unsigned decimal value from `1` through `65535`; invalid values fall back to `7437` in `engram serve` and Claude Bash hooks. `engram run` honors it when no `-p` port is given, and `engram restart` honors it when neither `-p` nor the stopped daemon's recorded port exists.                                                                                         | `7437`               |
 | `ENGRAM_SOCKET`                 | POSIX-only Unix-domain socket path for `engram serve` and Claude Bash hooks. Socket mode listens exclusively on this path; it cannot be combined with an explicit `ENGRAM_PORT` or positional port. The default TCP listener remains unchanged when unset. PowerShell stays TCP-only. Bash hooks warn on stderr if socket transport cannot preserve memory capture. | (unset) |
 | `ENGRAM_PROJECT`                | Process-level default project override for `current` project-scoped operations. Precedence: **explicit request project** (`engram save --project`, an MCP tool `project` argument) → **process override** (`engram mcp --project`, then `ENGRAM_PROJECT`) → **cwd detection**. The value must be a project name, not a path. Explicit/process values are checked against known context when an operation MUST NOT establish a bucket; documented creation and recovery writes retain that behavior. Deliberately global operations such as `mem_review` list with no project and `mem_search(all_projects=true)` remain global. | cwd-detected project |
 | `ENGRAM_HTTP_TOKEN`             | Optional Bearer auth for the local HTTP server. When set, `DELETE /sessions/{id}`, `DELETE /observations/{id}`, `DELETE /prompts/{id}`, `GET /export`, and `POST /import` require `Authorization: Bearer <token>`. `POST /projects/rescue-ownership` (and deprecated alias `POST /projects/migrate`) always requires a configured token and matching Bearer credential. Comparison is constant-time. Token is read at request time (no restart needed). Other routes remain open when unset (zero-config default). Ownership repair never depends on this token: `engram projects rescue-ownership` performs the same repair against the local store. | (unset — HTTP rescue route not served; CLI repair still available) |
@@ -1016,7 +1027,7 @@ Potentially recoverable retry-cap relations are excluded from both age pruning a
 
 ### Cloud CLI (opt-in)
 
-- `engram cloud status` — show current cloud config state plus auth/sync readiness without mutating local state. When cloud is configured, also probes the local `engram serve` daemon at `127.0.0.1:7437` (respects `ENGRAM_PORT`) and prints a `Local daemon:` line (`running` / `not running` / `unreachable`) so you can detect a silently dead autosync. The probe currently uses the TCP daemon endpoint, so `ENGRAM_SOCKET` socket-only mode can report the daemon as not running. Exit code is unaffected; the line is informational
+- `engram cloud status` — show current cloud config state plus auth/sync readiness without mutating local state. When cloud is configured, also probes the local `engram serve` daemon at `127.0.0.1:7437` (respects `ENGRAM_PORT`) and prints a `Local daemon:` line (`running` / `not running` / `unreachable`) so you can detect a silently dead autosync. The probe currently uses the TCP daemon endpoint, so `ENGRAM_SOCKET` socket-only mode can report the daemon as not running. A running Engram response also produces a `Versions:` line for server and installed CLI semantic releases. A known difference prints `Restart pending` with manual supervisor guidance; missing, malformed or development versions are unknown and cannot establish a pending restart. Build metadata is ignored. No restart occurs, and version equality is never an identity signal. Exit code is unaffected; these lines are informational
 - `engram cloud enroll <project>` — enroll one project for cloud replication
 - `engram cloud config --server <url>` — persist cloud server URL to `~/.engram/cloud.json`
 - `engram cloud config --project <project> --server <url> --token <token>` / `engram cloud config --project <project> --clear` — route one project to its own cloud remote, or back to the global remote (see [Per-project cloud remotes](#per-project-cloud-remotes))
@@ -1383,7 +1394,7 @@ For monorepos, detection now honors the **nearest** `.engram/config.json` at or 
 
 `mem_delete` requires `id` and caller-supplied `expected_project`; optional `hard_delete=true` permanently deletes the observation. The owner assertion is not a project-resolution override.
 
-`mem_merge_projects` requires `from` (comma-separated, explicitly named source project names) and `to` (canonical target project name). Case/trim variants and matching `-`/`_` separator variants (for example, `foo-bar` to `foo_bar`) are allowed; unrelated names and missing sources are rejected. It does not accept or auto-detect `project`.
+`mem_merge_projects` requires `from` (comma-separated, explicitly named source project names) and `to` (canonical target project name). Case/trim variants and ASCII-space/`-`/`_` separator variants (for example, `foo bar` to `foo-bar` or `foo_bar`) are allowed; unrelated names and missing sources are rejected. It does not accept or auto-detect `project`.
 
 ### mem_current_project
 
@@ -1624,7 +1635,7 @@ Extract structured learnings from text output. Looks for `## Key Learnings:` sec
 
 ### mem_merge_projects
 
-**Admin tool.** Merge explicitly named case/trim or corresponding `-`/`_` separator variants into a canonical name. Requires `from` as a comma-separated list of source project names and `to` as the target canonical name. For example, `foo-bar` may merge into `foo_bar`, but unrelated names are rejected. Sources must exist. If `from` already names the canonical target, `mem_merge_projects` succeeds without moving records and reports `No records moved`; it does not reject that source. Observations, sessions, prompts, pending sync identity, and enrollment migrate together.
+**Admin tool.** Merge explicitly named case/trim or ASCII-space/`-`/`_` separator variants into a canonical name. Requires `from` as a comma-separated list of source project names and `to` as the target canonical name. For example, `foo bar` may merge into `foo-bar` or `foo_bar`, but unrelated names are rejected. Sources must exist. If `from` already names the canonical target, `mem_merge_projects` succeeds without moving records and reports `No records moved`; it does not reject that source. Observations, sessions, prompts, pending sync identity, and enrollment migrate together.
 
 By contrast, the CLI preview rejects an already-canonical source. The CLI trims surrounding whitespace from `--from`, then selects only that exact stored spelling.
 
@@ -1890,13 +1901,13 @@ Both errors carry a `remedy` field naming the exact command to run: `engram proj
 
 ### Similar-project warnings
 
-When saving to a project that doesn't exist yet, Engram checks for similar existing project names (Levenshtein distance, substring, case-insensitive matching) and warns the agent if a likely variant already exists.
+When saving to a project without live observations, Engram checks for similar existing project names (Levenshtein distance, substring, case-insensitive matching) and warns the agent if a likely variant already exists. MCP saves first check the target project's live observations; established projects skip the full name listing. Sessions, prompts or enrollment alone do not suppress this warning, and soft-deleted observations do not count. The warning is advisory: if its point lookup fails, the existing best-effort name check is still attempted.
 
 ### Retroactive cleanup
 
 For local future-only key/cwd mappings, use [project aliases](docs/PROJECT-ALIASES.md). Alias resolution is a read-only preview; it does not enable inbox routing, enroll projects, or rewrite history.
 
-Use `engram projects merge --from acmeapi --to acme-api --dry-run` to preview one explicitly named separator variant without mutation, then `--apply` to merge it. Exactly one mode and both names are required; unrelated names and already-canonical sources (including surrounding whitespace) are rejected. A distinct legacy case or NFD spelling is accepted when it normalizes to the canonical target; surrounding whitespace in `--from` is trimmed before lookup, and the remaining spelling must match the stored source exactly. For example, `--from ' Acme-api '` selects the stored `Acme-api`, not another case-equivalent spelling. Use `engram projects merge --from Acme-api --to acme-api --dry-run`, then replace `--dry-run` with `--apply` to canonicalize a single legacy name locally, without cloud configuration or enrollment. Preview reports observation, session, and prompt counts plus sync identity changes, even with zero rows. It is point-in-time: apply revalidates and reports actual moved row counts, which may differ. Apply's sync identity message is qualitative, not an actual-change count or a claim that the preview's sync state still holds. Sync-only merges can succeed with zero record moves. The reserved `inbox` project cannot be a merge destination, including for an explicitly named separator variant such as `in-box`; preview and apply both reject it.
+Use `engram projects merge --from acmeapi --to acme-api --dry-run` to preview one explicitly named separator variant without mutation, then `--apply` to merge it. ASCII spaces are also admitted by this explicit path: `engram projects merge --from "plugin obsidian" --to plugin-obsidian --dry-run`, followed by `--apply`. Only the exact named source spelling moves; other case or separator variants are not included implicitly. Internal tabs and nonbreaking spaces are not admitted as separators. This does not change project-name normalization or automatic consolidation. Exactly one mode and both names are required; unrelated names and already-canonical sources (including surrounding whitespace) are rejected. A distinct legacy case or NFD spelling is accepted when it normalizes to the canonical target; surrounding whitespace in `--from` is trimmed before lookup, and the remaining spelling must match the stored source exactly. For example, `--from ' Acme-api '` selects the stored `Acme-api`, not another case-equivalent spelling. Use `engram projects merge --from Acme-api --to acme-api --dry-run`, then replace `--dry-run` with `--apply` to canonicalize a single legacy name locally, without cloud configuration or enrollment. Preview reports observation, session, and prompt counts plus sync identity changes, even with zero rows. It is point-in-time: apply revalidates and reports actual moved row counts, which may differ. Apply's sync identity message is qualitative, not an actual-change count or a claim that the preview's sync state still holds. Sync-only merges can succeed with zero record moves. The reserved `inbox` project cannot be a merge destination, including for an explicitly named separator variant such as `in-box`; preview and apply both reject it.
 
 Use `engram projects consolidate` to interactively merge legacy project names that are equivalent after normalization, or `mem_merge_projects` for agent-driven consolidation. `engram projects consolidate --all --dry-run` groups existing NFC/NFD pairs and suggests the NFC canonical name; rerun without `--dry-run` to select the groups to merge. Existing rows are not automatically migrated. Explicit merge and consolidation move observations, sessions, prompts, pending sync mutations and enrollment through the existing transactional repair path; acknowledged sync history remains unchanged.
 
@@ -2047,6 +2058,28 @@ Interactive Bubbletea-based terminal UI. Launch with `engram tui`.
 
 Use a service supervisor to start `engram serve` after reboot and restart it after failures. Replacing the binary alone does not guarantee that an existing process exits. In this version, permanent database generation invalidation observed by an HTTP request triggers autosync cancellation, up to five seconds of HTTP draining, listener release, and a nonzero exit after cleanup. Restart belongs to the supervisor or operator, not Engram itself; already-running older binaries do not gain this behavior. Use `engram cloud status` afterwards to confirm — the `Local daemon:` line should report `running on port 7437`.
 
+### CLI daemon verbs (docker-style)
+
+Engram ships docker-style verbs for the common daemon lifecycle. They manage only the daemon started by `engram run -d` — the one tracked by the pidfile — and never touch session-owned serves that MCP clients spawn per session.
+
+| Concern | Docker equivalent | Engram command |
+| --- | --- | --- |
+| Run in background | `docker run -d` | `engram run -d` — detaches, prints PID and port |
+| Custom port | `docker run -d -p 1234` | `engram run -d -p 1234` — fails loudly if the port is taken |
+| Status | `docker ps` | `engram ps` — managed running (pid N) on port P / not running / unreachable / unmanaged or unknown listener |
+| Stop | `docker stop` | `engram stop` — graceful stop, then force if needed |
+| Logs | `docker logs` | `engram logs` — `engram logs -f` follows |
+| Restart | `docker restart` | `engram restart [-p PORT]` — stop, then start detached again |
+
+- The daemon records `<dataDir>/serve.pid` (JSON `{"pid": N, "port": P, "token": T}` — the token identifies one daemon start) and writes its stdout/stderr to `<dataDir>/serve.log` (default data dir `~/.engram`). Concurrent starts on one data directory are serialized through `<dataDir>/serve.lock`, so two parents can never overwrite each other's records.
+- An identity-confirmed `engram ps` also prints server and installed CLI semantic release versions. A known difference reports `Restart pending`; unknown versions do not. Status never restarts or signals the process, and a version match cannot replace the start-token identity check.
+- A second `engram run -d` against a live daemon reports `already running (pid N)` and exits non-zero.
+- With a missing or dead pidfile, `ps` and `stop` also inspect the recorded port (otherwise `ENGRAM_PORT`, then 7437). A healthy Engram listener is reported as unmanaged; other occupied or unconfirmed listeners are reported as unknown. `run -d` checks its requested port before spawning. These diagnostics exit non-zero and never adopt or signal the listener. Windows reports a unique OS-observed IPv4 loopback/wildcard owning PID when available; other platforms, lookup failures, and ambiguous owners explicitly report PID unavailable. An observed PID is a diagnostic snapshot, never stop authorization.
+- A pidfile pid is only signaled after `/health` returns the same nonempty start token recorded in the pidfile. A live pid with a missing or mismatched identity is never signaled. `run -d` can clear a token-bearing record when the recorded port is not running or answers with a different identity; an unreachable probe preserves the record. A live legacy record without a token remains readable, but `ps` reports it as unmanaged and `run -d`, `stop`, and `restart` preserve it and require manual verification. Verify the process locally and stop it manually only if it is the daemon; remove the pidfile only if the record is stale. A healthy HTTP port alone never establishes ownership of a PID.
+- A port conflict is a startup error with a non-zero exit code, so `KeepAlive`/`Restart` supervisors never hot-loop on a silent exit-0 bind failure.
+- `engram stop` escalates from graceful to forced termination; on Windows, detached children cannot receive console events, so stop terminates the process directly.
+- The verbs complement the supervisor templates below: use a unit for boot persistence and the verbs for day-to-day control.
+
 ### Using systemd (Linux)
 
 1. Move binary to `~/.local/bin` (ensure it's in your `$PATH`)
@@ -2073,7 +2106,7 @@ Environment=ENGRAM_DATA_DIR=%h/.engram
 WantedBy=default.target
 ```
 
-`Restart=on-failure` restarts unexpected failures but not a clean exit when the same Engram instance already owns the port. A different or legacy port owner still causes a startup error. Existing installed units are not changed by this example: manually update `~/.config/systemd/user/engram.service` and run `systemctl --user daemon-reload` to apply the policy.
+`Restart=on-failure` restarts the service after any non-zero exit. Both port-ownership conflicts are startup errors: the same Engram instance already owning the port and a different or legacy owner, so the unit retries at `RestartSec` pace instead of silently looping on a clean exit. Existing installed units are not changed by this example: manually update `~/.config/systemd/user/engram.service` and run `systemctl --user daemon-reload` to apply the policy.
 
 ### Using launchd (macOS)
 
@@ -2196,7 +2229,7 @@ Register-ScheduledTask `
 
 The SQLite driver is paired with `modernc.org/libc` v1.75.6 in `go.mod`;
 update these together rather than overriding libc independently. The module
-requires Go 1.26.10.
+requires Go 1.26.11.
 
 ### OpenCode Plugin
 

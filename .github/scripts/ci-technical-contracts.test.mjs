@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { withoutSuitePriority } from './ci-suite-priority.mjs';
 
 const source = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 const job = (text, id) => text.match(new RegExp(`^  ${id}:\\n[\\s\\S]*?(?=^  [a-z][\\w-]*:|$(?![\\s\\S]))`, 'm'))?.[0] ?? '';
@@ -15,9 +16,9 @@ function discovery(text) {
 test('independent technical discovery in the existing Policy Helper Tests job', () => discovery(source));
 
 function race(text) {
-  const body = job(text, 'race-tests');
+  const body = withoutSuitePriority(job(text, 'race-tests'));
   for (const line of ['name: Go Race Tests', 'runs-on: ubuntu-24.04', 'timeout-minutes: 30',
-    'CGO_ENABLED: "1"', 'CC: gcc', 'GOTOOLCHAIN: local', 'go-version: "1.26.10"',
+    'CGO_ENABLED: "1"', 'CC: gcc', 'GOTOOLCHAIN: local', 'go-version: "1.26.11"',
     'ref: ${{ github.sha }}', 'persist-credentials: false', 'run: git rev-parse HEAD',
     'run: gcc --version', 'run: /usr/bin/time -p go test -race -timeout=20m ./...']) {
     assert.ok(body.split('\n').some(value => value.trim() === line), line);
@@ -49,7 +50,7 @@ function raceOwner(text) {
   const { steps, restore, save } = cacheSteps(text);
   assert.equal((body.match(/uses: actions\/cache\//g) ?? []).length, 2);
   assert.doesNotMatch(body, /uses: actions\/cache@|enableCrossOsArchive: true|cache-mode:|(?:lookup-only|fail-on-cache-miss): true/);
-  assert.match(steps.find(s => s.includes('uses: actions/setup-go@')) ?? '', /go-version: "1\.26\.10"\n          cache: false\n/);
+  assert.match(steps.find(s => s.includes('uses: actions/setup-go@')) ?? '', /go-version: "1\.26\.11"\n          cache: false\n/);
   for (const step of [restore, save]) {
     assert.match(step, /path: \|\n            \$\{\{ steps\.race-cache\.outputs\.gomodcache \}\}\n            \$\{\{ steps\.race-cache\.outputs\.gocache \}\}/);
     assert.match(step, /key: \$\{\{ steps\.race-cache\.outputs\.key \}\}/);
@@ -183,7 +184,7 @@ function verification(text) {
   const unit = job(withoutHold(text), 'unit-tests');
   assert.match(unit, /name: Unit Tests\n/);
   assert.doesNotMatch(unit, /continue-on-error|environment:|\n\s+if:|\|\| true|: write|secrets\.|-timeout=20m/);
-  const ordered = ['name: Set up Go', 'go-version: "1.26.10"',
+  const ordered = ['name: Set up Go', 'go-version: "1.26.11"',
     'name: Verify module metadata is tidy\n        run: go mod tidy -diff\n',
     'name: Verify generated templ output\n', 'make templ\n',
     "git diff --exit-code -- 'internal/cloud/dashboard/*_templ.go'\n",
@@ -247,7 +248,7 @@ for (const [name, check] of Object.entries({ race, verification, concurrency }))
 
 const mutations = {
   race: [
-    ['ubuntu-24.04', 'ubuntu-latest'], ['go-version: "1.26.10"', 'go-version: "1.26.9"'],
+    ['ubuntu-24.04', 'ubuntu-latest'], ['go-version: "1.26.11"', 'go-version: "1.26.9"'],
     ['CGO_ENABLED: "1"', 'CGO_ENABLED: "0"'], ['CC: gcc', 'CC: clang'],
     ['GOTOOLCHAIN: local', 'GOTOOLCHAIN: auto'], ['run: gcc --version', 'run: true'],
     ['timeout-minutes: 30', 'timeout-minutes: 20'], ['-timeout=20m', '-timeout=10m'],
@@ -298,7 +299,7 @@ for (const [category, cases] of Object.entries(mutations)) {
 }
 
 test('verification rejects missing setup and reordered preflight/build stages', () => {
-  const setup = '      - name: Set up Go\n        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6\n        with:\n          go-version: "1.26.10"\n';
+  const setup = '      - name: Set up Go\n        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6\n        with:\n          go-version: "1.26.11"\n';
   const unit = job(source, 'unit-tests');
   assert.ok(unit.includes(setup));
   assert.throws(() => verification(source.replace(unit, () => unit.replace(setup, ''))));
@@ -310,12 +311,12 @@ test('verification rejects missing setup and reordered preflight/build stages', 
 });
 
 function macos(text) {
-  const body = job(text, 'macos-native-tests');
+  const body = withoutSuitePriority(job(text, 'macos-native-tests'));
   assert.ok(body, 'native macOS job must exist');
   for (const value of ['name: Native macOS ARM64 Tests', 'runs-on: macos-15', 'timeout-minutes: 20',
-    'GOTOOLCHAIN: local', 'go-version: "1.26.10"', 'node-version: "24"',
+    'GOTOOLCHAIN: local', 'go-version: "1.26.11"', 'node-version: "24"',
     'ref: ${{ github.sha }}', 'persist-credentials: false',
-    'test "$(uname -sm)" = "Darwin arm64"', 'test "$(go env GOVERSION)" = go1.26.10',
+    'test "$(uname -sm)" = "Darwin arm64"', 'test "$(go env GOVERSION)" = go1.26.11',
     'test "$(go env GOHOSTOS)/$(go env GOHOSTARCH)" = darwin/arm64',
     'test "$(go env GOOS)/$(go env GOARCH)" = darwin/arm64',
     'test "$(node -p \'process.platform + "/" + process.arch\')" = darwin/arm64',
@@ -338,7 +339,7 @@ test('native macOS rejects scope, prerequisites, budget and failure regressions'
   const original = job(source, 'macos-native-tests');
   for (const [before, after] of [
     ['runs-on: macos-15', 'runs-on: macos-latest'], ['timeout-minutes: 20', 'timeout-minutes: 30'],
-    ['go-version: "1.26.10"', 'go-version: "1.26.9"'], ['node-version: "24"', 'node-version: "22"'],
+    ['go-version: "1.26.11"', 'go-version: "1.26.9"'], ['node-version: "24"', 'node-version: "22"'],
     ['/usr/bin/jq --version', 'jq --version'], ['Darwin arm64', 'Darwin x86_64'],
     ['-timeout=10m', '-timeout=20m'], ['-count=1', '-count=2'],
     ['set -euo pipefail', 'set -eu'], ['HOME=$state/home', 'HOME=/Users/runner'],
@@ -378,7 +379,7 @@ function adapters(text) {
   assert.ok(body, 'independent native adapter job');
   for (const value of ['runs-on: macos-15', 'timeout-minutes: 15', 'GOTOOLCHAIN: local',
     'go-version-file: go.mod', 'node-version: "24"', 'ref: ${{ github.sha }}', 'persist-credentials: false',
-    'test "$(uname -sm)" = "Darwin arm64"', 'test "$(go env GOVERSION)" = go1.26.10',
+    'test "$(uname -sm)" = "Darwin arm64"', 'test "$(go env GOVERSION)" = go1.26.11',
     'test "$(go env GOOS)/$(go env GOARCH)" = darwin/arm64',
     'test "$(go env GOHOSTOS)/$(go env GOHOSTARCH)" = darwin/arm64',
     'test "$(node -p \'process.platform + "/" + process.arch\')" = darwin/arm64',
@@ -389,6 +390,8 @@ function adapters(text) {
     'npm ci --ignore-scripts --legacy-peer-deps', 'go mod download',
     'go build -mod=readonly -o "$RUNNER_TEMP/pi-test-server" ./plugin/pi/test/support/real-server',
     'ENGRAM_PI_TEST_SERVER_BINARY=$RUNNER_TEMP/pi-test-server',
+    'go build -mod=readonly -o "$RUNNER_TEMP/pi-test-path" ./plugin/pi/test/support/runtime-path-binary',
+    'export ENGRAM_PI_TEST_PATH_BINARY="$RUNNER_TEMP/pi-test-path"',
     piScript.replace('node --test ', 'node --test --test-reporter=tap ') + ' | tee "$RUNNER_TEMP/pi.tap"',
     'node --test --test-reporter=tap plugin/opencode/engram.test.mjs plugin/opencode/engram.v2.test.mjs plugin/opencode/engram.v2.real-server.test.mjs | tee "$RUNNER_TEMP/opencode.tap"',
     'PI_OUTCOME: ${{ steps.pi.outcome }}', 'OPENCODE_OUTCOME: ${{ steps.opencode.outcome }}',
@@ -407,9 +410,11 @@ test('native adapter contract rejects weakened placement, prerequisites and exit
   const original = job(source, 'macos-adapter-tests');
   for (const before of ['runs-on: macos-15', 'timeout-minutes: 15', 'timeout-minutes: 2', 'timeout-minutes: 5',
     'go-version-file: go.mod', 'node-version: "24"', 'persist-credentials: false', 'set -euo pipefail',
-    'Darwin arm64', 'go1.26.10', 'darwin/arm64', 'state=$(cd "$state" && pwd -P)',
+    'Darwin arm64', 'go1.26.11', 'darwin/arm64', 'state=$(cd "$state" && pwd -P)',
     'node_modules/typebox/package.json', 'docs/contracts/agent-contract-v1.json',
     'npm ci --ignore-scripts --legacy-peer-deps', 'ENGRAM_PI_TEST_SERVER_BINARY=$RUNNER_TEMP/pi-test-server',
+    'go build -mod=readonly -o "$RUNNER_TEMP/pi-test-path" ./plugin/pi/test/support/runtime-path-binary',
+    'export ENGRAM_PI_TEST_PATH_BINARY="$RUNNER_TEMP/pi-test-path"',
     '--test-concurrency=1', 'plugin/opencode/engram.v2.real-server.test.mjs', 'if: ${{ !cancelled() }}']) {
     assert.ok(original.includes(before), before);
     assert.throws(() => adapters(source.replace(original, () => original.replace(before, '__REMOVED__'))), undefined, before);
@@ -463,12 +468,14 @@ function windowsAdapters(text) {
   for (const value of ['name: Native Windows x64 Adapter Tests', 'runs-on: windows-2022',
     'timeout-minutes: 20', 'shell: pwsh', 'GOTOOLCHAIN: local', 'go-version-file: go.mod',
     'node-version: "24"', 'architecture: x64', 'ref: ${{ github.sha }}', 'persist-credentials: false',
-    "'windows/amd64'", "'go1.26.10'", "'X64'", 'process.platform !== "win32"', 'process.arch !== "x64"',
+    "'windows/amd64'", "'go1.26.11'", "'X64'", 'process.platform !== "win32"', 'process.arch !== "x64"',
     'process.versions.node.split(".")[0] !== "24"', 'node_modules/typebox/package.json',
     'docs/contracts/agent-contract-v1.json', 'GOMODCACHE', 'GOCACHE', "USERPROFILE = 'home'",
     "APPDATA = 'appdata'", "LOCALAPPDATA = 'localappdata'", "TEMP = 'tmp'", "TMP = 'tmp'",
     'npm ci --ignore-scripts --legacy-peer-deps', 'go mod download', 'pi-test-server.exe',
     'go build -mod=readonly', '$env:ENGRAM_PI_TEST_SERVER_BINARY',
+    'pi-test-path.exe', './plugin/pi/test/support/runtime-path-binary',
+    '$env:ENGRAM_PI_TEST_PATH_BINARY',
     'node --test --test-reporter=tap --test-concurrency=1 test/*.test.mjs',
     'node --test --test-reporter=tap plugin/opencode/engram.test.mjs plugin/opencode/engram.v2.test.mjs plugin/opencode/engram.v2.real-server.test.mjs',
     'node .github/scripts/adapter-ci-evidence.mjs windows', 'PI_OUTCOME: ${{ steps.pi.outcome }}',
@@ -484,10 +491,12 @@ test('Windows adapter lane preserves native tools, profile isolation, selection 
 test('Windows adapter lane rejects prerequisite, budget and failure masking regressions', () => {
   const original = job(source, 'windows-adapter-tests');
   for (const before of ['runs-on: windows-2022', 'timeout-minutes: 20', 'timeout-minutes: 2',
-    'timeout-minutes: 5', 'shell: pwsh', 'windows/amd64', 'go1.26.10', 'X64',
+    'timeout-minutes: 5', 'shell: pwsh', 'windows/amd64', 'go1.26.11', 'X64',
     'go-version-file: go.mod', 'node-version: "24"', 'USERPROFILE', 'APPDATA', 'GOCACHE',
     'node_modules/typebox/package.json', 'docs/contracts/agent-contract-v1.json',
     'npm ci --ignore-scripts --legacy-peer-deps', '--test-concurrency=1', '$LASTEXITCODE',
+    'pi-test-path.exe', './plugin/pi/test/support/runtime-path-binary',
+    '$env:ENGRAM_PI_TEST_PATH_BINARY',
     'plugin/opencode/engram.v2.real-server.test.mjs', 'if: ${{ !cancelled() }}']) {
     assert.ok(original.includes(before), before);
     assert.throws(() => windowsAdapters(source.replace(original, original.replaceAll(before, '__REMOVED__'))), undefined, before);
@@ -523,7 +532,7 @@ test('Windows preflight rejects cross-target Go before creating profile state', 
   const dir = mkdtempSync(join(tmpdir(), 'adapter-preflight-'));
   try {
     for (const arch of ['amd64', 'arm64']) {
-      const metadata = JSON.stringify({ GOVERSION: 'go1.26.10', GOOS: 'windows', GOARCH: arch,
+      const metadata = JSON.stringify({ GOVERSION: 'go1.26.11', GOOS: 'windows', GOARCH: arch,
         GOHOSTOS: 'windows', GOHOSTARCH: 'amd64', GOMODCACHE: 'original modules', GOCACHE: 'original cache' });
       const fakeGo = `function go { '${metadata}'; $global:LASTEXITCODE = 0 };\n`;
       const envFile = join(dir, arch);
@@ -557,9 +566,17 @@ test('shared reporter selects Windows labels without changing evidence or exclus
   assert.equal(adapterSummary(undefined, undefined, 'failure', 'windows').status, 1);
 });
 
-const piRequired = ['Pi native saves persist under separate host sessions and stop on failed registration',
-  'existing CLI verifies real Pi registration without writing',
-  'packaged real workflows run all eight tests with the prebuilt fixture binary'];
+// Read the inline required.pi list the reporter enforces instead of keeping a copy that can drift.
+function requiredPiNames() {
+  const source = readFileSync(new URL('./adapter-ci-evidence.mjs', import.meta.url), 'utf8');
+  const block = source.match(/^ {2}pi: \[([\s\S]*?)\],$/m);
+  assert.ok(block, 'adapter-ci-evidence.mjs must keep its inline required.pi name list; the reporter shape changed');
+  const names = [...block[1].matchAll(/'([^']+)'/g)].map(([, name]) => name);
+  assert.ok(names.length > 0 && new Set(names).size === names.length,
+    'adapter-ci-evidence.mjs required.pi names must stay non-empty and unique');
+  return names;
+}
+const piRequired = requiredPiNames();
 const ocRequired = ['V2 inbox prompts stay idempotent and deleted across real server restarts'];
 const host = 'actual Pi hosts retain attribution through compaction, resume and refusal';
 const hostReason = 'opt-in: set ENGRAM_PI_LIFECYCLE_CLI to the installed Pi CLI entry point';
@@ -590,6 +607,20 @@ test('adapter evidence preserves counts, repeated parameterized names and instal
   assert.deepEqual(result.report.suites.pi.skips, [{ name: host, reason: hostReason }]);
   assert.deepEqual(result.report.suites.pi.counts, { tests: 4, suites: 0, pass: 3, fail: 0, cancelled: 0, skipped: 1, todo: 0 });
   assert.deepEqual(result.report.suites.opencode.counts, { tests: 3, suites: 0, pass: 3, fail: 0, cancelled: 0, skipped: 0, todo: 0 });
+});
+
+test('adapter evidence required names follow the packaged workflow the Pi suite declares', () => {
+  const suite = readFileSync(new URL('../../plugin/pi/test/real-workflows-package.test.mjs', import.meta.url), 'utf8');
+  const declared = suite.match(/test\("(packaged real workflows run all [^"]+ with the prebuilt fixture binary)"/);
+  assert.ok(declared?.[1], 'plugin/pi/test/real-workflows-package.test.mjs must declare '
+    + '"packaged real workflows run all <N> tests with the prebuilt fixture binary"; the packaged case was renamed');
+  const packaged = piRequired.filter(name => name.startsWith('packaged real workflows run all '));
+  assert.deepEqual(packaged, [declared[1]],
+    'adapter-ci-evidence.mjs required.pi must enforce the packaged case the Pi suite declares');
+  const result = adapterSummary(tap(piRequired));
+  assert.equal(result.status, 0, result.stdout);
+  const unenforced = piRequired.map(name => name === declared[1] ? declared[1].replace('run all ', 'run all rewritten ') : name);
+  assert.equal(adapterSummary(tap(unenforced)).status, 1, 'a packaged name the reporter does not enforce must not qualify execution');
 });
 test('adapter evidence consumes actual Node24 TAP including nested tests', () => {
   const dir = mkdtempSync(join(tmpdir(), 'adapter-tap-'));
