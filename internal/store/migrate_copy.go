@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -364,7 +365,7 @@ func copyCatalog(db *sql.DB) (map[string]copyCatalogObject, error) {
 
 // Supported catalogs are the current migration catalog, the existing derived
 // legacy compatibility shape originally based on the v3.3.2 -> b81ea5e diff,
-// and one frozen complete v3.6.0 catalog. Schema version equality alone is never
+// and frozen complete v3.4.0/v3.6.0 catalogs. Schema version equality alone is never
 // admission. Unknown objects, columns, triggers and constraints fail closed.
 func copyValidateDB(db *sql.DB) error {
 	var v int
@@ -409,6 +410,26 @@ func copyValidateDB(db *sql.DB) error {
 	if reflect.DeepEqual(actual, current) {
 		return nil
 	}
+	// The immediately preceding catalog differs only by this derived index.
+	// Compare whole catalogs, never admit arbitrary optional objects.
+	withoutEvidence := maps.Clone(current)
+	delete(withoutEvidence, "sync_chunk_delete_evidence")
+	delete(withoutEvidence, "sqlite_autoindex_sync_chunk_delete_evidence_1")
+	if reflect.DeepEqual(actual, withoutEvidence) {
+		return nil
+	}
+	// A complete pre-org/pre-delete-evidence state can already have the modern
+	// FTS and project indexes. Derive that atomic migration delta from current,
+	// keeping every other object and constraint exact; missing stable indexes
+	// must fail here, before ordinary startup could recreate them.
+	beforeOrg := maps.Clone(withoutEvidence)
+	delete(beforeOrg, "idx_obs_org")
+	observation := beforeOrg["observations"]
+	observation.SQL = strings.Replace(observation.SQL, "org TEXT,", "", 1)
+	beforeOrg["observations"] = observation
+	if reflect.DeepEqual(actual, beforeOrg) {
+		return nil
+	}
 	// The digest pins every normalized object (kind, owner and SQL), not merely
 	// object names or a set of independently optional migration differences.
 	// Its complete migration-produced catalog and provenance live in testdata.
@@ -416,7 +437,9 @@ func copyValidateDB(db *sql.DB) error {
 	if e != nil {
 		return e
 	}
-	if fmt.Sprintf("%x", sha256.Sum256(encoded)) == "1f217c73a6f4949a5e84e92a5e79c5096e3e18e1c4e8f97b0af9067d6d1abf95" {
+	historicalDigest := fmt.Sprintf("%x", sha256.Sum256(encoded))
+	if historicalDigest == "1f217c73a6f4949a5e84e92a5e79c5096e3e18e1c4e8f97b0af9067d6d1abf95" ||
+		historicalDigest == "01b3bb3b2c114bd2ddf0ddb7ccdc40b664afb2ef4490de583739f414b3e07037" {
 		return nil
 	}
 	delete(current, "session_finalizations")
@@ -426,6 +449,11 @@ func copyValidateDB(db *sql.DB) error {
 		o.SQL = strings.Replace(o.SQL, "superseded_by_sync_id TEXT,", "", 1)
 		current[name] = o
 	}
+	if reflect.DeepEqual(actual, current) {
+		return nil
+	}
+	delete(current, "sync_chunk_delete_evidence")
+	delete(current, "sqlite_autoindex_sync_chunk_delete_evidence_1")
 	if reflect.DeepEqual(actual, current) {
 		return nil
 	}
@@ -476,6 +504,11 @@ func copyNormalizeDDL(ddl string) string {
 	if start < 0 || !strings.HasSuffix(ddl, ")") {
 		return ddl
 	}
+	header := ddl[:start+1]
+	// SQLite quotes this known table name after its rebuild/rename migration.
+	if strings.TrimSpace(ddl[:start]) == `CREATE TABLE "sync_chunks"` {
+		header = "CREATE TABLE sync_chunks ("
+	}
 	body := ddl[start+1 : len(ddl)-1]
 	var parts []string
 	depth := 0
@@ -511,7 +544,7 @@ func copyNormalizeDDL(ddl string) string {
 	}
 	parts = append(parts, strings.TrimSpace(body[last:]))
 	sort.Strings(parts)
-	return ddl[:start+1] + strings.Join(parts, ",") + ",)"
+	return header + strings.Join(parts, ",") + ",)"
 }
 
 // migrateCopyReadOnlyDSN opens the copied database read-only. Like storeDSN,

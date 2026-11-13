@@ -418,6 +418,9 @@ func (s *Store) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidat
 	if strings.TrimSpace(queryText) == "" {
 		queryText = title
 	}
+	if err := validateFTSQueryLength(queryText); err != nil {
+		return nil, err
+	}
 	ftsQuery := sanitizeFTSCandidates(queryText)
 	if ftsQuery == "" {
 		return nil, nil
@@ -643,6 +646,16 @@ func (s *Store) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 			return nil, fmt.Errorf("JudgeRelation: relation %q not found", p.JudgmentID)
 		}
 		return nil, fmt.Errorf("JudgeRelation: check existence: %w", err)
+	}
+
+	// Redact explanations before persistence; responses and sync read this row.
+	if p.Reason != nil {
+		reason := stripPrivateTags(*p.Reason)
+		p.Reason = &reason
+	}
+	if p.Evidence != nil {
+		evidence := stripPrivateTags(*p.Evidence)
+		p.Evidence = &evidence
 	}
 
 	// Build nullable model string.

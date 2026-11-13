@@ -12,7 +12,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
@@ -43,19 +46,94 @@ func TestCompatibilityEarlyDispatch(t *testing.T) {
 	main()
 }
 
-// buildCompatibilityBinary builds the candidate CLI into a temporary directory.
-// Tests never execute an installed engram.
+// The executable belongs to TestMain, not the first consumer's t.TempDir.
+// Each consumer still owns its process environment and data directories.
+var compatibilityBinary *compatibilityBinaryFixture
+
+type compatibilityBinaryFixture struct {
+	once                          sync.Once
+	sourceDir, tempRoot, goBinary string
+	env                           []string
+	dir, path                     string
+	err                           error
+}
+
+func newCompatibilityBinaryFixture(tempRoot string) *compatibilityBinaryFixture {
+	f := &compatibilityBinaryFixture{tempRoot: tempRoot, env: append(os.Environ(),
+		"GOFLAGS=-mod=readonly", "GOPROXY=off", "GOTOOLCHAIN=local")}
+	// Capture build inputs before a test changes cwd, PATH or its profile.
+	f.sourceDir, f.err = os.Getwd()
+	if f.err == nil {
+		f.tempRoot, f.err = filepath.Abs(tempRoot)
+	}
+	if f.err == nil {
+		f.goBinary, f.err = exec.LookPath("go")
+	}
+	if f.err == nil {
+		f.goBinary, f.err = filepath.Abs(f.goBinary)
+	}
+	return f
+}
+
+func (f *compatibilityBinaryFixture) get() (string, error) {
+	f.once.Do(func() {
+		if f.err != nil {
+			return
+		}
+		f.dir, f.err = os.MkdirTemp(f.tempRoot, "engram-cli-fixture-")
+		if f.err != nil {
+			return
+		}
+		binaryName := "engram"
+		if runtime.GOOS == "windows" {
+			binaryName += ".exe"
+		}
+		f.path = filepath.Join(f.dir, binaryName)
+		build := exec.Command(f.goBinary, "build", "-ldflags=-X main.version="+compatibilityFixtureVersion, "-o", f.path, ".")
+		build.Dir, build.Env = f.sourceDir, f.env
+		if out, err := build.CombinedOutput(); err != nil {
+			f.err = fmt.Errorf("isolated build: %w %s", err, out)
+		}
+	})
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.path, nil
+}
+
+func (f *compatibilityBinaryFixture) close() error {
+	if f.dir == "" {
+		return nil
+	}
+	return removeCompatibilityFixture(f.dir, runtime.GOOS, os.RemoveAll, time.Sleep)
+}
+
+// Windows may briefly deny deletion after an executable has been used. Retry
+// only these native deletion errors, and still report a persistent failure.
+func removeCompatibilityFixture(dir, goos string, removeAll func(string) error, sleep func(time.Duration)) error {
+	const attempts = 20
+	for attempt := 1; ; attempt++ {
+		err := removeAll(dir)
+		if err == nil {
+			return nil
+		}
+		retryable := errors.Is(err, syscall.Errno(5)) || // ERROR_ACCESS_DENIED
+			errors.Is(err, syscall.Errno(32)) || // ERROR_SHARING_VIOLATION
+			errors.Is(err, syscall.Errno(145)) // ERROR_DIR_NOT_EMPTY
+		if goos != "windows" || !retryable || attempt == attempts {
+			return err
+		}
+		sleep(50 * time.Millisecond)
+	}
+}
+
+// buildCompatibilityBinary builds the current candidate once per test process.
+// Tests never execute an installed engram or an executable from another run.
 func buildCompatibilityBinary(t *testing.T) string {
 	t.Helper()
-	binaryName := "engram"
-	if runtime.GOOS == "windows" {
-		binaryName += ".exe"
-	}
-	binaryPath := filepath.Join(t.TempDir(), binaryName)
-	build := exec.Command("go", "build", "-ldflags=-X main.version="+compatibilityFixtureVersion, "-o", binaryPath, ".")
-	build.Env = append(os.Environ(), "GOFLAGS=-mod=readonly", "GOPROXY=off", "GOTOOLCHAIN=local")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("isolated build: %v %s", err, out)
+	binaryPath, err := compatibilityBinary.get()
+	if err != nil {
+		t.Fatal(err)
 	}
 	return binaryPath
 }

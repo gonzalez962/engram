@@ -17,6 +17,8 @@ permissions:
 
 jobs:
   race-tests:
+    needs: [unit-tests, e2e-tests, plugin-tests]
+    if: ${{ !cancelled() }}
     name: Go Race Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -39,7 +41,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
           cache: false
 
       - name: Verify C compiler prerequisite
@@ -73,7 +75,7 @@ jobs:
           goos=$(go env GOOS)
           goarch=$(go env GOARCH)
           cgo=$(go env CGO_ENABLED)
-          [[ "$goversion" == go1.26.10 && "$cgo" == 1 && "$goos" == linux && "$goarch" == amd64 ]]
+          [[ "$goversion" == go1.26.11 && "$cgo" == 1 && "$goos" == linux && "$goarch" == amd64 ]]
           compiler=$(readlink -f "$(command -v "$CC")")
           [[ "$compiler" == /* && -x "$compiler" ]]
           compiler_sha=$(hash < "$compiler")
@@ -126,6 +128,8 @@ jobs:
           key: ${{ steps.race-cache.outputs.key }}
 
   macos-native-tests:
+    needs: [unit-tests, e2e-tests, plugin-tests]
+    if: ${{ !cancelled() }}
     name: Native macOS ARM64 Tests
     runs-on: macos-15
     timeout-minutes: 20
@@ -143,7 +147,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Set up Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -162,7 +166,7 @@ jobs:
           go env GOOS GOARCH GOHOSTOS GOHOSTARCH CGO_ENABLED
           node --version
           test "$(uname -sm)" = "Darwin arm64"
-          test "$(go env GOVERSION)" = go1.26.10
+          test "$(go env GOVERSION)" = go1.26.11
           test "$(go env GOHOSTOS)/$(go env GOHOSTARCH)" = darwin/arm64
           test "$(go env GOOS)/$(go env GOARCH)" = darwin/arm64
           test "$(node -p 'process.platform + "/" + process.arch')" = darwin/arm64
@@ -307,7 +311,7 @@ jobs:
           node --version
           npm --version
           test "$(uname -sm)" = "Darwin arm64"
-          test "$(go env GOVERSION)" = go1.26.10
+          test "$(go env GOVERSION)" = go1.26.11
           test "$(go env GOOS)/$(go env GOARCH)" = darwin/arm64
           test "$(go env GOHOSTOS)/$(go env GOHOSTARCH)" = darwin/arm64
           test "$(node -p 'process.platform + "/" + process.arch')" = darwin/arm64
@@ -337,6 +341,7 @@ jobs:
           set -euo pipefail
           node -e 'const p = require("./plugin/pi/node_modules/typebox/package.json"); if (p.name !== "typebox" || p.version !== "1.3.34") process.exit(1)'
           go build -mod=readonly -o "$RUNNER_TEMP/pi-test-server" ./plugin/pi/test/support/real-server
+          go build -mod=readonly -o "$RUNNER_TEMP/pi-test-path" ./plugin/pi/test/support/runtime-path-binary
           echo "ENGRAM_PI_TEST_SERVER_BINARY=$RUNNER_TEMP/pi-test-server" >> "$GITHUB_ENV"
       - name: Run Pi adapters
         id: pi
@@ -349,6 +354,7 @@ jobs:
             case "$key" in ENGRAM_*|GENTLE_*|CLOUDSTORE_TEST_DSN|NODE_OPTIONS|GOFLAGS) unset "$key" ;; esac
           done < <(env)
           export ENGRAM_DATA_DIR="$HOME/../store" ENGRAM_PI_TEST_SERVER_BINARY="$RUNNER_TEMP/pi-test-server"
+          export ENGRAM_PI_TEST_PATH_BINARY="$RUNNER_TEMP/pi-test-path"
           node --test --test-reporter=tap --test-concurrency=1 test/*.test.mjs | tee "$RUNNER_TEMP/pi.tap"
       - name: Run OpenCode adapters
         id: opencode
@@ -413,7 +419,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $go = $go | ConvertFrom-Json
           $go | ConvertTo-Json
-          if ($go.GOVERSION -ne 'go1.26.10' -or "$($go.GOOS)/$($go.GOARCH)" -ne 'windows/amd64' -or "$($go.GOHOSTOS)/$($go.GOHOSTARCH)" -ne 'windows/amd64') { throw 'Native repository Go required' }
+          if ($go.GOVERSION -ne 'go1.26.11' -or "$($go.GOOS)/$($go.GOARCH)" -ne 'windows/amd64' -or "$($go.GOHOSTOS)/$($go.GOHOSTARCH)" -ne 'windows/amd64') { throw 'Native repository Go required' }
           foreach ($file in @('docs/contracts/agent-contract-v1.json', 'plugin/pi/test/support/real-server/main.go', 'plugin/opencode/test/support/real-server/main.go')) {
             if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing mandatory fixture: $file" }
           }
@@ -440,6 +446,10 @@ jobs:
           go build -mod=readonly -o $binary ./plugin/pi/test/support/real-server
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (!(Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Missing mandatory prebuilt fixture' }
+          $pathBinary = Join-Path $env:RUNNER_TEMP 'pi-test-path.exe'
+          go build -mod=readonly -o $pathBinary ./plugin/pi/test/support/runtime-path-binary
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path -LiteralPath $pathBinary -PathType Leaf)) { throw 'Missing mandatory prebuilt path fixture' }
       - name: Run Pi adapters
         id: pi
         timeout-minutes: 5
@@ -451,6 +461,7 @@ jobs:
             ForEach-Object { Remove-Item "Env:$($_.Name)" }
           $env:ENGRAM_DATA_DIR = Join-Path (Split-Path $env:HOME) 'store'
           $env:ENGRAM_PI_TEST_SERVER_BINARY = Join-Path $env:RUNNER_TEMP 'pi-test-server.exe'
+          $env:ENGRAM_PI_TEST_PATH_BINARY = Join-Path $env:RUNNER_TEMP 'pi-test-path.exe'
           node --test --test-reporter=tap --test-concurrency=1 test/*.test.mjs | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'pi.tap')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run OpenCode adapters
@@ -490,7 +501,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
           cache: false
       - name: Install pinned scanner
         env:
@@ -516,7 +527,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
           cache: false
       - name: Install pinned validator
         env:
@@ -543,7 +554,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Verify pinned jq 1.6
         shell: bash
@@ -582,7 +593,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8
@@ -743,7 +754,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Verify module metadata is tidy
         run: go mod tidy -diff
@@ -806,7 +817,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Set up Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -851,7 +862,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
           cache: false
 
       - name: Set up unsupported Node.js
@@ -866,7 +877,7 @@ jobs:
           git rev-parse HEAD
           go version
           node --version
-          test "$(go env GOVERSION)" = go1.26.10
+          test "$(go env GOVERSION)" = go1.26.11
           test "$(node -p 'process.versions.node.split(".")[0]')" = 22
           set +e
           go test -json -count=1 -timeout=10m ./tools/release-candidate -run '^TestArtifactCoreUnsupportedNode$' | tee "$RUNNER_TEMP/node22.json"
@@ -890,12 +901,14 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Run e2e tests
         run: go test -tags e2e ./internal/server/...
 
   windows-suite:
+    needs: [unit-tests, e2e-tests, plugin-tests]
+    if: ${{ !cancelled() }}
     name: Windows Full Suite (Observational)
     runs-on: windows-2025
     # New observational ceiling, not an SLO or the selective #2020 budgets.
@@ -918,7 +931,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Set up Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -938,7 +951,7 @@ jobs:
           go version
           node --version
           if ((go env GOOS) -ne 'windows' -or (go env GOARCH) -ne 'amd64') { throw 'Native Windows x64 required' }
-          if ((go env GOVERSION) -ne 'go1.26.10' -or (node --version) -notmatch '^v24\.') { throw 'Unexpected toolchain' }
+          if ((go env GOVERSION) -ne 'go1.26.11' -or (node --version) -notmatch '^v24\.') { throw 'Unexpected toolchain' }
           Get-Command powershell.exe
           powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
           $gitDir = Split-Path (Get-Command git.exe).Source
@@ -1036,7 +1049,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Run Windows-specific setup test
         run: go test ./internal/setup/ -run 'TestClaudeCodeEngramCommandPreservesWindowsAbsolutePath|TestResolveEngramCommandMiseInstall|TestCanonicalEngramCommand|TestEnsurePiMCPConfigRepairsDeadEngramCommand' -count=1
@@ -1053,7 +1066,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
       - run: go test ./tools/ -run '^TestCloudSync(Wrappers|PowerShellMissingEngram)$' -v
 
   obsidian-build:
@@ -1145,7 +1158,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.26.10"
+          go-version: "1.26.11"
 
       - name: Compare store benchmarks with the previous main revision
         shell: bash

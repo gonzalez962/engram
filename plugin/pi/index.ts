@@ -113,6 +113,25 @@ const ENGRAM_TOOLS = [
 
 const ENGRAM_TOOL_NAMES = new Set<string>(ENGRAM_TOOLS);
 
+// Tools no injected protocol names leave the per-turn declarations while codemode or tool_search
+// can reach them; otherwise they are re-registered direct (#2347). mem_doctor stays direct:
+// failure messages tell the model to run it.
+const ENGRAM_DEFERRED_TOOLS = new Set<string>([
+  "mem_search_prompts",
+  "mem_consolidate",
+  "mem_session_finalize",
+  "mem_session_start",
+  "mem_judge_many",
+  "mem_compare",
+  "mem_list_projects",
+  "mem_pin",
+  "mem_unpin",
+]);
+
+// Headless/bench runs may suppress the injected protocol text without removing the mem_*
+// tools themselves; only literal "1" defers, so any other value keeps today's injection.
+const ENGRAM_DEFER_MEMORY = process.env.ENGRAM_DEFER_MEMORY === "1";
+
 const MEMORY_INSTRUCTIONS = `## Engram Persistent Memory — Protocol
 
 You have access to Engram, a persistent memory system that survives across sessions and compactions.
@@ -133,6 +152,8 @@ A memory is an evolving topic, not a log entry. Follow this workflow for every l
 Persist verified knowledge that is durable and costly to reconstruct: decisions with rationale,
 non-obvious root causes, real constraints, and resumption-relevant pending work.
 Group related conclusions deliberately, not every task, response, or event.
+A request with several fixes is saved once, when the request is done, unless one fix
+has a non-obvious root cause worth its own entry. The save may share a turn with other tool calls; it does not need a turn of its own.
 Exclude secrets, private data, speculation, raw dumps, and routine progress.
 Never save credentials, private content, or personal data.
 
@@ -305,6 +326,7 @@ interface PassiveCaptureBody {
 
 interface CurrentProjectResponse {
   project?: string;
+  org?: string;
   project_source?: string;
   raw_project?: string;
   project_path?: string;
@@ -337,7 +359,13 @@ interface AgentStartEvent {
   systemPrompt: string;
   prompt?: string;
   // Present on Pi versions that expose structured, per-run cloned prompt options.
-  systemPromptOptions?: { appendSystemPrompt?: string } | null;
+  systemPromptOptions?: { appendSystemPrompt?: string; selectedTools?: unknown } | null;
+}
+
+// A host that lists its active tools without any mem_* tool cannot follow the protocol (#2347).
+function selectionLacksMemoryTools(options: { selectedTools?: unknown } | undefined): boolean {
+  const selected = options?.selectedTools;
+  return Array.isArray(selected) && !selected.some((name) => typeof name === "string" && ENGRAM_TOOL_NAMES.has(name));
 }
 
 function appendPromptSection(options: { appendSystemPrompt?: string }, section: string): void {
@@ -763,7 +791,7 @@ function runtimeContractFailure(reason: string): RuntimeContractError {
   return new RuntimeContractError(`gentle-engram rejected the Engram runtime contract: ${reason}. Expected ${runtimeContractID}. Upgrade Engram and restart its server and Pi; verify ENGRAM_URL/ENGRAM_BIN. Memory dispatch was blocked.`);
 }
 
-async function ensureRuntimeQualification(signal?: AbortSignal): Promise<void> {
+async function ensureRuntimeQualification(signal?: AbortSignal, startupDeadline?: number): Promise<void> {
   throwIfAborted(signal);
   const endpoint = ENGRAM_URL, token = effectiveTransportToken();
   let flight = runtimeQualificationFlight;
@@ -776,7 +804,8 @@ async function ensureRuntimeQualification(signal?: AbortSignal): Promise<void> {
         timer = setTimeout(() => {
           controller.abort();
           reject(runtimeContractFailure("contract probe timed out"));
-        }, ENGRAM_WRITE_TIMEOUT_MS);
+        }, startupDeadline === undefined ? ENGRAM_WRITE_TIMEOUT_MS
+          : Math.max(1, Math.min(ENGRAM_WRITE_TIMEOUT_MS, startupDeadline - Date.now())));
       });
       try {
         const probe = (async () => {
@@ -1208,7 +1237,61 @@ export function detachedServeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return result;
 }
 
-function spawnAndWaitForEngram(deadline: number, expectedID = ""): Promise<void> {
+// `run -d` exits after its daemon reports readiness. Trying it directly is a
+// bounded capability probe: releases before 3.7.0 reject the command, while a
+// source build reporting version "main" needs no special version gate. Any
+// failure retains the legacy detached serve path below.
+const ENGRAM_DAEMON_EXIT_GRACE_MS = 2000;
+
+async function spawnEngramDaemon(deadline: number, expectedID: string): Promise<boolean> {
+  const readiness = new AbortController();
+  let proc: ChildProcess | undefined;
+  try {
+    proc = spawn(ENGRAM_BIN, ["run", "-d"], {
+      env: detachedServeEnv(process.env),
+      windowsHide: true,
+      detached: false,
+      stdio: "ignore",
+    });
+    const child = proc;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const exited = new Promise<void>((resolve) => {
+      child.once("error", () => resolve());
+      child.once("exit", () => resolve());
+    });
+    try {
+      await Promise.race([
+        exited,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(1, deadline - Date.now()));
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      stopAbandonedChild(child);
+      return false;
+    }
+    // A daemon wrapper can exit just before the listener is observable. A
+    // concurrent compatible server also converges through the same health
+    // contract instead of being replaced.
+    await waitForEngramReadiness(readiness.signal, Math.min(deadline, Date.now() + ENGRAM_DAEMON_EXIT_GRACE_MS), expectedID);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    readiness.abort();
+    proc?.unref();
+  }
+}
+
+async function spawnAndWaitForEngram(deadline: number, expectedID = ""): Promise<void> {
+  if (await spawnEngramDaemon(deadline, expectedID)) return;
+  return spawnAndWaitForLegacyEngram(deadline, expectedID);
+}
+
+function spawnAndWaitForLegacyEngram(deadline: number, expectedID = ""): Promise<void> {
   return new Promise((resolvePromise, rejectPromise) => {
     let proc: ChildProcess | undefined;
     let settled = false;
@@ -2027,7 +2110,22 @@ async function initialize(cwd: string): Promise<void> {
   project = fallbackProjectName(cwd);
 
   await initializeEngramServer();
-  await ensureRuntimeQualification();
+  // A pinned server may still be binding its listener. Retry only definite
+  // refusal during shared initialization; contract and HTTP failures stay fatal.
+  const deadline = CONFIGURED_ENGRAM_URL !== undefined && !SESSION_OWNED
+    ? Date.now() + ENGRAM_STARTUP_TIMEOUT_MS : undefined;
+  for (;;) {
+    try {
+      await ensureRuntimeQualification(undefined, deadline);
+      break;
+    } catch (error) {
+      if (!(error instanceof EngramUnavailableError) || deadline === undefined) throw error;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw error;
+      await wait(Math.min(ENGRAM_STARTUP_POLL_MS, remaining));
+      if (Date.now() >= deadline) throw error;
+    }
+  }
 
   applyDetectedProject(await detectServerProject(cwd));
 }
@@ -2124,6 +2222,7 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     type: optionalString("Filter by observation type"),
     project: optionalString("Filter by project name"),
     scope: optionalString("Filter by scope: project, personal, or global. Omit to apply no scope filter."),
+    org: optionalString("Filter by org — a free-text grouping axis orthogonal to scope. Omit to apply no org filter."),
     limit: optionalNumber("Max results"),
     all_projects: optionalBoolean("Search across every project; when true project is ignored"),
     match_mode: optionalString("Match mode: all (default) or any for broader recall"),
@@ -2136,6 +2235,7 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     scope: optionalString("Scope: project, personal, or global"),
     topic_key: optionalString("Stable, deliberate topic key; reuse via mem_update rather than duplicating"),
     project: optionalString("Optional explicit project"),
+    org: optionalString("Optional org — a free-text grouping axis orthogonal to scope"),
     cwd: optionalString("Optional directory whose Engram project receives this write; must agree with project when both are set"),
     capture_prompt: optionalBoolean("Capture the available session/project prompt for this save (default true); does not disable lifecycle capture"),
   }),
@@ -2258,7 +2358,9 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     reasoning: Type.String({ description: "Brief explanation of the verdict" }),
     model: optionalString("Model identifier for provenance"),
   }),
-  mem_list_projects: Type.Object({}),
+  mem_list_projects: Type.Object({
+    org: optionalString("Filter by org — a free-text grouping axis orthogonal to scope. Omit to apply no org filter."),
+  }),
   mem_pin: Type.Object({
     id: Type.Number({ description: "Observation ID to pin" }),
   }),
@@ -2438,6 +2540,7 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
         type: params.type,
         project: params.all_projects ? undefined : activeProject,
         scope: params.scope,
+        org: typeof params.org === "string" ? params.org.trim() || undefined : undefined,
         limit: params.limit,
         match_mode: params.match_mode,
         all_projects: params.all_projects,
@@ -2464,6 +2567,11 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
       })}`);
     case "mem_save": {
       if (!requestedProject) requireResolvedProject();
+      // Reuse core detection, including an explicit cwd's per-call evidence.
+      // Project overrides do not change the caller directory's org label.
+      const detected = writeTarget?.evidence ?? detectedProjectEvidence;
+      const org = (typeof params.org === "string" ? params.org.trim() : "")
+        || (typeof detected?.org === "string" ? detected.org.trim() : "");
       if (writeState) assertOpen(writeState, writeEpoch!);
       const activeSessionId = await registeredSessionForWrite(activeProject);
       if (writeState) assertOpen(writeState, writeEpoch!);
@@ -2478,6 +2586,7 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
           project: activeProject,
           scope: params.scope || "project",
           topic_key: params.topic_key,
+          org: org || undefined,
           capture_prompt: params.capture_prompt,
           current_prompt: params.capture_prompt !== false && currentPrompt
             && writeState?.currentPrompt === currentPrompt
@@ -2762,7 +2871,7 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
         },
       });
     case "mem_list_projects":
-      return fetch("/projects");
+      return fetch(`/projects${queryString({ org: params.org })}`);
     case "mem_pin":
       return fetch(`/observations/${encodeURIComponent(String(params.id))}/pin`, { method: "PUT" });
     case "mem_unpin":
@@ -2830,14 +2939,26 @@ async function executeMemoryTool(toolName: string, params: Record<string, unknow
   }
 }
 
-function registerMemoryTools(pi: ExtensionAPI): void {
-  for (const toolName of ENGRAM_TOOLS) {
+// Registers every memory tool and returns a one-way switch that re-registers the deferred ones as
+// direct. Pi activates a tool whose exposure changes to direct like a newly registered tool,
+// still subject to --tools allowlists and exclusions.
+function registerMemoryTools(pi: ExtensionAPI): () => void {
+  let deferredExposed = false;
+  for (const toolName of ENGRAM_TOOLS) register(toolName, ENGRAM_DEFERRED_TOOLS.has(toolName));
+  return () => {
+    if (deferredExposed) return;
+    deferredExposed = true;
+    for (const toolName of ENGRAM_DEFERRED_TOOLS) register(toolName as (typeof ENGRAM_TOOLS)[number], false);
+  };
+
+  function register(toolName: (typeof ENGRAM_TOOLS)[number], deferred: boolean): void {
     pi.registerTool({
       name: toolName,
       label: `Engram: ${humanToolName(toolName)}`,
       description: `Engram memory tool: ${humanToolName(toolName)}. Compact UI is provided by gentle-engram; persistence is handled by Engram when installed and running.`,
       promptSnippet: `Engram memory: ${humanToolName(toolName)}`,
       parameters: MEMORY_TOOL_SCHEMAS[toolName],
+      ...(deferred ? { exposure: "deferred" as const } : {}),
       renderShell: "self",
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         if (toolName === "mem_doctor") {
@@ -2859,6 +2980,15 @@ function registerMemoryTools(pi: ExtensionAPI): void {
       },
     });
   }
+}
+
+// Deferred tools are reachable only through codemode or tool_search. Without either, or when the
+// host does not report its active tools, they must be declared directly (#2347).
+function sessionCannotReachDeferredTools(options: { selectedTools?: unknown } | undefined): boolean {
+  const selected = options?.selectedTools;
+  if (!Array.isArray(selected)) return true;
+  return !selected.includes("codemode") && !selected.includes("tool_search")
+    && selected.some((name) => typeof name === "string" && ENGRAM_TOOL_NAMES.has(name));
 }
 
 const BRIDGE_CLAIM = "engram:bridge:claim:v1";
@@ -2971,7 +3101,7 @@ export default function registerEngram(pi: ExtensionAPI) {
   // Pi's queued steer/follow-up inputs bypass before_agent_start. Only retain
   // the latest idle input; a FIFO would assign queued provenance to later runs.
   const pendingInput = new WeakMap<object, { sessionId: string; source: InputEvent["source"] }>();
-  registerMemoryTools(pi);
+  const exposeDeferredMemoryTools = registerMemoryTools(pi);
   pi.on("input", (event: InputEvent, ctx: SessionContext) => {
     if (event.streamingBehavior) return { action: "continue" as const };
     const sessionId = observeRuntimeSessionID(ctx);
@@ -3140,7 +3270,9 @@ export default function registerEngram(pi: ExtensionAPI) {
       prior.awaitingInitialUserMessage = false;
       prior.promptTurn = (prior.promptTurn || 0) + 1;
     }
-    const systemPrompt = event.systemPrompt.length > 0 ? `${event.systemPrompt}\n\n${MEMORY_INSTRUCTIONS}` : MEMORY_INSTRUCTIONS;
+    const systemPrompt = ENGRAM_DEFER_MEMORY
+      ? event.systemPrompt
+      : event.systemPrompt.length > 0 ? `${event.systemPrompt}\n\n${MEMORY_INSTRUCTIONS}` : MEMORY_INSTRUCTIONS;
     const state = sessionId ? lifecycle(ctx, sessionId) : undefined;
     if (state) state.awaitingInitialUserMessage = true;
     const epoch = state?.epoch;
@@ -3148,7 +3280,8 @@ export default function registerEngram(pi: ExtensionAPI) {
     // A returned systemPrompt becomes a forced prompt that turns skipping this hook never see
     // (pi#5581), so newer Pi receives the text through the per-run structured options instead.
     const options = event.systemPromptOptions && typeof event.systemPromptOptions === "object" ? event.systemPromptOptions : undefined;
-    if (options) appendPromptSection(options, MEMORY_INSTRUCTIONS);
+    if (sessionCannotReachDeferredTools(options)) exposeDeferredMemoryTools();
+    if (options && !selectionLacksMemoryTools(options) && !ENGRAM_DEFER_MEMORY) appendPromptSection(options, MEMORY_INSTRUCTIONS);
     const message = pendingRecoveryNotice !== undefined && sessionId === pendingRecoveryNotice.sessionId
       ? { customType: "engram-compaction-recovery", content: pendingRecoveryNotice.content, display: false }
       : undefined;

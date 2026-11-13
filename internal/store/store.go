@@ -42,6 +42,16 @@ import (
 const sqliteConstraintForeignKey = 787
 
 const (
+	maxFTSQueryBytes = 65_536
+
+	// maxFTSShortTermQueryTerms keeps LIKE fallbacks below empirically observed
+	// SQLite failures. Filtered SearchContext first failed at 990 terms, while
+	// SearchPrompts first failed at 997 terms. The cap of 768 leaves at least
+	// 221 terms of headroom below the observed worst path.
+	maxFTSShortTermQueryTerms = 768
+)
+
+const (
 	sqlitePrimaryBusy   = 5
 	sqlitePrimaryLocked = 6
 )
@@ -86,6 +96,7 @@ var (
 	ErrObservationFindReplaceResultTooLarge     = errors.New("replacement result exceeds maximum observation length")
 	ErrObservationFindReplaceLegacyContentLarge = errors.New("cannot partially replace oversized legacy observation")
 	ErrPromptContentRequired                    = errors.New("prompt content is required")
+	ErrFTSQueryTooLarge                         = errors.New("fts query too large")
 )
 
 // Sentinel errors for relation sync apply path (Phase 2).
@@ -159,15 +170,18 @@ const (
 )
 
 type Observation struct {
-	ID                 int64   `json:"id"`
-	SyncID             string  `json:"sync_id"`
-	SessionID          string  `json:"session_id"`
-	Type               string  `json:"type"`
-	Title              string  `json:"title"`
-	Content            string  `json:"content"`
-	ToolName           *string `json:"tool_name,omitempty"`
-	Project            *string `json:"project,omitempty"`
-	Scope              string  `json:"scope"`
+	ID        int64   `json:"id"`
+	SyncID    string  `json:"sync_id"`
+	SessionID string  `json:"session_id"`
+	Type      string  `json:"type"`
+	Title     string  `json:"title"`
+	Content   string  `json:"content"`
+	ToolName  *string `json:"tool_name,omitempty"`
+	Project   *string `json:"project,omitempty"`
+	Scope     string  `json:"scope"`
+	// Org is an optional, free-text grouping axis orthogonal to Scope (#776).
+	// Nil for observations saved before this field existed or without an org set.
+	Org                *string `json:"org,omitempty"`
 	TopicKey           *string `json:"topic_key,omitempty"`
 	RevisionCount      int     `json:"revision_count"`
 	DuplicateCount     int     `json:"duplicate_count"`
@@ -234,6 +248,7 @@ type SearchPreviewResult struct {
 	Project     *string `json:"project,omitempty"`
 	TopicKey    *string `json:"topic_key,omitempty"`
 	Scope       string  `json:"scope"`
+	Org         *string `json:"org,omitempty"`
 	ReviewAfter *string `json:"review_after,omitempty"`
 	Pinned      bool    `json:"-"`
 	CreatedAt   string  `json:"created_at"`
@@ -293,6 +308,7 @@ type SearchOptions struct {
 	Type      string `json:"type,omitempty"`
 	Project   string `json:"project,omitempty"`
 	Scope     string `json:"scope,omitempty"`
+	Org       string `json:"org,omitempty"`
 	Limit     int    `json:"limit,omitempty"`
 	MatchMode string `json:"match_mode,omitempty"` // "all" (default) | "any"
 }
@@ -309,6 +325,8 @@ type AddObservationParams struct {
 	TopicKey          string             `json:"topic_key,omitempty"`
 	OperationID       string             `json:"operation_id,omitempty"`
 	Timings           *WriteTimings      `json:"-"`
+	// Org is a free-text grouping axis orthogonal to Scope (#776). Empty means unset.
+	Org string `json:"org,omitempty"`
 }
 
 // WriteTimings collects one write operation's local database stages. It holds
@@ -454,7 +472,7 @@ var legacySyncReviewAfterMonths = map[string]int{
 }
 
 const observationSelectColumns = `id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-	       scope, topic_key, revision_count, duplicate_count, last_seen_at, review_after, pinned, created_at, updated_at, deleted_at, superseded_by_sync_id`
+	       scope, org, topic_key, revision_count, duplicate_count, last_seen_at, review_after, pinned, created_at, updated_at, deleted_at, superseded_by_sync_id`
 
 type SyncState struct {
 	TargetKey           string  `json:"target_key"`
@@ -680,6 +698,7 @@ type syncObservationPayload struct {
 	ToolName       *string `json:"tool_name,omitempty"`
 	Project        *string `json:"project,omitempty"`
 	Scope          string  `json:"scope"`
+	Org            *string `json:"org,omitempty"`
 	TopicKey       *string `json:"topic_key,omitempty"`
 	RevisionCount  int     `json:"revision_count"`
 	DuplicateCount int     `json:"duplicate_count"`
@@ -1420,8 +1439,53 @@ func (s *Store) backfillLegacySessionOwnershipModes() error {
 	return nil
 }
 
+// backfillLegacySyncMutationProjects preserves payload-first recovery followed
+// by session fallback, without updating rows whose project would remain blank.
+// CASE keeps added JSON evaluation inside the original eligibility conditions.
+func (s *Store) backfillLegacySyncMutationProjects() error {
+	// Backfill: extract project from JSON payload for existing rows with empty project.
+	if _, err := s.execHook(s.db, `
+		UPDATE sync_mutations
+		SET project = COALESCE(json_extract(payload, '$.project'), '')
+		WHERE project = '' AND payload != ''
+		  AND CASE WHEN project = '' AND payload != ''
+		      THEN COALESCE(json_extract(payload, '$.project'), '') != ''
+		      ELSE 0 END
+	`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `
+		UPDATE sync_mutations
+		SET project = COALESCE((
+			SELECT sessions.project
+			FROM sessions
+			WHERE sessions.id = json_extract(sync_mutations.payload, '$.session_id')
+		), '')
+		WHERE project = ''
+		  AND payload != ''
+		  AND ifnull(json_extract(payload, '$.session_id'), '') != ''
+		  AND CASE WHEN project = '' AND payload != ''
+		      THEN COALESCE((
+		          SELECT sessions.project FROM sessions
+		          WHERE sessions.id = json_extract(sync_mutations.payload, '$.session_id')
+		      ), '') != ''
+		      ELSE 0 END
+	`); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (s *Store) migrate() error {
-	schema := `
+	// Existing and partially migrated schemas can have triggers that need FTS
+	// before the legacy data migrations run. Only an empty schema can defer
+	// creation to migrateFTS, which installs tables and triggers together.
+	var existingSchema bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master)`).Scan(&existingSchema); err != nil {
+		return fmt.Errorf("inspect initial schema: %w", err)
+	}
+	const baseSchema = `
 		CREATE TABLE IF NOT EXISTS project_aliases (
 			kind TEXT NOT NULL CHECK (kind IN ('key', 'cwd')),
 			alias_key TEXT NOT NULL,
@@ -1475,6 +1539,13 @@ func (s *Store) migrate() error {
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
+			review_after TEXT,
+			superseded_by_sync_id TEXT,
+			expires_at TEXT,
+			embedding BLOB,
+			embedding_model TEXT,
+			embedding_created_at TEXT,
+			org TEXT,
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		);
 
@@ -1482,18 +1553,6 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_obs_type     ON observations(type);
 		CREATE INDEX IF NOT EXISTS idx_obs_project  ON observations(project);
 		CREATE INDEX IF NOT EXISTS idx_obs_created  ON observations(created_at DESC);
-
-		CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
-			title,
-			content,
-			tool_name,
-			type,
-			project,
-			topic_key,
-			tokenize='trigram remove_diacritics 1',
-			content='observations',
-			content_rowid='id'
-		);
 
 		CREATE TABLE IF NOT EXISTS observation_versions (
 			id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1554,6 +1613,7 @@ func (s *Store) migrate() error {
 				active                   BOOLEAN NOT NULL DEFAULT 1,
 				last_mutation_seq        INTEGER NOT NULL DEFAULT 0,
 				last_remote_mutation_seq INTEGER,
+				superseded_by_sync_id    TEXT,
 				PRIMARY KEY (entity, entity_key)
 			);
 
@@ -1568,14 +1628,6 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_prompts_session ON user_prompts(session_id);
 		CREATE INDEX IF NOT EXISTS idx_prompts_project ON user_prompts(project);
 		CREATE INDEX IF NOT EXISTS idx_prompts_created ON user_prompts(created_at DESC);
-
-		CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
-			content,
-			project,
-			tokenize='trigram remove_diacritics 1',
-			content='user_prompts',
-			content_rowid='id'
-		);
 
 			-- Local Git clear intent is independent of enrollment and cloud acks.
 			-- Retain events; manifest history owns export deduplication.
@@ -1592,6 +1644,17 @@ func (s *Store) migrate() error {
 				PRIMARY KEY (target_key, chunk_id)
 			);
 
+			-- Local derived evidence, never exported as memory or sync data.
+			CREATE TABLE IF NOT EXISTS sync_chunk_delete_evidence (
+				target_key TEXT NOT NULL,
+				scope TEXT NOT NULL,
+				manifest_version INTEGER NOT NULL,
+				chunk_id TEXT NOT NULL,
+				deleted_ids TEXT NOT NULL,
+				PRIMARY KEY (target_key, scope, manifest_version, chunk_id),
+				FOREIGN KEY (target_key, chunk_id) REFERENCES sync_chunks(target_key, chunk_id) ON DELETE CASCADE
+			);
+
 			CREATE TABLE IF NOT EXISTS sync_state (
 				target_key           TEXT PRIMARY KEY,
 				lifecycle            TEXT NOT NULL DEFAULT 'idle',
@@ -1604,7 +1667,9 @@ func (s *Store) migrate() error {
 				lease_until          TEXT,
 				last_error           TEXT,
 				last_success_at      TEXT,
-				updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+				updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+				reason_code          TEXT,
+				reason_message       TEXT
 			);
 
 			CREATE TABLE IF NOT EXISTS sync_mutations (
@@ -1621,6 +1686,7 @@ func (s *Store) migrate() error {
 				disposition_reason TEXT,
 				disposition_evidence TEXT,
 				disposition_at TEXT,
+				project TEXT NOT NULL DEFAULT '',
 				FOREIGN KEY (target_key) REFERENCES sync_state(target_key)
 			);
 
@@ -1636,6 +1702,31 @@ func (s *Store) migrate() error {
 				updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
 			);
 		`
+	schema := baseSchema
+	if existingSchema {
+		schema = baseSchema + `
+		CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
+			title,
+			content,
+			tool_name,
+			type,
+			project,
+			topic_key,
+			tokenize='trigram remove_diacritics 1',
+			content='observations',
+			content_rowid='id'
+		);
+
+		CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
+			content,
+			project,
+			tokenize='trigram remove_diacritics 1',
+			content='user_prompts',
+			content_rowid='id'
+		);
+		`
+	}
+
 	if _, err := s.execHook(s.db, schema); err != nil {
 		return err
 	}
@@ -1643,12 +1734,16 @@ func (s *Store) migrate() error {
 		return err
 	}
 
-	observationColumns := []struct {
-		name       string
-		definition string
-	}{
+	observationColumns := []migrationColumn{
 		{name: "sync_id", definition: "TEXT"},
 		{name: "scope", definition: "TEXT NOT NULL DEFAULT 'project'"},
+		// org-grouping-axis (#776): a second grouping axis orthogonal to scope,
+		// additive nullable, empty/NULL by default. Treated exactly like scope —
+		// present in the fresh CREATE TABLE, in this primary upgrade batch, and in
+		// the legacy observations rebuild — so it is NOT part of the memory-
+		// conflict batch (which has its own asserted ALTER count) and needs no
+		// extra observations metadata read.
+		{name: "org", definition: "TEXT"},
 		{name: "topic_key", definition: "TEXT"},
 		{name: "normalized_hash", definition: "TEXT"},
 		{name: "revision_count", definition: "INTEGER NOT NULL DEFAULT 1"},
@@ -1658,22 +1753,18 @@ func (s *Store) migrate() error {
 		{name: "updated_at", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "deleted_at", definition: "TEXT"},
 	}
-	for _, c := range observationColumns {
-		if err := s.addColumnIfNotExists("observations", c.name, c.definition); err != nil {
-			return err
-		}
+	if err := s.addColumnsIfNotExists("observations", observationColumns...); err != nil {
+		return err
 	}
 
 	if err := s.migrateLegacyObservationsTable(); err != nil {
 		return err
 	}
-	if err := s.addColumnIfNotExists("sessions", "ownership_mode", "TEXT"); err != nil {
-		return err
-	}
-	if err := s.addColumnIfNotExists("sessions", "runtime_lease_expires_at", "TEXT"); err != nil {
-		return err
-	}
-	if err := s.addColumnIfNotExists("sessions", "local_creation_project", "TEXT"); err != nil {
+	if err := s.addColumnsIfNotExists("sessions",
+		migrationColumn{"ownership_mode", "TEXT"},
+		migrationColumn{"runtime_lease_expires_at", "TEXT"},
+		migrationColumn{"local_creation_project", "TEXT"},
+	); err != nil {
 		return err
 	}
 	// Legacy rows remain unclassified unless their persisted identity proves a
@@ -1682,29 +1773,27 @@ func (s *Store) migrate() error {
 		return err
 	}
 
-	if err := s.addColumnIfNotExists("user_prompts", "sync_id", "TEXT"); err != nil {
+	if err := s.addColumnsIfNotExists("user_prompts",
+		migrationColumn{"sync_id", "TEXT"},
+		migrationColumn{"source_inbox_id", "TEXT"},
+		migrationColumn{"local_creation_session_id", "TEXT"},
+		migrationColumn{"local_creation_inbox_id", "TEXT"},
+		migrationColumn{"local_creation_project", "TEXT"},
+	); err != nil {
 		return err
 	}
-	if err := s.addColumnIfNotExists("user_prompts", "source_inbox_id", "TEXT"); err != nil {
+	if err := s.addColumnsIfNotExists("prompt_tombstones",
+		migrationColumn{"source_inbox_id", "TEXT"},
+		migrationColumn{"local_creation_session_id", "TEXT"},
+		migrationColumn{"local_creation_inbox_id", "TEXT"},
+		migrationColumn{"local_creation_project", "TEXT"},
+	); err != nil {
 		return err
 	}
-	for _, column := range []string{"local_creation_session_id", "local_creation_inbox_id", "local_creation_project"} {
-		if err := s.addColumnIfNotExists("user_prompts", column, "TEXT"); err != nil {
-			return err
-		}
-	}
-	if err := s.addColumnIfNotExists("prompt_tombstones", "source_inbox_id", "TEXT"); err != nil {
-		return err
-	}
-	for _, column := range []string{"local_creation_session_id", "local_creation_inbox_id", "local_creation_project"} {
-		if err := s.addColumnIfNotExists("prompt_tombstones", column, "TEXT"); err != nil {
-			return err
-		}
-	}
-	if err := s.addColumnIfNotExists("sync_delete_tombstones", "superseded_by_sync_id", "TEXT"); err != nil {
-		return err
-	}
-	if err := s.addColumnIfNotExists("sync_delete_tombstones", "last_remote_mutation_seq", "INTEGER"); err != nil {
+	if err := s.addColumnsIfNotExists("sync_delete_tombstones",
+		migrationColumn{"superseded_by_sync_id", "TEXT"},
+		migrationColumn{"last_remote_mutation_seq", "INTEGER"},
+	); err != nil {
 		return err
 	}
 	if err := s.migrateFTS(); err != nil {
@@ -1732,29 +1821,23 @@ func (s *Store) migrate() error {
 	}
 
 	// Project-scoped sync: add project column to sync_mutations and enrollment table.
-	if err := s.addColumnIfNotExists("sync_mutations", "project", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	for _, c := range []struct{ name, definition string }{
+	if err := s.addColumnsIfNotExists("sync_mutations", []migrationColumn{
+		{"project", "TEXT NOT NULL DEFAULT ''"},
 		{"disposition", "TEXT NOT NULL DEFAULT 'pending'"},
 		{"disposition_reason", "TEXT"},
 		{"disposition_evidence", "TEXT"},
 		{"disposition_at", "TEXT"},
-	} {
-		if err := s.addColumnIfNotExists("sync_mutations", c.name, c.definition); err != nil {
-			return err
-		}
+	}...); err != nil {
+		return err
 	}
 	if _, err := s.execHook(s.db, `UPDATE sync_mutations SET disposition = 'pending' WHERE disposition IS NULL OR disposition = ''`); err != nil {
 		return err
 	}
-	if err := s.addColumnIfNotExists("sync_state", "reason_code", "TEXT"); err != nil {
-		return err
-	}
-	if err := s.addColumnIfNotExists("sync_state", "reason_message", "TEXT"); err != nil {
-		return err
-	}
-	if err := s.addColumnIfNotExists("sync_state", "last_success_at", "TEXT"); err != nil {
+	if err := s.addColumnsIfNotExists("sync_state",
+		migrationColumn{"reason_code", "TEXT"},
+		migrationColumn{"reason_message", "TEXT"},
+		migrationColumn{"last_success_at", "TEXT"},
+	); err != nil {
 		return err
 	}
 	if err := s.migrateSyncChunksTable(); err != nil {
@@ -1763,13 +1846,10 @@ func (s *Store) migrate() error {
 
 	// ── Phase: memory-conflict-surfacing — B.1 ──────────────────────────────
 	// Additive nullable columns on observations for conflict surfacing, decay,
-	// and embedding reservation.  All applied via addColumnIfNotExists so that
+	// and embedding reservation. Applied as a fresh schema batch so that
 	// running migrate() on a fresh DB (where CREATE TABLE already added these
 	// columns) is a no-op.
-	memConflictObsCols := []struct {
-		name       string
-		definition string
-	}{
+	memConflictObsCols := []migrationColumn{
 		{name: "review_after", definition: "TEXT"},
 		{name: "superseded_by_sync_id", definition: "TEXT"},
 		{name: "expires_at", definition: "TEXT"},
@@ -1777,10 +1857,8 @@ func (s *Store) migrate() error {
 		{name: "embedding_model", definition: "TEXT"},
 		{name: "embedding_created_at", definition: "TEXT"},
 	}
-	for _, c := range memConflictObsCols {
-		if err := s.addColumnIfNotExists("observations", c.name, c.definition); err != nil {
-			return err
-		}
+	if err := s.addColumnsIfNotExists("observations", memConflictObsCols...); err != nil {
+		return err
 	}
 
 	// ── Phase: memory-conflict-surfacing — B.2 ──────────────────────────────
@@ -1821,6 +1899,15 @@ func (s *Store) migrate() error {
 		return err
 	}
 
+	// ── Phase: org-grouping-axis (#776) ─────────────────────────────────────
+	// The org column is added with the primary observations batch above (like
+	// scope); here we only index it for grouping/filtering queries. Created after
+	// the memory_relations table so it stays outside the observation column-batch
+	// window asserted by TestObservationSchemaInitialColumnBatch.
+	if _, err := s.execHook(s.db, `CREATE INDEX IF NOT EXISTS idx_obs_org ON observations(org)`); err != nil {
+		return err
+	}
+
 	if _, err := s.execHook(s.db, `
 		CREATE TABLE IF NOT EXISTS sync_enrolled_projects (
 			project     TEXT PRIMARY KEY,
@@ -1830,44 +1917,11 @@ func (s *Store) migrate() error {
 	`); err != nil {
 		return err
 	}
-	// Backfill: extract project from JSON payload for existing rows with empty project.
-	if _, err := s.execHook(s.db, `
-		UPDATE sync_mutations
-		SET project = COALESCE(json_extract(payload, '$.project'), '')
-		WHERE project = '' AND payload != ''
-	`); err != nil {
-		return err
-	}
-	if _, err := s.execHook(s.db, `
-		UPDATE sync_mutations
-		SET project = COALESCE((
-			SELECT sessions.project
-			FROM sessions
-			WHERE sessions.id = json_extract(sync_mutations.payload, '$.session_id')
-		), '')
-		WHERE project = ''
-		  AND payload != ''
-		  AND ifnull(json_extract(payload, '$.session_id'), '') != ''
-	`); err != nil {
+	if err := s.backfillLegacySyncMutationProjects(); err != nil {
 		return err
 	}
 
-	if _, err := s.execHook(s.db, `UPDATE observations SET scope = 'project' WHERE scope IS NULL OR scope = ''`); err != nil {
-		return err
-	}
-	if _, err := s.execHook(s.db, `UPDATE observations SET topic_key = NULL WHERE topic_key = ''`); err != nil {
-		return err
-	}
-	if _, err := s.execHook(s.db, `UPDATE observations SET revision_count = 1 WHERE revision_count IS NULL OR revision_count < 1`); err != nil {
-		return err
-	}
-	if _, err := s.execHook(s.db, `UPDATE observations SET duplicate_count = 1 WHERE duplicate_count IS NULL OR duplicate_count < 1`); err != nil {
-		return err
-	}
-	if _, err := s.execHook(s.db, `UPDATE observations SET updated_at = created_at WHERE updated_at IS NULL OR updated_at = ''`); err != nil {
-		return err
-	}
-	if _, err := s.execHook(s.db, `UPDATE observations SET sync_id = 'obs-' || lower(hex(randomblob(16))) WHERE sync_id IS NULL OR sync_id = ''`); err != nil {
+	if err := s.normalizeLegacyObservations(); err != nil {
 		return err
 	}
 
@@ -1940,10 +1994,7 @@ func (s *Store) migrate() error {
 	`); err != nil {
 		return err
 	}
-	deferredColumns := []struct {
-		name       string
-		definition string
-	}{
+	deferredColumns := []migrationColumn{
 		{name: "target_key", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "remote_seq", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "entity_key", definition: "TEXT NOT NULL DEFAULT ''"},
@@ -1960,10 +2011,8 @@ func (s *Store) migrate() error {
 		// at all, which is itself one of the reasons its row is dead.
 		{name: "payload_sync_id", definition: "TEXT NOT NULL DEFAULT ''"},
 	}
-	for _, c := range deferredColumns {
-		if err := s.addColumnIfNotExists("sync_apply_deferred", c.name, c.definition); err != nil {
-			return err
-		}
+	if err := s.addColumnsIfNotExists("sync_apply_deferred", deferredColumns...); err != nil {
+		return err
 	}
 	if _, err := s.execHook(s.db, `
 		CREATE INDEX IF NOT EXISTS idx_sad_scope_status_seen
@@ -2039,6 +2088,47 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_obs_save_op_created
 			ON observation_save_operations(created_at);
 	`); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// normalizeLegacyObservations preserves the ordered repair statements, while
+// healthy databases need only one check. Keep the guard predicates equivalent
+// to the repairs below; do not cache the result between migration runs.
+func (s *Store) normalizeLegacyObservations() error {
+	var needsNormalization bool
+	if err := s.db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM observations
+		WHERE scope IS NULL OR scope = ''
+			OR topic_key = ''
+			OR revision_count IS NULL OR revision_count < 1
+			OR duplicate_count IS NULL OR duplicate_count < 1
+			OR updated_at IS NULL OR updated_at = ''
+			OR sync_id IS NULL OR sync_id = ''
+	)`).Scan(&needsNormalization); err != nil {
+		return fmt.Errorf("inspect legacy observations: %w", err)
+	}
+	if !needsNormalization {
+		return nil
+	}
+	if _, err := s.execHook(s.db, `UPDATE observations SET scope = 'project' WHERE scope IS NULL OR scope = ''`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `UPDATE observations SET topic_key = NULL WHERE topic_key = ''`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `UPDATE observations SET revision_count = 1 WHERE revision_count IS NULL OR revision_count < 1`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `UPDATE observations SET duplicate_count = 1 WHERE duplicate_count IS NULL OR duplicate_count < 1`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `UPDATE observations SET updated_at = created_at WHERE updated_at IS NULL OR updated_at = ''`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `UPDATE observations SET sync_id = 'obs-' || lower(hex(randomblob(16))) WHERE sync_id IS NULL OR sync_id = ''`); err != nil {
 		return err
 	}
 
@@ -3255,13 +3345,14 @@ func (s *Store) migrateFTS() error {
 			return fmt.Errorf("inspect prompts fts: %w", err)
 		}
 
-		observationsRebuild := !observationsOK || !ftsTriggersMatch(tx, map[string][]string{
+		triggerDefinitions := s.readFTSTriggerDefinitions(tx)
+		observationsRebuild := !observationsOK || !ftsTriggersMatch(triggerDefinitions, map[string][]string{
 			"obs_fts_insert":        {"afterinsertonobservations", "whennew.deleted_atisnull"},
 			"obs_fts_delete":        {"beforedeleteonobservations", "whenold.deleted_atisnull", "deletefromobservations_ftswhererowid=old.id"},
 			"obs_fts_update":        {"beforeupdateonobservations", "whenold.deleted_atisnull", "deletefromobservations_ftswhererowid=old.id"},
 			"obs_fts_update_insert": {"afterupdateonobservations", "whennew.deleted_atisnull"},
 		})
-		promptsRebuild := !promptsOK || !ftsTriggersMatch(tx, map[string][]string{
+		promptsRebuild := !promptsOK || !ftsTriggersMatch(triggerDefinitions, map[string][]string{
 			"prompt_fts_insert":        {"afterinsertonuser_prompts"},
 			"prompt_fts_delete":        {"beforedeleteonuser_prompts", "deletefromprompts_ftswhererowid=old.id"},
 			"prompt_fts_update":        {"beforeupdateonuser_prompts", "deletefromprompts_ftswhererowid=old.id"},
@@ -3340,10 +3431,34 @@ func ftsTableMatches(tx *sql.Tx, table string, expectedColumns []string, content
 		strings.Contains(normalized, "content_rowid='id'"), nil
 }
 
-func ftsTriggersMatch(tx *sql.Tx, expected map[string][]string) bool {
+// readFTSTriggerDefinitions snapshots both trigger groups in the migration
+// transaction. An unreadable or partial snapshot is invalid, retaining the
+// existing mismatch-and-repair behavior for trigger inspection failures.
+func (s *Store) readFTSTriggerDefinitions(tx *sql.Tx) map[string]string {
+	rows, err := s.queryItHook(tx, `SELECT name, sql FROM sqlite_master
+		WHERE type = 'trigger' AND (name GLOB 'obs_fts_*' OR name GLOB 'prompt_fts_*')`)
+	if err != nil {
+		return nil
+	}
+	definitions := make(map[string]string, 8)
+	for rows.Next() {
+		var name, ddl string
+		if err := rows.Scan(&name, &ddl); err != nil {
+			_ = rows.Close()
+			return nil
+		}
+		definitions[name] = ddl
+	}
+	if err := closeRowsWithError(rows, rows.Err()); err != nil {
+		return nil
+	}
+	return definitions
+}
+
+func ftsTriggersMatch(definitions map[string]string, expected map[string][]string) bool {
 	for name, fragments := range expected {
-		var ddl string
-		if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?`, name).Scan(&ddl); err != nil {
+		ddl, ok := definitions[name]
+		if !ok {
 			return false
 		}
 		normalized := normalizeFTSSQL(ddl)
@@ -4371,10 +4486,11 @@ func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservation
 				 WHERE topic_key = ?
 				   AND ifnull(project, '') = ifnull(?, '')
 				   AND scope = ?
+				   AND ifnull(org, '') = ifnull(?, '')
 				   AND deleted_at IS NULL
 				 ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
 				 LIMIT 1`,
-				topicKey, nullableString(p.Project), scope,
+				topicKey, nullableString(p.Project), scope, nullableString(p.Org),
 			).Scan(&existingID)
 			if err == nil {
 				// Capture the pre-overwrite state before the topic_key upsert
@@ -4393,6 +4509,7 @@ func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservation
 					     title = ?,
 					     content = ?,
 					     tool_name = ?,
+					     org = ?,
 					     topic_key = ?,
 					     normalized_hash = ?,
 					     revision_count = revision_count + 1,
@@ -4404,6 +4521,7 @@ func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservation
 					title,
 					content,
 					nullableString(p.ToolName),
+					nullableString(p.Org),
 					nullableString(topicKey),
 					normHash,
 					Now(),
@@ -4430,13 +4548,14 @@ func (s *Store) AddObservationWithResult(p AddObservationParams) (AddObservation
 			 WHERE normalized_hash = ?
 			   AND ifnull(project, '') = ifnull(?, '')
 			   AND scope = ?
+			   AND ifnull(org, '') = ifnull(?, '')
 			   AND type = ?
 			   AND title = ?
 			   AND deleted_at IS NULL
 			   AND datetime(created_at) >= datetime('now', ?)
 			 ORDER BY created_at DESC
 			 LIMIT 1`,
-			normHash, nullableString(p.Project), scope, p.Type, title, window,
+			normHash, nullableString(p.Project), scope, nullableString(p.Org), p.Type, title, window,
 		).Scan(&existingID)
 		if err == nil {
 			if _, err := s.execHook(tx,
@@ -4518,18 +4637,18 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 // ContextOptions.Pinned) use the unexported pinnedObservationsLimit helper,
 // which this delegates to with limit=0 ("no LIMIT clause", i.e. unbounded).
 func (s *Store) PinnedObservations(project, scope string) ([]Observation, error) {
-	return s.pinnedObservationsLimit(project, scope, 0)
+	return s.pinnedObservationsLimit(project, scope, 0, false)
 }
 
 // pinnedObservationsLimit is the shared query behind PinnedObservations. A
 // limit <= 0 means "no LIMIT clause" (every pinned row, matching
 // PinnedObservations' historical unbounded behavior); a positive limit caps
 // the result via SQL LIMIT.
-func (s *Store) pinnedObservationsLimit(project, scope string, limit int) ([]Observation, error) {
+func (s *Store) pinnedObservationsLimit(project, scope string, limit int, compact bool) ([]Observation, error) {
 	project, _ = NormalizeProject(project)
 
 	query := `
-		SELECT ` + observationSelectColumns + `
+		SELECT ` + contextObservationColumns(compact) + `
 		FROM observations o
 		WHERE o.deleted_at IS NULL AND o.pinned = 1
 	`
@@ -4549,7 +4668,7 @@ func (s *Store) pinnedObservationsLimit(project, scope string, limit int) ([]Obs
 		query += " LIMIT ?"
 		args = append(args, limit)
 	}
-	return s.queryObservations(query, args...)
+	return s.queryContextObservations(s.db, query, args, compact)
 }
 
 func (s *Store) PinObservation(id int64) error {
@@ -4579,14 +4698,14 @@ func (s *Store) setObservationPinned(id int64, pinned bool) error {
 	return nil
 }
 
-func (s *Store) recentUnpinnedObservations(project, scope string, limit int) ([]Observation, error) {
+func (s *Store) recentUnpinnedObservations(project, scope string, limit int, compact bool) ([]Observation, error) {
 	project, _ = NormalizeProject(project)
 	if limit <= 0 {
 		limit = s.cfg.MaxContextResults
 	}
 
 	query := `
-		SELECT ` + observationSelectColumns + `
+		SELECT ` + contextObservationColumns(compact) + `
 		FROM observations o
 		WHERE o.deleted_at IS NULL AND o.pinned = 0
 	`
@@ -4601,7 +4720,7 @@ func (s *Store) recentUnpinnedObservations(project, scope string, limit int) ([]
 	}
 	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC LIMIT ?"
 	args = append(args, limit)
-	return s.queryObservations(query, args...)
+	return s.queryContextObservations(s.db, query, args, compact)
 }
 
 func (s *Store) compactionObservations(sessionID, project string, pinned bool, limit int) ([]Observation, error) {
@@ -5098,6 +5217,9 @@ func (s *Store) compactionPrompts(sessionID, project string, limit int) ([]Promp
 }
 
 func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt, error) {
+	if err := validateFTSQueryLength(query); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = 10
 	}
@@ -5105,6 +5227,9 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 	var sql string
 	var args []any
 	if hasShortFTSTerm(query) {
+		if err := validateShortTermFTSQuery(query); err != nil {
+			return nil, err
+		}
 		sql, args = buildPromptLIKEQuery(query, project, limit)
 	} else {
 		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(query), project, limit)
@@ -5783,6 +5908,10 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 		return nil, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
 	}
 
+	if err := validateFTSQueryLength(query); err != nil {
+		return nil, err
+	}
+
 	// Normalize project filter so "Engram" finds records stored as "engram"
 	opts.Project, _ = NormalizeProject(opts.Project)
 
@@ -5815,6 +5944,10 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 			tkSQL += " AND scope = ?"
 			tkArgs = append(tkArgs, normalizeScope(opts.Scope))
 		}
+		if opts.Org != "" {
+			tkSQL += " AND org = ?"
+			tkArgs = append(tkArgs, opts.Org)
+		}
 
 		tkSQL += " ORDER BY updated_at DESC LIMIT ?"
 		tkArgs = append(tkArgs, limit)
@@ -5829,7 +5962,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 				var sr SearchResult
 				if err := tkRows.Scan(
 					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
-					&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+					&sr.ToolName, &sr.Project, &sr.Scope, &sr.Org, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
 					&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt, &sr.SupersededBySyncID,
 				); err != nil {
 					if ctxErr := ctx.Err(); ctxErr != nil {
@@ -5854,6 +5987,9 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 	var sqlQ string
 	var args []any
 	if hasShortFTSTerm(query) {
+		if err := validateShortTermFTSQuery(query); err != nil {
+			return nil, err
+		}
 		sqlQ, args = buildSearchLIKEQuery(query, opts, limit)
 	} else {
 		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
@@ -5888,7 +6024,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 		var sr SearchResult
 		if err := rows.Scan(
 			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
-			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+			&sr.ToolName, &sr.Project, &sr.Scope, &sr.Org, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
 			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt, &sr.SupersededBySyncID,
 			&sr.Rank,
 		); err != nil {
@@ -5932,6 +6068,9 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 	default:
 		return nil, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
 	}
+	if err := validateFTSQueryLength(query); err != nil {
+		return nil, err
+	}
 
 	opts.Project, _ = NormalizeProject(opts.Project)
 	limit := opts.Limit
@@ -5947,7 +6086,7 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 		tkSQL := `
 			SELECT id, ifnull(sync_id, '') as sync_id, type, title,
 			       substr(content, 1, 300) as preview, length(content) > 300 as truncated,
-			       project, topic_key, scope, review_after, pinned, created_at
+			       project, topic_key, scope, org, review_after, pinned, created_at
 			FROM observations
 			WHERE topic_key = ? AND deleted_at IS NULL
 		`
@@ -5963,6 +6102,10 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 		if opts.Scope != "" {
 			tkSQL += " AND scope = ?"
 			tkArgs = append(tkArgs, normalizeScope(opts.Scope))
+		}
+		if opts.Org != "" {
+			tkSQL += " AND org = ?"
+			tkArgs = append(tkArgs, opts.Org)
 		}
 		tkSQL += " ORDER BY updated_at DESC LIMIT ?"
 		tkArgs = append(tkArgs, limit)
@@ -5995,6 +6138,9 @@ func (s *Store) SearchPreviewsContext(ctx context.Context, query string, opts Se
 	var sqlQ string
 	var args []any
 	if hasShortFTSTerm(query) {
+		if err := validateShortTermFTSQuery(query); err != nil {
+			return nil, err
+		}
 		sqlQ, args = buildSearchPreviewLIKEQuery(query, opts, limit)
 	} else {
 		ftsQuery := sanitizeFTS(query)
@@ -6067,13 +6213,13 @@ func buildSearchPromptsFTSQuery(ftsQuery, project string, limit int) (string, []
 
 func buildSearchFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
 	return buildSearchFTSQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-	       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at, o.superseded_by_sync_id`, ftsQuery, opts, limit)
+	       o.scope, o.org, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at, o.superseded_by_sync_id`, ftsQuery, opts, limit)
 }
 
 func buildSearchPreviewFTSQuery(ftsQuery string, opts SearchOptions, limit int) (string, []any) {
 	return buildSearchFTSQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.type, o.title,
 	       substr(o.content, 1, 300) as preview, length(o.content) > 300 as truncated,
-	       o.project, o.topic_key, o.scope, o.review_after, o.pinned, o.created_at`, ftsQuery, opts, limit)
+	       o.project, o.topic_key, o.scope, o.org, o.review_after, o.pinned, o.created_at`, ftsQuery, opts, limit)
 }
 
 func buildSearchFTSQueryWithColumns(columns, ftsQuery string, opts SearchOptions, limit int) (string, []any) {
@@ -6118,6 +6264,10 @@ func buildSearchFTSQueryWithColumns(columns, ftsQuery string, opts SearchOptions
 		sqlQ += " AND o.scope = ?"
 		args = append(args, normalizeScope(opts.Scope))
 	}
+	if opts.Org != "" {
+		sqlQ += " AND o.org = ?"
+		args = append(args, opts.Org)
+	}
 
 	sqlQ += " ORDER BY " + compositeRank + " ASC, COALESCE(NULLIF(o.sync_id, ''), printf('%020d', o.id)) ASC, o.id ASC LIMIT ?"
 	return sqlQ, append(args, limit)
@@ -6154,13 +6304,13 @@ func escapeLIKE(term string) string {
 
 func buildSearchLIKEQuery(query string, opts SearchOptions, limit int) (string, []any) {
 	return buildSearchLIKEQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-	       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at, o.superseded_by_sync_id`, query, opts, limit)
+	       o.scope, o.org, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at, o.superseded_by_sync_id`, query, opts, limit)
 }
 
 func buildSearchPreviewLIKEQuery(query string, opts SearchOptions, limit int) (string, []any) {
 	return buildSearchLIKEQueryWithColumns(`o.id, ifnull(o.sync_id, '') as sync_id, o.type, o.title,
 	       substr(o.content, 1, 300) as preview, length(o.content) > 300 as truncated,
-	       o.project, o.topic_key, o.scope, o.review_after, o.pinned, o.created_at`, query, opts, limit)
+	       o.project, o.topic_key, o.scope, o.org, o.review_after, o.pinned, o.created_at`, query, opts, limit)
 }
 
 func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions, limit int) (string, []any) {
@@ -6195,6 +6345,10 @@ func buildSearchLIKEQueryWithColumns(columns, query string, opts SearchOptions, 
 	if opts.Scope != "" {
 		sqlQ += " AND o.scope = ?"
 		args = append(args, normalizeScope(opts.Scope))
+	}
+	if opts.Org != "" {
+		sqlQ += " AND o.org = ?"
+		args = append(args, opts.Org)
 	}
 	sqlQ += " ORDER BY datetime(o.updated_at) DESC, o.id DESC LIMIT ?"
 	return sqlQ, append(args, limit)
@@ -6238,6 +6392,26 @@ func (s *Store) StatsProject(project string) (*Stats, error) {
 }
 
 func (s *Store) statsForProject(project string) (*Stats, error) {
+	stats, _, err := s.statsForProjectLimit(project, 0)
+	return stats, err
+}
+
+// ContextStats returns aggregate counts, at most maxProjects project names, and
+// the exact project total. Public Stats and StatsProject retain complete lists.
+func (s *Store) ContextStats(project string, maxProjects int) (*Stats, int, error) {
+	if maxProjects <= 0 {
+		return nil, 0, fmt.Errorf("max projects must be positive")
+	}
+	if project != "" {
+		project, _ = NormalizeProject(project)
+		if strings.TrimSpace(project) == "" {
+			return nil, 0, fmt.Errorf("project is required")
+		}
+	}
+	return s.statsForProjectLimit(project, maxProjects)
+}
+
+func (s *Store) statsForProjectLimit(project string, maxProjects int) (*Stats, int, error) {
 	stats := &Stats{}
 	args := []any{}
 	where := ""
@@ -6246,47 +6420,66 @@ func (s *Store) statsForProject(project string) (*Stats, error) {
 		args = append(args, project)
 	}
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM sessions"+where, args...).Scan(&stats.TotalSessions); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL"+func() string {
-		if project == "" {
-			return ""
-		}
-		return " AND LOWER(project) = ?"
-	}(), args...).Scan(&stats.TotalObservations); err != nil {
-		return nil, err
+	observationsFilter := ""
+	if project != "" {
+		observationsFilter = " AND LOWER(project) = ?"
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL"+observationsFilter, args...).Scan(&stats.TotalObservations); err != nil {
+		return nil, 0, err
 	}
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM user_prompts"+where, args...).Scan(&stats.TotalPrompts); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	projectsQuery := "SELECT project FROM observations WHERE project IS NOT NULL AND deleted_at IS NULL"
+	projectColumns := "project"
+	if maxProjects > 0 {
+		projectColumns += ", MAX(created_at) AS latest_created_at"
+	}
+	projectsQuery := "SELECT " + projectColumns + " FROM observations WHERE project IS NOT NULL AND deleted_at IS NULL"
 	if project != "" {
 		projectsQuery += " AND LOWER(project) = ?"
 	}
 	projectsQuery += " GROUP BY project ORDER BY MAX(created_at) DESC"
+	if maxProjects > 0 {
+		// Retain the grouped recency order and explicitly order the outer
+		// result before LIMIT, without adding a tie-breaker.
+		// The window counts all groups before LIMIT, in the same snapshot as
+		// the returned names, without hydrating every group through the driver.
+		projectsQuery = "SELECT project, COUNT(*) OVER () FROM (" + projectsQuery + ") ORDER BY latest_created_at DESC LIMIT ?"
+		args = append(args, maxProjects)
+	}
 	rows, err := s.queryItHook(s.db, projectsQuery, args...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
+	totalProjects := 0
 	for rows.Next() {
 		var projectName string
-		if err := rows.Scan(&projectName); err != nil {
+		var scanErr error
+		if maxProjects > 0 {
+			scanErr = rows.Scan(&projectName, &totalProjects)
+		} else {
+			scanErr = rows.Scan(&projectName)
+			totalProjects++
+		}
+		if scanErr != nil {
 			_ = rows.Close()
-			return nil, err
+			return nil, 0, scanErr
 		}
 		stats.Projects = append(stats.Projects, projectName)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return nil, err
+		return nil, 0, err
 	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return stats, nil
+	return stats, totalProjects, nil
 }
 
 // ─── Project Existence ───────────────────────────────────────────────────────
@@ -6393,12 +6586,18 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 		}
 	}
 
-	if opts.Pinned == 0 {
-		if pinned, err = s.PinnedObservations(project, scope); err != nil {
-			return "", err
+	if opts.Pinned >= 0 {
+		limit := opts.Pinned
+		if opts.MaxBytes > 0 {
+			// Even an empty compact bullet ("- [] ****\n") costs 10 bytes.
+			// One extra row guarantees the rendered prefix exceeds the budget
+			// when more rows exist, preserving the final truncation marker.
+			byteLimit := opts.MaxBytes/len("- [] ****\n") + 1
+			if limit == 0 || limit > byteLimit {
+				limit = byteLimit
+			}
 		}
-	} else if opts.Pinned > 0 {
-		if pinned, err = s.pinnedObservationsLimit(project, scope, opts.Pinned); err != nil {
+		if pinned, err = s.pinnedObservationsLimit(project, scope, limit, opts.Compact); err != nil {
 			return "", err
 		}
 	}
@@ -6409,7 +6608,7 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 		if s.contextHistoryNow != nil {
 			now = s.contextHistoryNow().UTC()
 		}
-		observations, olderGroups, err = s.contextHistory(project, scope, opts.Observations, now)
+		observations, olderGroups, err = s.contextHistory(project, scope, opts.Observations, now, opts.Compact)
 		if err != nil {
 			return "", err
 		}
@@ -6421,7 +6620,7 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 		if limit == 0 {
 			limit = s.cfg.MaxContextResults
 		}
-		if observations, err = s.recentUnpinnedObservations(project, scope, limit); err != nil {
+		if observations, err = s.recentUnpinnedObservations(project, scope, limit, opts.Compact); err != nil {
 			return "", err
 		}
 	}
@@ -6446,6 +6645,9 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 	if len(sessions) > 0 {
 		b.WriteString("### Recent Sessions\n")
 		for _, sess := range sessions {
+			if opts.MaxBytes > 0 && b.Len() > opts.MaxBytes {
+				break
+			}
 			summary := ""
 			if sess.Summary != nil {
 				summary = fmt.Sprintf(": %s", truncate(*sess.Summary, 200))
@@ -6459,6 +6661,9 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 	if len(prompts) > 0 {
 		b.WriteString("### Recent User Prompts\n")
 		for _, p := range prompts {
+			if opts.MaxBytes > 0 && b.Len() > opts.MaxBytes {
+				break
+			}
 			fmt.Fprintf(&b, "- %s: %s\n", timeutil.FormatLocal(p.CreatedAt), truncate(p.Content, 200))
 		}
 		b.WriteString("\n")
@@ -6467,6 +6672,9 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 	if len(pinned) > 0 {
 		b.WriteString("### Pinned\n")
 		for _, obs := range pinned {
+			if opts.MaxBytes > 0 && b.Len() > opts.MaxBytes {
+				break
+			}
 			writeObservationBullet(&b, obs, opts.Compact)
 		}
 		b.WriteString("\n")
@@ -6475,6 +6683,9 @@ func (s *Store) FormatContextWithOptions(project, scope string, opts ContextOpti
 	if len(observations) > 0 {
 		b.WriteString("### Recent Observations\n")
 		for _, obs := range observations {
+			if opts.MaxBytes > 0 && b.Len() > opts.MaxBytes {
+				break
+			}
 			writeObservationBullet(&b, obs, opts.Compact)
 		}
 		b.WriteString("\n")
@@ -7036,8 +7247,17 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 			if duplicateCount <= 0 {
 				duplicateCount = existing.DuplicateCount
 			}
-			if _, err := s.execHook(tx, `UPDATE observations SET session_id = ?, type = ?, title = ?, content = ?, tool_name = CAST(? AS TEXT), project = ?, scope = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, review_after = ?, pinned = ?, created_at = ?, updated_at = ?, deleted_at = ? WHERE id = ?`,
-				obs.SessionID, obs.Type, obs.Title, obs.Content, obs.ToolName, obs.Project, normalizeScope(obs.Scope), nullableString(normalizeTopicKey(derefString(obs.TopicKey))), hashNormalized(obs.Content), revisionCount, duplicateCount, obs.LastSeenAt, obs.ReviewAfter, obs.Pinned, createdAt, obs.UpdatedAt, obs.DeletedAt, existing.ID); err != nil {
+			// A snapshot from before org existed (#776) omits the field
+			// entirely, decoding to nil — preserve the existing org rather
+			// than clobbering it with NULL. A snapshot that carries org
+			// (including an explicit empty string) always wins, same as
+			// every other field here.
+			org := obs.Org
+			if org == nil {
+				org = existing.Org
+			}
+			if _, err := s.execHook(tx, `UPDATE observations SET session_id = ?, type = ?, title = ?, content = ?, tool_name = CAST(? AS TEXT), project = ?, scope = ?, org = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, review_after = ?, pinned = ?, created_at = ?, updated_at = ?, deleted_at = ? WHERE id = ?`,
+				obs.SessionID, obs.Type, obs.Title, obs.Content, obs.ToolName, obs.Project, normalizeScope(obs.Scope), org, nullableString(normalizeTopicKey(derefString(obs.TopicKey))), hashNormalized(obs.Content), revisionCount, duplicateCount, obs.LastSeenAt, obs.ReviewAfter, obs.Pinned, createdAt, obs.UpdatedAt, obs.DeletedAt, existing.ID); err != nil {
 				return nil, fmt.Errorf("import observation %d: %w", obs.ID, err)
 			}
 			if err := s.preserveObservationProvenanceTx(tx, syncID, obs.SupersededBySyncID); err != nil {
@@ -7047,8 +7267,8 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 			continue
 		}
 		res, err := s.execHook(tx,
-			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, pinned, created_at, updated_at, deleted_at)
-			 SELECT ?, ?, ?, ?, ?, ?, CAST(? AS TEXT), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, org, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, pinned, created_at, updated_at, deleted_at)
+			 SELECT ?, ?, ?, ?, ?, ?, CAST(? AS TEXT), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 			 WHERE NOT EXISTS (SELECT 1 FROM observations WHERE sync_id = ?)`,
 			syncID,
 			obs.SessionID,
@@ -7058,6 +7278,7 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 			obs.ToolName,
 			obs.Project,
 			normalizeScope(obs.Scope),
+			obs.Org,
 			nullableString(normalizeTopicKey(derefString(obs.TopicKey))),
 			hashNormalized(obs.Content),
 			maxInt(obs.RevisionCount, 1),
@@ -7346,7 +7567,10 @@ func (s *Store) GetSyncedChunks() (map[string]bool, error) {
 // GetSyncedChunksForTarget returns chunk IDs tracked for a specific sync target.
 func (s *Store) GetSyncedChunksForTarget(targetKey string) (map[string]bool, error) {
 	targetKey = normalizeChunkTargetKey(targetKey)
-	rows, err := s.queryItHook(s.db, "SELECT chunk_id FROM sync_chunks WHERE target_key = ?", targetKey)
+	// Transfer one driver row so generation checks protect the read without
+	// repeating filesystem probes for every ID. Hex preserves opaque bytes:
+	// decoding chunk_id directly from JSON would replace invalid UTF-8.
+	rows, err := s.queryItHook(s.db, "SELECT json_group_array(hex(chunk_id)) FROM sync_chunks WHERE target_key = ?", targetKey)
 	if err != nil {
 		return nil, fmt.Errorf("get synced chunks: %w", err)
 	}
@@ -7354,11 +7578,21 @@ func (s *Store) GetSyncedChunksForTarget(targetKey string) (map[string]bool, err
 
 	chunks := make(map[string]bool)
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
 			return nil, err
 		}
-		chunks[id] = true
+		var ids []string
+		if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			decoded, err := hex.DecodeString(id)
+			if err != nil {
+				return nil, err
+			}
+			chunks[string(decoded)] = true
+		}
 	}
 	return chunks, rows.Err()
 }
@@ -8879,6 +9113,10 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 // blank directories are accepted and the skip-plus-evidence quarantine ladder
 // behaves exactly as before.
 func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations []SyncMutation, cloud bool) error {
+	return s.applyPulledChunkForDomain(targetKey, chunkID, mutations, cloud, nil)
+}
+
+func (s *Store) applyPulledChunkForDomain(targetKey, chunkID string, mutations []SyncMutation, cloud bool, evidence *ChunkDeleteEvidence) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	chunkTargetKey := normalizeChunkTargetKey(targetKey)
 	chunkID = strings.TrimSpace(chunkID)
@@ -8896,6 +9134,9 @@ func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations [
 			return err
 		}
 		if alreadyImported > 0 {
+			if evidence != nil {
+				return s.recordChunkDeleteEvidenceTx(tx, chunkTargetKey, chunkID, *evidence)
+			}
 			return nil
 		}
 
@@ -8934,6 +9175,11 @@ func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations [
 			chunkTargetKey, chunkID,
 		); err != nil {
 			return err
+		}
+		if evidence != nil {
+			if err := s.recordChunkDeleteEvidenceTx(tx, chunkTargetKey, chunkID, *evidence); err != nil {
+				return err
+			}
 		}
 
 		_, err = s.execHook(tx,
@@ -9739,16 +9985,24 @@ type ProjectStats struct {
 	Directories      []string `json:"directories"` // unique directories from sessions
 }
 
-// ListProjectsWithStats returns all projects with aggregated counts.
-// Ordered by observation count descending.
-func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
+// ListProjectsWithStats returns all projects with aggregated counts. Ordered
+// by observation count descending. When org is non-empty (#776), observation
+// counts are scoped to that org and the result set is limited to projects
+// that have at least one observation tagged with it — sessions and prompts
+// have no org axis of their own, so they only enrich projects already
+// selected by the org filter rather than reintroducing unfiltered ones.
+func (s *Store) ListProjectsWithStats(org string) ([]ProjectStats, error) {
 	// Observation counts per project
-	obsRows, err := s.queryItHook(s.db,
-		`SELECT project, COUNT(*) as cnt
+	obsQuery := `SELECT project, COUNT(*) as cnt
 		 FROM observations
-		 WHERE project IS NOT NULL AND project != '' AND deleted_at IS NULL
-		 GROUP BY project`,
-	)
+		 WHERE project IS NOT NULL AND project != '' AND deleted_at IS NULL`
+	obsArgs := []any{}
+	if org != "" {
+		obsQuery += " AND org = ?"
+		obsArgs = append(obsArgs, org)
+	}
+	obsQuery += " GROUP BY project"
+	obsRows, err := s.queryItHook(s.db, obsQuery, obsArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list projects obs: %w", err)
 	}
@@ -9804,6 +10058,11 @@ func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
 
 	for name, sd := range sessData {
 		if statsMap[name] == nil {
+			if org != "" {
+				// This project had no observation tagged with org: skip it
+				// rather than reintroducing it via session data alone.
+				continue
+			}
 			statsMap[name] = &ProjectStats{Name: name}
 		}
 		statsMap[name].SessionCount = sd.count
@@ -9831,6 +10090,9 @@ func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
 			return nil, err
 		}
 		if statsMap[name] == nil {
+			if org != "" {
+				continue
+			}
 			statsMap[name] = &ProjectStats{Name: name}
 		}
 		statsMap[name].PromptCount = cnt
@@ -9852,6 +10114,23 @@ func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
 	}
 
 	return results, nil
+}
+
+// HasObservationsForProject checks for a live observation using the exact stored
+// project name, matching membership in ListProjectNames without enumerating it.
+// Sessions, prompts and enrollment alone do not establish this membership.
+func (s *Store) HasObservationsForProject(name string) (bool, error) {
+	if name == "" {
+		return false, nil
+	}
+	var exists bool
+	err := s.db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM observations WHERE project = ? AND deleted_at IS NULL LIMIT 1
+	)`, name).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // CountObservationsForProject returns the number of non-deleted observations
@@ -9898,7 +10177,7 @@ func mergeProjectEligible(source, canonical string, explicit bool) bool {
 	}
 	strip := func(name string) string {
 		return strings.Map(func(r rune) rune {
-			if r == '-' || r == '_' {
+			if r == '-' || r == '_' || r == ' ' {
 				return -1
 			}
 			return r
@@ -9985,7 +10264,7 @@ func (s *Store) mergeProjects(sources []string, canonical string, explicit bool)
 		}
 		if !mergeProjectEligible(normalizedSource, canonical, explicit) {
 			if explicit {
-				return nil, fmt.Errorf("source project %q must normalize to canonical project %q or differ only by corresponding '-' and '_' separators", source, canonical)
+				return nil, fmt.Errorf("source project %q must normalize to canonical project %q or differ only by ASCII spaces, '-' and '_' separators", source, canonical)
 			}
 			return nil, fmt.Errorf("source project %q must normalize to canonical project %q", source, canonical)
 		}
@@ -11036,8 +11315,8 @@ func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, sess
 	}
 	for _, id := range p.ObservationIDs {
 		var payload syncObservationPayload
-		err := tx.QueryRow(`SELECT sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at FROM observations WHERE id = ? AND project = ?`, id, target).
-			Scan(&payload.SyncID, &payload.SessionID, &payload.Type, &payload.Title, &payload.Content, &payload.ToolName, &payload.Project, &payload.Scope, &payload.TopicKey, &payload.RevisionCount, &payload.DuplicateCount, &payload.LastSeenAt, &payload.CreatedAt, &payload.UpdatedAt, &payload.DeletedAt)
+		err := tx.QueryRow(`SELECT sync_id, session_id, type, title, content, tool_name, project, scope, org, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at FROM observations WHERE id = ? AND project = ?`, id, target).
+			Scan(&payload.SyncID, &payload.SessionID, &payload.Type, &payload.Title, &payload.Content, &payload.ToolName, &payload.Project, &payload.Scope, &payload.Org, &payload.TopicKey, &payload.RevisionCount, &payload.DuplicateCount, &payload.LastSeenAt, &payload.CreatedAt, &payload.UpdatedAt, &payload.DeletedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -13044,6 +13323,7 @@ func observationPayloadFromObservation(obs *Observation) syncObservationPayload 
 		ToolName:           obs.ToolName,
 		Project:            obs.Project,
 		Scope:              obs.Scope,
+		Org:                obs.Org,
 		TopicKey:           obs.TopicKey,
 		RevisionCount:      obs.RevisionCount,
 		DuplicateCount:     obs.DuplicateCount,
@@ -13219,8 +13499,8 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 			}
 		}
 		_, err = s.execHook(tx,
-			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, created_at, updated_at, deleted_at)
-			 VALUES (?, ?, ?, ?, ?, ?, CAST(? AS TEXT), ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, org, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, created_at, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, CAST(? AS TEXT), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 			payload.SyncID,
 			payload.SessionID,
 			payload.Type,
@@ -13229,6 +13509,7 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 			payload.ToolName,
 			payload.Project,
 			normalizeScope(payload.Scope),
+			payload.Org,
 			payload.TopicKey,
 			hashNormalized(payload.Content),
 			revisionCount,
@@ -13268,10 +13549,17 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 	if strings.TrimSpace(payload.UpdatedAt) == "" {
 		updatedAt = existing.UpdatedAt
 	}
+	// A payload from before org existed (#776) omits the field entirely,
+	// decoding to nil — preserve the existing org rather than clobbering it
+	// with NULL. A payload that carries org (including an explicit empty
+	// string) always wins, same as every other field here.
+	if payload.Org == nil {
+		payload.Org = existing.Org
+	}
 
 	_, err = s.execHook(tx,
 		`UPDATE observations
-		 SET session_id = ?, type = ?, title = ?, content = ?, tool_name = ?, project = CAST(? AS TEXT), scope = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, review_after = ?, created_at = ?, updated_at = ?, deleted_at = NULL
+		 SET session_id = ?, type = ?, title = ?, content = ?, tool_name = ?, project = CAST(? AS TEXT), scope = ?, org = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, review_after = ?, created_at = ?, updated_at = ?, deleted_at = NULL
 		 WHERE id = ?`,
 		payload.SessionID,
 		payload.Type,
@@ -13280,6 +13568,7 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 		payload.ToolName,
 		payload.Project,
 		normalizeScope(payload.Scope),
+		payload.Org,
 		payload.TopicKey,
 		hashNormalized(payload.Content),
 		revisionCount,
@@ -13497,7 +13786,7 @@ type observationScanner interface {
 func scanObservationRow(scanner observationScanner, o *Observation) error {
 	return scanner.Scan(
 		&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-		&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.ReviewAfter,
+		&o.ToolName, &o.Project, &o.Scope, &o.Org, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.ReviewAfter,
 		&o.Pinned, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt, &o.SupersededBySyncID,
 	)
 }
@@ -13505,7 +13794,7 @@ func scanObservationRow(scanner observationScanner, o *Observation) error {
 func scanSearchPreviewRow(scanner observationScanner, r *SearchPreviewResult, withRank bool) error {
 	dest := []any{
 		&r.ID, &r.SyncID, &r.Type, &r.Title, &r.Preview, &r.Truncated,
-		&r.Project, &r.TopicKey, &r.Scope, &r.ReviewAfter, &r.Pinned, &r.CreatedAt,
+		&r.Project, &r.TopicKey, &r.Scope, &r.Org, &r.ReviewAfter, &r.Pinned, &r.CreatedAt,
 	}
 	if withRank {
 		dest = append(dest, &r.Rank)
@@ -13531,12 +13820,23 @@ func (s *Store) queryObservations(query string, args ...any) ([]Observation, err
 	return results, rows.Err()
 }
 
-func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) error {
+type migrationColumn struct {
+	name       string
+	definition string
+}
+
+// addColumnsIfNotExists reads schema once per ordered migration batch. The set
+// is invocation-local: later batches re-read schema after intervening rebuilds.
+func (s *Store) addColumnsIfNotExists(tableName string, columns ...migrationColumn) error {
+	if len(columns) == 0 {
+		return nil
+	}
 	rows, err := s.queryItHook(s.db, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
 		return err
 	}
 
+	existing := make(map[string]bool)
 	for rows.Next() {
 		var cid int
 		var name, typ string
@@ -13546,10 +13846,7 @@ func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) e
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
 			return closeRowsWithError(rows, err)
 		}
-		if name == columnName {
-			rows.Close()
-			return nil
-		}
+		existing[name] = true
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -13559,8 +13856,16 @@ func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) e
 		return err
 	}
 
-	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, definition))
-	return err
+	for _, column := range columns {
+		if existing[column.name] {
+			continue
+		}
+		if _, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, column.name, column.definition)); err != nil {
+			return err
+		}
+		existing[column.name] = true
+	}
+	return nil
 }
 
 func (s *Store) migrateSyncChunksTable() error {
@@ -13713,6 +14018,12 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
+			-- org (#776) is declared so the rebuilt table carries the column, but
+			-- it is NOT copied from the source: this rebuild only fires for
+			-- pre-org "id INT" schemas whose rows all predate org (always NULL),
+			-- and the source may not have the column at all when this runs in
+			-- isolation. It stays NULL for every migrated row, as it must.
+			org TEXT,
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		);
 	`); err != nil {
@@ -14044,6 +14355,20 @@ func stripPrivateTags(s string) string {
 	// Clean up multiple consecutive [REDACTED] and excessive whitespace
 	result = strings.TrimSpace(result)
 	return result
+}
+
+func validateFTSQueryLength(query string) error {
+	if len(query) > maxFTSQueryBytes {
+		return fmt.Errorf("%w: got %d bytes; maximum is %d bytes; shorten the query and retry", ErrFTSQueryTooLarge, len(query), maxFTSQueryBytes)
+	}
+	return nil
+}
+
+func validateShortTermFTSQuery(query string) error {
+	if terms := len(searchTerms(query)); terms > maxFTSShortTermQueryTerms {
+		return fmt.Errorf("%w: got %d terms; maximum is %d terms for short-term search; shorten the query and retry", ErrFTSQueryTooLarge, terms, maxFTSShortTermQueryTerms)
+	}
+	return nil
 }
 
 // sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars.

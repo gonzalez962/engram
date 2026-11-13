@@ -127,6 +127,9 @@ type DetectionResult struct {
 	Error error
 	// AvailableProjects is populated only when Error==ErrAmbiguousProject.
 	AvailableProjects []string
+	// Org is the optional grouping label from .engram/config.json's "org" field.
+	// Only populated when Source==SourceConfig; empty means unset (#776).
+	Org string
 }
 
 // DetectProjectFull resolves the project for dir using a 6-case algorithm:
@@ -185,12 +188,13 @@ func detectProjectFull(dir string, options DetectionOptions, historyDirectory st
 		dir = "./" + dir
 	}
 
-	if res, ok := detectFromConfigContext(ctx, dir); ok {
+	inspection := inspectGitCheckoutRoot(ctx, dir)
+	if res, ok := detectFromConfigContext(ctx, dir, inspection); ok {
 		return res
 	}
 
 	// ── Cases 1 & 2: Git repository binding ─────────────────────────────
-	if res, ok := detectFromGitBinding(dir, options, historyDirectory); ok {
+	if res, ok := detectFromGitBinding(dir, options, historyDirectory, inspection); ok {
 		return res
 	}
 
@@ -256,10 +260,15 @@ basename:
 // detectFromGitBinding preserves the first legacy Git-derived project label in
 // the repository's shared Git metadata. The binding is private to a clone and
 // shared by linked worktrees; mutable remotes are only consulted at creation.
-func detectFromGitBinding(dir string, options DetectionOptions, historyDirectory string) (DetectionResult, bool) {
+func detectFromGitBinding(dir string, options DetectionOptions, historyDirectory string, inspection *gitInspection) (DetectionResult, bool) {
 	ctx := options.detectionContext()
+	if err := ctx.Err(); err != nil {
+		return DetectionResult{Error: err}, true
+	}
 	var commonDir string
-	if options.Context == nil {
+	if inspection != nil {
+		commonDir = inspection.commonDir
+	} else if options.Context == nil {
 		commonDir = detectGitCommonDir(dir)
 	} else {
 		commonDir = detectGitCommonDirContext(ctx, dir)
@@ -267,7 +276,16 @@ func detectFromGitBinding(dir string, options DetectionOptions, historyDirectory
 	if commonDir == "" {
 		return DetectionResult{}, false
 	}
-	root := detectGitRootDirContext(ctx, dir)
+	var root string
+	if inspection != nil {
+		if inspection.gitDir == commonDir {
+			root = inspection.worktreeDir
+		} else {
+			root = repositoryRootFromCommonDir(commonDir)
+		}
+	} else {
+		root = detectGitRootDirContext(ctx, dir)
+	}
 	if root == "" {
 		return DetectionResult{
 			Source: SourceGitRoot,
@@ -368,9 +386,12 @@ func requireHomeProjectContext(parent context.Context, dir, root string) error {
 
 type configFile struct {
 	ProjectName string `json:"project_name"`
+	// Org is a free-text grouping axis orthogonal to scope (#776). Unlike
+	// ProjectName it has no canonicalization beyond trimming whitespace.
+	Org string `json:"org"`
 }
 
-func detectFromConfigContext(ctx context.Context, dir string) (DetectionResult, bool) {
+func detectFromConfigContext(ctx context.Context, dir string, inspection *gitInspection) (DetectionResult, bool) {
 	if err := ctx.Err(); err != nil {
 		return DetectionResult{Error: err}, true
 	}
@@ -384,7 +405,13 @@ func detectFromConfigContext(ctx context.Context, dir string) (DetectionResult, 
 	// cwd is inside git, walk upward only within the enclosing repository so a
 	// nearest subproject .engram/config.json can override the repo root without
 	// letting ~/.engram/config.json leak into nested workspaces under $HOME.
-	if worktreeRoot := canonicalizePath(detectGitWorktreeDirContext(ctx, absDir)); worktreeRoot != "" {
+	var worktreeRoot string
+	if inspection != nil {
+		worktreeRoot = inspection.worktreeDir
+	} else {
+		worktreeRoot = detectGitWorktreeDirContext(ctx, absDir)
+	}
+	if worktreeRoot = canonicalizePath(worktreeRoot); worktreeRoot != "" {
 		return readNearestConfigAtOrBelowContext(ctx, absDir, worktreeRoot)
 	}
 
@@ -435,7 +462,7 @@ func readConfigAt(projectDir string) (DetectionResult, bool) {
 	if err != nil {
 		return invalidConfigResult(projectDir, err), true
 	}
-	return DetectionResult{Project: projectName, Source: SourceConfig, Path: projectDir}, true
+	return DetectionResult{Project: projectName, Source: SourceConfig, Path: projectDir, Org: strings.TrimSpace(cfg.Org)}, true
 }
 
 func invalidConfigResult(path string, err error) DetectionResult {
