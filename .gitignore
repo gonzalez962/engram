@@ -41,3 +41,6 @@ engram-dev
 .env
 .env.*
 !.env.example
+/.pi
+/odd
+setup-engram-daemon.sh
